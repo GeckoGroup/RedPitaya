@@ -65,10 +65,18 @@ class WavePreview(QWidget):
 
 
 class MainWindow(QMainWindow):
-    BTN_GREEN = "QPushButton { background-color: #2e7d32; color: white; font-weight: 600; }"
-    BTN_RED = "QPushButton { background-color: #b71c1c; color: white; font-weight: 600; }"
-    BTN_GRAY = "QPushButton { background-color: #616161; color: white; font-weight: 600; }"
-    BTN_DIM = "QPushButton { background-color: #263238; color: #b0bec5; font-weight: 600; }"
+    BTN_GREEN = (
+        "QPushButton { background-color: #2e7d32; color: white; font-weight: 600; }"
+    )
+    BTN_RED = (
+        "QPushButton { background-color: #b71c1c; color: white; font-weight: 600; }"
+    )
+    BTN_GRAY = (
+        "QPushButton { background-color: #616161; color: white; font-weight: 600; }"
+    )
+    BTN_DIM = (
+        "QPushButton { background-color: #263238; color: #b0bec5; font-weight: 600; }"
+    )
 
     def __init__(self) -> None:
         super().__init__()
@@ -195,7 +203,9 @@ class MainWindow(QMainWindow):
             self.output_toggle_btn.setStyleSheet(self.BTN_GREEN)
         else:
             self.output_toggle_btn.setText("Output OFF")
-            self.output_toggle_btn.setStyleSheet(self.BTN_RED if connected else self.BTN_GRAY)
+            self.output_toggle_btn.setStyleSheet(
+                self.BTN_RED if connected else self.BTN_GRAY
+            )
 
     def ensure_connected(self) -> bool:
         if self.rp is None:
@@ -366,7 +376,8 @@ class MainWindow(QMainWindow):
                 # Apply amplitude/offset in software and clamp before upload.
                 # Red Pitaya arbitrary data must be normalized to [-1, 1].
                 tx_wave = np.clip(
-                    self.volt_spin.value() * self.file_samples + self.offset_spin.value(),
+                    self.volt_spin.value() * self.file_samples
+                    + self.offset_spin.value(),
                     -1.0,
                     1.0,
                 )

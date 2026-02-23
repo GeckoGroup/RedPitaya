@@ -355,6 +355,26 @@ DEFAULT_PARAM_SPECS = (
     ),
 )
 FIT_CURVE_COLOR = "#16a34a"
+CHANNEL_PLOT_COLORS = (
+    "#2563eb",  # blue
+    "#f59e0b",  # amber
+    "#7c3aed",  # violet
+    "#dc2626",  # red
+    "#0891b2",  # cyan
+    "#ea580c",  # orange
+    "#0f766e",  # teal
+    "#a855f7",  # purple
+    "#64748b",  # slate
+    "#be123c",  # rose
+)
+
+
+def palette_color(index: int) -> str:
+    idx = int(index)
+    if CHANNEL_PLOT_COLORS:
+        return CHANNEL_PLOT_COLORS[idx % len(CHANNEL_PLOT_COLORS)]
+    return f"C{idx % 10}"
+
 
 # Initialize backend after fit defaults.
 switch_backend("Qt5Agg")
@@ -372,6 +392,29 @@ def compute_r2(y_true, y_pred):
         return float(r2_score(y_true_arr[valid], y_pred_arr[valid]))
     except Exception:
         return None
+
+
+def smooth_channel_array(values, window_size):
+    arr = np.asarray(values, dtype=float).reshape(-1)
+    if arr.size == 0:
+        return arr
+    try:
+        window = int(window_size)
+    except Exception:
+        window = 1
+    if window <= 1:
+        return arr.copy()
+    if window % 2 == 0:
+        window += 1
+    if window > arr.size:
+        window = arr.size if arr.size % 2 == 1 else max(1, arr.size - 1)
+    if window <= 1:
+        return arr.copy()
+    pad = window // 2
+    padded = np.pad(arr, (pad, pad), mode="edge")
+    kernel = np.ones(window, dtype=float) / float(window)
+    smoothed = np.convolve(padded, kernel, mode="valid")
+    return np.asarray(smoothed, dtype=float)
 
 
 @dataclass(frozen=True)
@@ -1420,6 +1463,8 @@ def make_batch_result_row(
     error=None,
     plot_full=None,
     plot=None,
+    plot_has_fit=None,
+    plot_render_size=None,
     fit_attempts=None,
     fit_best_sse=None,
     fit_mode=None,
@@ -1439,6 +1484,8 @@ def make_batch_result_row(
         "y_channel": y_channel,
         "plot_full": plot_full,
         "plot": plot,
+        "plot_has_fit": plot_has_fit,
+        "plot_render_size": plot_render_size,
         "fit_attempts": fit_attempts,
         "fit_best_sse": fit_best_sse,
         "fit_mode": fit_mode,
@@ -1449,7 +1496,13 @@ def make_batch_result_row(
     }
 
 
-def render_batch_thumbnail(row, model_func, full_thumbnail_size=(468, 312)):
+def render_batch_thumbnail(
+    row,
+    model_func,
+    full_thumbnail_size=(468, 312),
+    smoothing_enabled=False,
+    smoothing_window=1,
+):
     """Render a row thumbnail pixmap, including fitted curve when available."""
     try:
         data = read_measurement_csv(row["file"])
@@ -1463,19 +1516,38 @@ def render_batch_thumbnail(row, model_func, full_thumbnail_size=(468, 312)):
         time_data = data[time_col].to_numpy(dtype=float, copy=True) * 1e3
         y_data = data[y_col].to_numpy(dtype=float, copy=True)
         x_data = data[x_col].to_numpy(dtype=float, copy=True)
+        if smoothing_enabled:
+            y_data = smooth_channel_array(y_data, smoothing_window)
+            x_data = smooth_channel_array(x_data, smoothing_window)
+
+        # Keep thumbnail rendering lightweight: use a reduced sample count.
+        sample_count = len(time_data)
+        max_thumbnail_points = 600
+        if sample_count > max_thumbnail_points:
+            step = int(np.ceil(sample_count / float(max_thumbnail_points)))
+            time_data = time_data[::step]
+            y_data = y_data[::step]
+            x_data = x_data[::step]
         column_data = {}
         for column in data.columns:
             key = str(column).strip()
             if not key:
                 continue
             try:
-                column_data[key] = data[column].to_numpy(dtype=float, copy=True)
+                column_values = data[column].to_numpy(dtype=float, copy=True)
+                if smoothing_enabled:
+                    column_values = smooth_channel_array(
+                        column_values, smoothing_window
+                    )
+                if sample_count > max_thumbnail_points:
+                    column_values = column_values[::step]
+                column_data[key] = column_values
             except Exception:
                 continue
 
         target_width = max(24, int(full_thumbnail_size[0]))
         target_height = max(24, int(full_thumbnail_size[1]))
-        render_dpi = 180
+        render_dpi = 72
         fig = Figure(
             figsize=(target_width / render_dpi, target_height / render_dpi),
             dpi=render_dpi,
@@ -1595,6 +1667,8 @@ class BatchFitWorker(QObject):
         fit_start_pct,
         fit_end_pct,
         fit_options=None,
+        smoothing_enabled=False,
+        smoothing_window=1,
     ):
         super().__init__()
         self.file_paths = list(file_paths)
@@ -1615,6 +1689,8 @@ class BatchFitWorker(QObject):
             if isinstance(fit_options, FitOptimizationOptions)
             else FitOptimizationOptions()
         )
+        self.smoothing_enabled = bool(smoothing_enabled)
+        self.smoothing_window = int(smoothing_window)
         self.cancel_requested = False
         self._executor = None
         self._futures = []
@@ -1656,6 +1732,9 @@ class BatchFitWorker(QObject):
         data = read_measurement_csv(file_path)
         x_data = data[self.x_channel].to_numpy(dtype=float, copy=True)
         y_data = data[self.y_channel].to_numpy(dtype=float, copy=True)
+        if self.smoothing_enabled:
+            x_data = smooth_channel_array(x_data, self.smoothing_window)
+            y_data = smooth_channel_array(y_data, self.smoothing_window)
         n = len(x_data)
         start = int(np.floor((self.fit_start_pct / 100.0) * max(0, n - 1)))
         end = int(np.ceil((self.fit_end_pct / 100.0) * max(0, n - 1))) + 1
@@ -1670,9 +1749,13 @@ class BatchFitWorker(QObject):
             if not key:
                 continue
             try:
-                column_data_fit[key] = data[column].to_numpy(dtype=float, copy=True)[
-                    fit_slice
-                ]
+                column_values = data[column].to_numpy(dtype=float, copy=True)
+                if self.smoothing_enabled:
+                    column_values = smooth_channel_array(
+                        column_values,
+                        self.smoothing_window,
+                    )
+                column_data_fit[key] = column_values[fit_slice]
             except Exception:
                 continue
 
@@ -1887,21 +1970,65 @@ class ThumbnailRenderWorker(QObject):
         model_func,
         full_thumbnail_size=(468, 312),
         row_indices=None,
+        smoothing_enabled=False,
+        smoothing_window=1,
     ):
         super().__init__()
         self.batch_results = batch_results
         self.model_func = model_func
         self.full_thumbnail_size = full_thumbnail_size
+        self.smoothing_enabled = bool(smoothing_enabled)
+        self.smoothing_window = int(smoothing_window)
         if row_indices is None:
             self.row_indices = list(range(len(batch_results)))
         else:
-            self.row_indices = sorted(
-                {int(idx) for idx in row_indices if 0 <= int(idx) < len(batch_results)}
-            )
+            ordered = []
+            seen = set()
+            for idx in row_indices:
+                try:
+                    row_idx = int(idx)
+                except Exception:
+                    continue
+                if 0 <= row_idx < len(batch_results) and row_idx not in seen:
+                    ordered.append(row_idx)
+                    seen.add(row_idx)
+            self.row_indices = ordered
         self.cancel_requested = False
 
     def request_cancel(self):
         self.cancel_requested = True
+
+    def _row_render_size(self, row):
+        size_meta = row.get("plot_render_size")
+        if isinstance(size_meta, (tuple, list)) and len(size_meta) == 2:
+            try:
+                return (int(size_meta[0]), int(size_meta[1]))
+            except Exception:
+                pass
+
+        source = row.get("plot_full") or row.get("plot")
+        if source is not None:
+            try:
+                width = int(source.width())
+                height = int(source.height())
+                if width > 0 and height > 0:
+                    return (width, height)
+            except Exception:
+                pass
+        return None
+
+    def _needs_render(self, row):
+        source = row.get("plot_full") or row.get("plot")
+        if source is None:
+            return True
+        rendered_size = self._row_render_size(row)
+        if rendered_size is None:
+            return True
+        target_size = (
+            int(self.full_thumbnail_size[0]),
+            int(self.full_thumbnail_size[1]),
+        )
+        return tuple(rendered_size) != target_size
 
     @pyqtSlot()
     def run(self):
@@ -1913,12 +2040,17 @@ class ThumbnailRenderWorker(QObject):
                     return
 
                 row = self.batch_results[row_idx]
-                if row.get("plot_full") is not None:
+                if not self._needs_render(row):
                     self.progress.emit(done_idx + 1, total, row_idx)
                     continue
 
                 pixmap = self.render_thumbnail(row)
                 row["plot_full"] = pixmap
+                row["plot_has_fit"] = bool(row.get("params"))
+                row["plot_render_size"] = (
+                    int(self.full_thumbnail_size[0]),
+                    int(self.full_thumbnail_size[1]),
+                )
                 self.progress.emit(done_idx + 1, total, row_idx)
 
             if self.cancel_requested:
@@ -1935,6 +2067,8 @@ class ThumbnailRenderWorker(QObject):
             row,
             self.model_func,
             full_thumbnail_size=self.full_thumbnail_size,
+            smoothing_enabled=self.smoothing_enabled,
+            smoothing_window=self.smoothing_window,
         )
 
 
@@ -2024,13 +2158,15 @@ class ManualFitGUI(QMainWindow):
         self.analysis_columns = []
         self.analysis_numeric_data = {}
         self.analysis_param_columns = []
+        self._analysis_point_pick_cid = None
+        self._analysis_scatter_files = {}
         self.max_thumbnails = 8
         self.thumb_cols = 1
         self.batch_row_height = 64
         self.batch_row_height_min = 40
         self.batch_row_height_max = 320
         self.batch_thumbnail_aspect = 1.5
-        self.batch_thumbnail_supersample = 5.0
+        self.batch_thumbnail_supersample = 2.0
         self._batch_row_height_sync = False
         self._batch_progress_done = 0
         self.regex_timer = QTimer()
@@ -2056,11 +2192,14 @@ class ManualFitGUI(QMainWindow):
 
         # Cache for plot data
         self.cached_time_data = None
+        self.raw_channel_cache = {}
         self.channel_cache = {}
         self._expression_channel_data_cache = None
         self._display_target_points = 3000
         self._plot_has_residual_axis = False
         self._last_file_load_error = ""
+        self.smoothing_enabled = False
+        self.smoothing_window = 5
 
         # Current directory
         self.current_dir = "./AFG_measurements/"
@@ -2135,6 +2274,8 @@ class ManualFitGUI(QMainWindow):
             and event.type() in (QEvent.Type.Resize, QEvent.Type.Show)
         ):
             QTimer.singleShot(0, self._sync_fit_panel_top_spacing)
+        if event is not None and event.type() == QEvent.Type.MouseButtonPress:
+            self._defocus_numeric_editor_on_outside_click(watched, event)
         if (
             self._expression_edit_mode
             and event is not None
@@ -2165,6 +2306,51 @@ class ManualFitGUI(QMainWindow):
                     0, lambda: self._apply_expression_on_focus_leave(force=True)
                 )
         return super().eventFilter(watched, event)
+
+    def _defocus_numeric_editor_on_outside_click(self, watched, event):
+        active_popup = QApplication.activePopupWidget()
+        if active_popup is not None:
+            return
+
+        focused_widget = QApplication.focusWidget()
+        spinbox = None
+        probe = focused_widget
+        while isinstance(probe, QWidget):
+            if isinstance(probe, QAbstractSpinBox):
+                spinbox = probe
+                break
+            probe = probe.parentWidget()
+
+        if spinbox is None:
+            return
+        if not bool(spinbox.property("defocus_on_outside_click")):
+            return
+
+        clicked_widget = watched if isinstance(watched, QWidget) else None
+        global_pos = None
+        if hasattr(event, "globalPosition"):
+            try:
+                global_pos = event.globalPosition().toPoint()
+            except Exception:
+                global_pos = None
+        elif hasattr(event, "globalPos"):
+            try:
+                global_pos = event.globalPos()
+            except Exception:
+                global_pos = None
+        if global_pos is not None:
+            widget_at_pos = QApplication.widgetAt(global_pos)
+            if widget_at_pos is not None:
+                clicked_widget = widget_at_pos
+
+        if clicked_widget is not None and (
+            clicked_widget is spinbox or spinbox.isAncestorOf(clicked_widget)
+        ):
+            return
+
+        if focused_widget is not None:
+            focused_widget.clearFocus()
+        spinbox.clearFocus()
 
     def _enforce_light_mode(self):
         """Force a light Qt palette regardless of system appearance."""
@@ -2626,6 +2812,7 @@ class ManualFitGUI(QMainWindow):
         spinbox.setKeyboardTracking(False)
         spinbox.setAlignment(Qt.AlignmentFlag.AlignRight)
         spinbox.setFixedWidth(56)
+        spinbox.setProperty("defocus_on_outside_click", True)
         if tooltip:
             spinbox.setToolTip(str(tooltip))
         return spinbox
@@ -2650,6 +2837,7 @@ class ManualFitGUI(QMainWindow):
         spinbox.setKeyboardTracking(False)
         spinbox.setAlignment(Qt.AlignmentFlag.AlignRight)
         spinbox.setFixedWidth(56)
+        spinbox.setProperty("defocus_on_outside_click", True)
         if tooltip:
             spinbox.setToolTip(str(tooltip))
         return spinbox
@@ -2690,6 +2878,7 @@ class ManualFitGUI(QMainWindow):
         spinbox.setKeyboardTracking(False)
         spinbox.setAlignment(Qt.AlignmentFlag.AlignRight)
         spinbox.setFixedWidth(int(width))
+        spinbox.setProperty("defocus_on_outside_click", True)
         if tooltip:
             spinbox.setToolTip(str(tooltip))
         spinbox.setValue(float(value))
@@ -2705,6 +2894,105 @@ class ManualFitGUI(QMainWindow):
         de_enabled = enabled and bool(self.fit_use_de_cb.isChecked())
         for widget in getattr(self, "_fit_de_widgets", []):
             widget.setEnabled(de_enabled)
+
+    def _effective_smoothing_window(self):
+        window = int(getattr(self, "smoothing_window", 1))
+        if window <= 1:
+            return 1
+        if window % 2 == 0:
+            window += 1
+        return window
+
+    def _smooth_channel_values(self, values):
+        if not bool(getattr(self, "smoothing_enabled", False)):
+            return np.asarray(values, dtype=float)
+        return smooth_channel_array(values, self._effective_smoothing_window())
+
+    def _rebuild_channel_cache_from_raw(self):
+        rebuilt = {}
+        for key, values in (self.raw_channel_cache or {}).items():
+            try:
+                rebuilt[str(key)] = self._smooth_channel_values(values)
+            except Exception:
+                continue
+        self.channel_cache = rebuilt
+        self._expression_channel_data_cache = dict(rebuilt)
+
+    def _on_smoothing_controls_changed(self):
+        enabled = bool(
+            getattr(self, "smoothing_enable_cb", None)
+            and self.smoothing_enable_cb.isChecked()
+        )
+        window = (
+            int(self.smoothing_window_spin.value())
+            if hasattr(self, "smoothing_window_spin")
+            else int(getattr(self, "smoothing_window", 1))
+        )
+        if window % 2 == 0:
+            window += 1
+            if hasattr(self, "smoothing_window_spin"):
+                self.smoothing_window_spin.blockSignals(True)
+                self.smoothing_window_spin.setValue(window)
+                self.smoothing_window_spin.blockSignals(False)
+
+        changed = (enabled != self.smoothing_enabled) or (
+            window != self.smoothing_window
+        )
+        self.smoothing_enabled = enabled
+        self.smoothing_window = window
+
+        if not changed:
+            return
+
+        main_xlim = None
+        main_ylim = None
+        residual_ylim = None
+        if hasattr(self, "ax") and self.ax is not None:
+            try:
+                main_xlim = tuple(self.ax.get_xlim())
+            except Exception:
+                main_xlim = None
+            try:
+                main_ylim = tuple(self.ax.get_ylim())
+            except Exception:
+                main_ylim = None
+        if hasattr(self, "ax_residual") and self.ax_residual is not None:
+            try:
+                residual_ylim = tuple(self.ax_residual.get_ylim())
+            except Exception:
+                residual_ylim = None
+
+        self._rebuild_channel_cache_from_raw()
+        for row in self.batch_results:
+            row["plot_full"] = None
+            row["plot"] = None
+            row["plot_render_size"] = None
+        if self.batch_results:
+            self.update_batch_table()
+            self.queue_visible_thumbnail_render()
+        self.update_plot(fast=False)
+        if hasattr(self, "ax") and self.ax is not None:
+            if main_xlim is not None:
+                try:
+                    self.ax.set_xlim(*main_xlim)
+                except Exception:
+                    pass
+            if main_ylim is not None:
+                try:
+                    self.ax.set_ylim(*main_ylim)
+                except Exception:
+                    pass
+        if (
+            residual_ylim is not None
+            and hasattr(self, "ax_residual")
+            and self.ax_residual is not None
+        ):
+            try:
+                self.ax_residual.set_ylim(*residual_ylim)
+            except Exception:
+                pass
+        if hasattr(self, "canvas") and self.canvas is not None:
+            self.canvas.draw_idle()
 
     def _sync_fit_panel_top_spacing(self):
         spacer = getattr(self, "fit_panel_top_spacer", None)
@@ -3510,6 +3798,42 @@ class ManualFitGUI(QMainWindow):
             3,
             1,
         )
+
+        self.smoothing_enable_label = self._new_label("Smooth")
+        self.smoothing_enable_label.setToolTip(
+            "Apply moving-average smoothing to channels before fitting/analysis."
+        )
+        self.smoothing_enable_cb = self._new_checkbox(
+            "",
+            checked=self.smoothing_enabled,
+            tooltip="Apply moving-average smoothing to channels before fitting/analysis.",
+        )
+        fit_options_layout.addWidget(
+            self._build_fit_option_cell(
+                self.smoothing_enable_label,
+                self.smoothing_enable_cb,
+            ),
+            4,
+            0,
+        )
+
+        self.smoothing_window_label = self._new_label("Win")
+        self.smoothing_window_label.setToolTip("Smoothing window size (odd samples).")
+        self.smoothing_window_spin = self._new_compact_int_spinbox(
+            1,
+            101,
+            self._effective_smoothing_window(),
+            single_step=2,
+            tooltip="Smoothing window size (odd samples).",
+        )
+        fit_options_layout.addWidget(
+            self._build_fit_option_cell(
+                self.smoothing_window_label,
+                self.smoothing_window_spin,
+            ),
+            4,
+            1,
+        )
         fit_options_layout.setColumnStretch(0, 1)
         fit_options_layout.setColumnStretch(1, 1)
 
@@ -3534,6 +3858,10 @@ class ManualFitGUI(QMainWindow):
 
         self.fit_enabled_cb.toggled.connect(self._sync_fit_optimization_controls)
         self.fit_use_de_cb.toggled.connect(self._sync_fit_optimization_controls)
+        self.smoothing_enable_cb.toggled.connect(self._on_smoothing_controls_changed)
+        self.smoothing_window_spin.valueChanged.connect(
+            self._on_smoothing_controls_changed
+        )
 
         fit_actions_row = QHBoxLayout()
         fit_actions_row.setSpacing(4)
@@ -3918,6 +4246,7 @@ class ManualFitGUI(QMainWindow):
             self._set_function_status("", is_error=False)
             self._refresh_expression_highlighting()
             self.update_plot(fast=False)
+            self._reset_plot_home_view()
             if self.batch_results:
                 for row in self.batch_results:
                     row["params"] = None
@@ -4103,7 +4432,9 @@ class ManualFitGUI(QMainWindow):
         editors = {}
         first_editor = None
         for channel_name in channel_names:
-            editor = self._new_line_edit(str(self.channels.get(channel_name, channel_name)))
+            editor = self._new_line_edit(
+                str(self.channels.get(channel_name, channel_name))
+            )
             editor.setPlaceholderText(str(channel_name))
             editor.setToolTip(
                 f"Display label for {channel_name}. Leave blank to use {channel_name}."
@@ -4122,6 +4453,7 @@ class ManualFitGUI(QMainWindow):
         dialog_layout.addWidget(buttons)
 
         if first_editor is not None:
+
             def _activate_dialog():
                 dialog.raise_()
                 dialog.activateWindow()
@@ -4300,6 +4632,24 @@ class ManualFitGUI(QMainWindow):
 
     def _toolbar_mode_active(self):
         return bool(getattr(self.toolbar, "mode", ""))
+
+    def _reset_plot_home_view(self):
+        """Reset toolbar navigation so Home returns to the current plot view."""
+        toolbar = getattr(self, "toolbar", None)
+        if toolbar is None:
+            return
+        try:
+            nav_stack = getattr(toolbar, "_nav_stack", None)
+            if nav_stack is not None:
+                nav_stack.clear()
+            push_current = getattr(toolbar, "push_current", None)
+            if callable(push_current):
+                push_current()
+            set_history_buttons = getattr(toolbar, "set_history_buttons", None)
+            if callable(set_history_buttons):
+                set_history_buttons()
+        except Exception:
+            pass
 
     def _fit_boundary_click_distance_px(self, event):
         if event is None or event.x is None:
@@ -4674,7 +5024,7 @@ class ManualFitGUI(QMainWindow):
         regex_layout.setSpacing(4)
         regex_layout.addWidget(self._new_label("Pattern:"))
         self.regex_input = self._new_line_edit(
-            "data_{freq}_{idx}_ALL",
+            "",
             placeholder="Example: data_{freq}_{idx}_ALL",
             tooltip=(
                 "Template mode: use {field} placeholders (and * wildcard).\n"
@@ -4826,12 +5176,6 @@ class ManualFitGUI(QMainWindow):
             toggled_handler=self.update_batch_analysis_plot,
         )
         controls_row.addWidget(self.analysis_legend_btn)
-
-        self.analysis_refresh_btn = self._new_button(
-            "Refresh",
-            handler=lambda: self._refresh_batch_analysis_data(preserve_selection=True),
-        )
-        controls_row.addWidget(self.analysis_refresh_btn)
         layout.addLayout(controls_row)
 
         params_row = QHBoxLayout()
@@ -4841,22 +5185,16 @@ class ManualFitGUI(QMainWindow):
         self.analysis_params_button_layout = QHBoxLayout()
         self.analysis_params_button_layout.setSpacing(4)
         params_row.addLayout(self.analysis_params_button_layout, 1)
-        param_btn_col = QVBoxLayout()
-        param_btn_col.setSpacing(4)
-        select_all_btn = self._new_button(
-            "Select All",
-            handler=self._select_all_analysis_params,
-        )
-        param_btn_col.addWidget(select_all_btn)
-        clear_btn = self._new_button("Clear", handler=self._clear_analysis_params)
-        param_btn_col.addWidget(clear_btn)
-        param_btn_col.addStretch()
-        params_row.addLayout(param_btn_col)
         layout.addLayout(params_row)
 
         self.analysis_fig = Figure(figsize=(10, 3.2), dpi=100)
         self.analysis_fig.subplots_adjust(left=0.08, right=0.98, top=0.95, bottom=0.2)
         self.analysis_canvas = FigureCanvas(self.analysis_fig)
+        if self._analysis_point_pick_cid is None:
+            self._analysis_point_pick_cid = self.analysis_canvas.mpl_connect(
+                "pick_event",
+                self._on_analysis_point_picked,
+            )
         layout.addWidget(self.analysis_canvas)
 
         group.setLayout(layout)
@@ -4870,6 +5208,11 @@ class ManualFitGUI(QMainWindow):
     def _batch_row_error_text(self, row):
         pattern_error = str(row.get("pattern_error") or "").strip()
         fit_error = str(row.get("error") or "").strip()
+
+        normalized_fit_error = fit_error.lower().replace(".", "").strip()
+        if normalized_fit_error in {"cancelled", "canceled"}:
+            fit_error = ""
+
         parts = []
         if pattern_error:
             parts.append(pattern_error)
@@ -4904,7 +5247,10 @@ class ManualFitGUI(QMainWindow):
     def _extract_analysis_records_from_batch(self):
         records = []
         for row in self.batch_results:
-            record = {"File": display_name_for_file_ref(row["file"])}
+            record = {
+                "File": display_name_for_file_ref(row["file"]),
+                "__file_ref": row["file"],
+            }
             captures = row.get("captures") or {}
             for key, value in captures.items():
                 record[key] = value
@@ -5061,11 +5407,53 @@ class ManualFitGUI(QMainWindow):
         self.update_batch_analysis_plot()
 
     def _show_analysis_message(self, message):
+        self._analysis_scatter_files = {}
         self.analysis_fig.clear()
         ax = self.analysis_fig.add_subplot(111)
         ax.text(0.5, 0.5, message, ha="center", va="center")
         ax.set_axis_off()
         self.analysis_canvas.draw_idle()
+
+    def _analysis_record_file_ref(self, record):
+        file_ref = str(record.get("__file_ref") or "").strip()
+        if file_ref:
+            return file_ref
+
+        display_name = str(record.get("File") or "").strip()
+        if not display_name:
+            return None
+
+        matches = [
+            file_path
+            for file_path in self.data_files
+            if display_name_for_file_ref(file_path) == display_name
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        return None
+
+    def _on_analysis_point_picked(self, event):
+        artist = getattr(event, "artist", None)
+        if artist is None:
+            return
+        file_refs = self._analysis_scatter_files.get(artist)
+        if not file_refs:
+            return
+
+        picked = getattr(event, "ind", None)
+        if picked is None or len(picked) == 0:
+            return
+        point_idx = int(picked[0])
+        if point_idx < 0 or point_idx >= len(file_refs):
+            return
+
+        file_ref = file_refs[point_idx]
+        if not file_ref:
+            self.stats_text.append(
+                "Unable to resolve clicked point to a unique source file."
+            )
+            return
+        self._open_file_in_plot_tab(file_ref)
 
     def _linear_fit(self, x_data, y_data):
         if x_data.size < 2:
@@ -5082,6 +5470,7 @@ class ManualFitGUI(QMainWindow):
         """Plot parameter variation against selected field."""
         if not hasattr(self, "analysis_fig"):
             return
+        self._analysis_scatter_files = {}
         if not self.analysis_numeric_data:
             self._show_analysis_message("No numeric data available for analysis.")
             return
@@ -5127,17 +5516,24 @@ class ManualFitGUI(QMainWindow):
             plotted_any = True
             x_plot = x_values[mask]
             y_plot = y_values[mask]
+            file_refs = [
+                self._analysis_record_file_ref(self.analysis_records[row_idx])
+                for row_idx in np.flatnonzero(mask)
+            ]
             order = np.argsort(x_plot)
             x_sorted = x_plot[order]
             y_sorted = y_plot[order]
-            color = f"C{idx % 10}"
+            file_refs_sorted = [file_refs[int(order_idx)] for order_idx in order]
+            color = palette_color(idx)
             target_ax = axes[idx] if len(axes) > 1 else axes[0]
 
             if show_points:
                 scatter_label = param_name if not show_series_line else "_nolegend_"
-                target_ax.scatter(
+                scatter = target_ax.scatter(
                     x_sorted, y_sorted, s=26, color=color, label=scatter_label
                 )
+                scatter.set_picker(5)
+                self._analysis_scatter_files[scatter] = file_refs_sorted
             if show_series_line:
                 target_ax.plot(
                     x_sorted,
@@ -5202,10 +5598,11 @@ class ManualFitGUI(QMainWindow):
 
     def _full_batch_thumbnail_size(self):
         full_height = max(
-            24,
+            48,
             int(
                 round(
-                    (self.batch_row_height_max - 8) * self.batch_thumbnail_supersample
+                    (self._current_batch_row_height() - 8)
+                    * self.batch_thumbnail_supersample
                 )
             ),
         )
@@ -5307,11 +5704,28 @@ class ManualFitGUI(QMainWindow):
         preserve_fit_result=False,
     ):
         existing_row = existing or {}
-        existing_plot_full = existing_row.get("plot_full")
-        if existing_plot_full is None:
-            existing_plot_full = existing_row.get("plot")
-        if existing_plot_full is None:
-            existing_plot_full = existing_row.get("thumbnail")
+        existing_plot_full = None
+        existing_plot = None
+        existing_plot_render_size = None
+        existing_plot_has_fit = existing_row.get("plot_has_fit")
+        if existing_plot_has_fit is None:
+            existing_plot_has_fit = bool(existing_row.get("params"))
+        if preserve_fit_result:
+            existing_plot_full = existing_row.get("plot_full")
+            if existing_plot_full is None:
+                existing_plot_full = existing_row.get("plot")
+            if existing_plot_full is None:
+                existing_plot_full = existing_row.get("thumbnail")
+            existing_plot = existing_row.get("plot")
+            existing_plot_render_size = existing_row.get("plot_render_size")
+        elif not existing_plot_has_fit:
+            existing_plot_full = existing_row.get("plot_full")
+            if existing_plot_full is None:
+                existing_plot_full = existing_row.get("plot")
+            if existing_plot_full is None:
+                existing_plot_full = existing_row.get("thumbnail")
+            existing_plot = existing_row.get("plot")
+            existing_plot_render_size = existing_row.get("plot_render_size")
         return make_batch_result_row(
             source_index=source_index,
             file_path=file_path,
@@ -5322,13 +5736,29 @@ class ManualFitGUI(QMainWindow):
             r2=existing_row.get("r2") if preserve_fit_result else None,
             error=existing_row.get("error") if preserve_fit_result else None,
             plot_full=existing_plot_full,
-            plot=existing_row.get("plot"),
-            fit_attempts=existing_row.get("fit_attempts"),
-            fit_best_sse=existing_row.get("fit_best_sse"),
-            fit_mode=existing_row.get("fit_mode"),
-            fit_seed=existing_row.get("fit_seed"),
-            fit_requested_starts=existing_row.get("fit_requested_starts"),
-            fit_de_used=existing_row.get("fit_de_used"),
+            plot=existing_plot,
+            plot_has_fit=(
+                bool(existing_plot_has_fit) if existing_plot_full is not None else None
+            ),
+            plot_render_size=(
+                existing_plot_render_size if existing_plot_full is not None else None
+            ),
+            fit_attempts=(
+                existing_row.get("fit_attempts") if preserve_fit_result else None
+            ),
+            fit_best_sse=(
+                existing_row.get("fit_best_sse") if preserve_fit_result else None
+            ),
+            fit_mode=existing_row.get("fit_mode") if preserve_fit_result else None,
+            fit_seed=existing_row.get("fit_seed") if preserve_fit_result else None,
+            fit_requested_starts=(
+                existing_row.get("fit_requested_starts")
+                if preserve_fit_result
+                else None
+            ),
+            fit_de_used=(
+                existing_row.get("fit_de_used") if preserve_fit_result else None
+            ),
             pattern_error=pattern_error,
         )
 
@@ -5362,6 +5792,7 @@ class ManualFitGUI(QMainWindow):
         if not self.data_files:
             self.current_data = None
             self.cached_time_data = None
+            self.raw_channel_cache = {}
             self.channel_cache = {}
             self._expression_channel_data_cache = None
             self._last_file_load_error = ""
@@ -5502,6 +5933,7 @@ class ManualFitGUI(QMainWindow):
         self._fit_window_bounds_ms = (None, None)
         self._fit_boundary_positions_ms = ()
         self._recreate_fit_region_selector()
+        self._reset_plot_home_view()
         self.canvas.draw_idle()
 
     def load_file(self, idx, *, report_errors=True):
@@ -5539,21 +5971,26 @@ class ManualFitGUI(QMainWindow):
                 self.cached_time_data = (
                     self.current_data[time_src].to_numpy(dtype=float, copy=True) * 1e3
                 )
+                self.raw_channel_cache = {}
                 self.channel_cache = {}
                 for col in self.current_data.columns:
                     try:
-                        self.channel_cache[col] = self.current_data[col].to_numpy(
-                            dtype=float, copy=True
+                        self.raw_channel_cache[col] = self.current_data[col].to_numpy(
+                            dtype=float,
+                            copy=True,
                         )
                     except Exception:
                         continue
-                self._expression_channel_data_cache = dict(self.channel_cache)
+                self._rebuild_channel_cache_from_raw()
                 self._refresh_channel_combos()
+                self._apply_batch_params_for_file(file_path)
                 self.update_plot(fast=False)
+                self._reset_plot_home_view()
                 loaded_ok = True
             except Exception as e:
                 self.current_data = None
                 self.cached_time_data = None
+                self.raw_channel_cache = {}
                 self.channel_cache = {}
                 self._expression_channel_data_cache = None
                 file_path = self.data_files[idx]
@@ -5593,6 +6030,41 @@ class ManualFitGUI(QMainWindow):
     def get_batch_params(self):
         """Get batch fit initial parameters from shared controls."""
         return self.get_current_params()
+
+    def _apply_batch_params_for_file(self, file_path):
+        """Apply batch-fitted parameters for this file if available."""
+        if not file_path or not getattr(self, "batch_results", None):
+            return False
+
+        matched_row = None
+        for row in self.batch_results:
+            if row.get("file") == file_path and row.get("params"):
+                matched_row = row
+                break
+        if matched_row is None:
+            return False
+
+        params = matched_row.get("params")
+        if not isinstance(params, (list, tuple)):
+            return False
+        if len(params) < len(self.param_specs):
+            return False
+
+        changed = False
+        for idx, spec in enumerate(self.param_specs):
+            spinbox = self.param_spinboxes.get(spec.key)
+            if spinbox is None:
+                continue
+            try:
+                value = float(params[idx])
+            except Exception:
+                continue
+            if not np.isfinite(value):
+                continue
+            if not np.isclose(float(spinbox.value()), value):
+                changed = True
+            spinbox.setValue(value)
+        return changed
 
     def reset_params(self):
         """Reset all parameter values to midpoint of their current bounds."""
@@ -5802,6 +6274,7 @@ class ManualFitGUI(QMainWindow):
         )
         self.stats_text.append(summary)
         self.update_plot()
+        self._reset_plot_home_view()
         self.cleanup_fit_thread()
 
     def on_fit_failed(self, error_text):
@@ -5899,8 +6372,10 @@ class ManualFitGUI(QMainWindow):
         if channel_name not in self.current_data.columns:
             raise KeyError(f"Channel '{channel_name}' not found in data.")
         values = self.current_data[channel_name].to_numpy(dtype=float, copy=True)
-        self.channel_cache[channel_name] = values
-        return values
+        self.raw_channel_cache[channel_name] = values
+        smoothed = self._smooth_channel_values(values)
+        self.channel_cache[channel_name] = smoothed
+        return smoothed
 
     def _display_indices(self, n_points):
         if n_points <= 0:
@@ -6177,11 +6652,9 @@ class ManualFitGUI(QMainWindow):
             for idx, (channel_name, values) in enumerate(
                 context.get("plot_channel_displays", {}).items()
             ):
-                color = f"C{idx % 10}"
+                color = palette_color(idx)
                 channel_inside = np.where(context["fit_mask_display"], values, np.nan)
-                channel_outside = np.where(
-                    context["fit_mask_display"], np.nan, values
-                )
+                channel_outside = np.where(context["fit_mask_display"], np.nan, values)
                 self.ax.plot(
                     context["time_display"],
                     channel_outside,
@@ -6253,7 +6726,9 @@ class ManualFitGUI(QMainWindow):
                 full_r2_value = self._last_r2_full
 
             channel_arrays = list(context.get("plot_channel_displays", {}).values())
-            y_min, y_max = self._finite_min_max(*channel_arrays, series["fitted_display"])
+            y_min, y_max = self._finite_min_max(
+                *channel_arrays, series["fitted_display"]
+            )
             self.ax.set_ylim(y_min, y_max)
             self._apply_unique_legend(self.ax, loc="lower right")
             self.ax.set_xlabel("" if show_residuals else "Time (ms)")
@@ -6353,6 +6828,8 @@ class ManualFitGUI(QMainWindow):
             self.fit_region_start_pct,
             self.fit_region_end_pct,
             fit_options,
+            smoothing_enabled=self.smoothing_enabled,
+            smoothing_window=self._effective_smoothing_window(),
         )
         self.batch_worker.moveToThread(self.batch_thread)
 
@@ -6390,14 +6867,34 @@ class ManualFitGUI(QMainWindow):
                     break
         if row_index is not None and 0 <= row_index < len(self.batch_results):
             existing = self.batch_results[row_index]
-            if existing.get("plot_full") is not None and row.get("plot_full") is None:
+            row_has_fit = bool(row.get("params"))
+            existing_plot_has_fit = existing.get("plot_has_fit")
+            if existing_plot_has_fit is None:
+                existing_plot_has_fit = bool(existing.get("params"))
+            if (
+                (not row_has_fit)
+                and (not existing_plot_has_fit)
+                and existing.get("plot_full") is not None
+                and row.get("plot_full") is None
+            ):
                 row["plot_full"] = existing["plot_full"]
-            elif existing.get("plot") is not None and row.get("plot") is None:
+                row["plot_has_fit"] = False
+                row["plot_render_size"] = existing.get("plot_render_size")
+            elif (
+                (not row_has_fit)
+                and (not existing_plot_has_fit)
+                and existing.get("plot") is not None
+                and row.get("plot") is None
+            ):
                 row["plot"] = existing["plot"]
+                row["plot_has_fit"] = False
+                row["plot_render_size"] = existing.get("plot_render_size")
             self.batch_results[row_index] = row
             table_row_idx = self._find_table_row_by_file(row["file"])
             if table_row_idx is not None:
                 self.update_batch_table_row(table_row_idx, row)
+            if row_has_fit and row.get("plot_full") is None:
+                self._start_thumbnail_render(row_indices=[row_index])
 
     def on_batch_finished(self, results):
         """Populate table and thumbnails after batch fit finishes."""
@@ -6408,10 +6905,22 @@ class ManualFitGUI(QMainWindow):
         self.batch_results = ordered_results
         for row in self.batch_results:
             existing = previous_by_file.get(row["file"])
-            if existing and existing.get("plot_full") is not None:
+            if not existing:
+                continue
+            row_has_fit = bool(row.get("params"))
+            existing_plot_has_fit = existing.get("plot_has_fit")
+            if existing_plot_has_fit is None:
+                existing_plot_has_fit = bool(existing.get("params"))
+            if row_has_fit or existing_plot_has_fit:
+                continue
+            if existing.get("plot_full") is not None and row.get("plot_full") is None:
                 row["plot_full"] = existing["plot_full"]
-            elif existing and existing.get("plot") is not None:
+                row["plot_has_fit"] = False
+                row["plot_render_size"] = existing.get("plot_render_size")
+            elif existing.get("plot") is not None and row.get("plot") is None:
                 row["plot"] = existing["plot"]
+                row["plot_has_fit"] = False
+                row["plot_render_size"] = existing.get("plot_render_size")
         self.update_batch_table()
         self._refresh_batch_analysis_if_run()
         self.stats_text.append("✓ Batch fit completed.")
@@ -6500,8 +7009,9 @@ class ManualFitGUI(QMainWindow):
                 ["Plot"]
                 + ["File"]
                 + self.batch_capture_keys
+                + ["R2"]
                 + [spec.column_name for spec in self.param_specs]
-                + ["R2", "Error"]
+                + ["Error"]
             )
             self.batch_table.setColumnCount(len(columns))
             self.batch_table.setHorizontalHeaderLabels(columns)
@@ -6537,8 +7047,25 @@ class ManualFitGUI(QMainWindow):
                     row_idx, col_idx, NumericSortTableWidgetItem(str(value))
                 )
 
-            # Parameter columns (start at 2 + len(batch_capture_keys))
-            param_start = 2 + len(self.batch_capture_keys)
+            # R2 column comes right after capture columns.
+            r2_col = 2 + len(self.batch_capture_keys)
+            # Parameter columns come after R2.
+            param_start = r2_col + 1
+
+            r2_val = row.get("r2")
+            if r2_val is not None:
+                self.batch_table.setItem(
+                    row_idx,
+                    r2_col,
+                    NumericSortTableWidgetItem(f"{r2_val:.6f}"),
+                )
+            else:
+                self.batch_table.setItem(
+                    row_idx,
+                    r2_col,
+                    NumericSortTableWidgetItem(""),
+                )
+
             params = row.get("params")
             for offset in range(len(self.param_specs)):
                 if params and offset < len(params):
@@ -6550,23 +7077,10 @@ class ManualFitGUI(QMainWindow):
                     param_start + offset,
                     NumericSortTableWidgetItem(cell_text),
                 )
-            r2_val = row.get("r2")
-            if r2_val is not None:
-                self.batch_table.setItem(
-                    row_idx,
-                    param_start + len(self.param_specs),
-                    NumericSortTableWidgetItem(f"{r2_val:.6f}"),
-                )
-            else:
-                self.batch_table.setItem(
-                    row_idx,
-                    param_start + len(self.param_specs),
-                    NumericSortTableWidgetItem(""),
-                )
             error_text = self._batch_row_error_text(row)
             self.batch_table.setItem(
                 row_idx,
-                param_start + len(self.param_specs) + 1,
+                param_start + len(self.param_specs),
                 NumericSortTableWidgetItem(error_text),
             )
             self._apply_batch_row_error_background(row_idx, bool(error_text))
@@ -6617,6 +7131,12 @@ class ManualFitGUI(QMainWindow):
         if not file_path:
             return
 
+        self._open_file_in_plot_tab(file_path)
+
+    def _open_file_in_plot_tab(self, file_path):
+        if not file_path:
+            return False
+
         if file_path not in self.data_files:
             self.data_files.append(file_path)
             self.file_combo.addItem(display_name_for_file_ref(file_path), file_path)
@@ -6625,6 +7145,7 @@ class ManualFitGUI(QMainWindow):
         file_idx = self.data_files.index(file_path)
         self.load_file(file_idx)
         self.tabs.setCurrentWidget(self.manual_tab)
+        return True
 
     def _expand_file_column_for_selected_files(self):
         """Expand file column width to show the longest selected file name."""
@@ -6657,12 +7178,92 @@ class ManualFitGUI(QMainWindow):
                 visible.append(row_idx)
         return visible
 
+    def _visible_batch_result_indices(self):
+        """Return visible rows mapped to indices in self.batch_results."""
+        if not self.batch_results:
+            return []
+        visible_table_rows = self._visible_batch_row_indices()
+        if not visible_table_rows:
+            return []
+
+        result_index_by_file = {
+            row.get("file"): idx for idx, row in enumerate(self.batch_results)
+        }
+        visible_result_rows = []
+        seen = set()
+        for table_row in visible_table_rows:
+            file_path = None
+            for col_idx in (0, 1):
+                item = self.batch_table.item(table_row, col_idx)
+                if item is not None:
+                    file_path = item.data(Qt.ItemDataRole.UserRole)
+                if file_path:
+                    break
+            if not file_path:
+                continue
+            result_idx = result_index_by_file.get(file_path)
+            if result_idx is None or result_idx in seen:
+                continue
+            visible_result_rows.append(result_idx)
+            seen.add(result_idx)
+        return visible_result_rows
+
+    def _prioritize_thumbnail_rows(self, row_indices):
+        ordered = []
+        seen = set()
+        for idx in row_indices:
+            try:
+                row_idx = int(idx)
+            except Exception:
+                continue
+            if 0 <= row_idx < len(self.batch_results) and row_idx not in seen:
+                ordered.append(row_idx)
+                seen.add(row_idx)
+
+        if not ordered:
+            return []
+
+        visible_set = set(self._visible_batch_result_indices())
+        visible_first = [idx for idx in ordered if idx in visible_set]
+        not_visible = [idx for idx in ordered if idx not in visible_set]
+        return visible_first + not_visible
+
+    def _row_thumbnail_render_size(self, row):
+        size_meta = row.get("plot_render_size")
+        if isinstance(size_meta, (tuple, list)) and len(size_meta) == 2:
+            try:
+                return (int(size_meta[0]), int(size_meta[1]))
+            except Exception:
+                pass
+
+        source = row.get("plot_full") or row.get("plot")
+        if source is not None:
+            try:
+                width = int(source.width())
+                height = int(source.height())
+                if width > 0 and height > 0:
+                    return (width, height)
+            except Exception:
+                pass
+        return None
+
+    def _batch_row_thumbnail_needs_render(self, row, expected_size):
+        source = row.get("plot_full") or row.get("plot")
+        if source is None:
+            return True
+
+        rendered_size = self._row_thumbnail_render_size(row)
+        if rendered_size is None:
+            return True
+        return tuple(rendered_size) != tuple(expected_size)
+
     def queue_visible_thumbnail_render(self, *_args):
-        if not self.batch_results or self.batch_fit_in_progress:
+        if not self.batch_results:
             return
-        row_indices = self._visible_batch_row_indices()
+        row_indices = self._visible_batch_result_indices()
         if not row_indices:
             row_indices = list(range(min(len(self.batch_results), 10)))
+        row_indices = self._prioritize_thumbnail_rows(row_indices)
         self._start_thumbnail_render(row_indices=row_indices)
 
     def _start_thumbnail_render(self, row_indices=None):
@@ -6670,20 +7271,19 @@ class ManualFitGUI(QMainWindow):
         if not self.batch_results:
             return
 
+        expected_size = self._full_batch_thumbnail_size()
+
         if row_indices is None:
             candidate_rows = list(range(len(self.batch_results)))
         else:
-            candidate_rows = sorted(
-                {
-                    int(idx)
-                    for idx in row_indices
-                    if 0 <= int(idx) < len(self.batch_results)
-                }
-            )
+            candidate_rows = self._prioritize_thumbnail_rows(row_indices)
+        candidate_rows = self._prioritize_thumbnail_rows(candidate_rows)
         candidate_rows = [
             idx
             for idx in candidate_rows
-            if self.batch_results[idx].get("plot_full") is None
+            if self._batch_row_thumbnail_needs_render(
+                self.batch_results[idx], expected_size
+            )
         ]
         if not candidate_rows:
             return
@@ -6702,8 +7302,10 @@ class ManualFitGUI(QMainWindow):
         self.thumb_worker = ThumbnailRenderWorker(
             self.batch_results,
             thumbnail_model_func,
-            full_thumbnail_size=self._full_batch_thumbnail_size(),
+            full_thumbnail_size=expected_size,
             row_indices=candidate_rows,
+            smoothing_enabled=self.smoothing_enabled,
+            smoothing_window=self._effective_smoothing_window(),
         )
         self.thumb_worker.moveToThread(self.thumb_thread)
 
@@ -6737,25 +7339,9 @@ class ManualFitGUI(QMainWindow):
         self.thumb_worker = None
         self.thumb_render_in_progress = False
         if self._pending_thumbnail_rows:
-            queued = sorted(self._pending_thumbnail_rows)
+            queued = self._prioritize_thumbnail_rows(self._pending_thumbnail_rows)
             self._pending_thumbnail_rows.clear()
             self._start_thumbnail_render(row_indices=queued)
-
-    def _batch_export_default_filename(self):
-        pattern_text = (
-            self.regex_input.text().strip() if hasattr(self, "regex_input") else ""
-        )
-        base = pattern_text or "batch_fit_results"
-        base = base.replace("*", "any")
-        base = re.sub(r"\{([^{}]+)\}", r"\1", base)
-        base = re.sub(r"\s+", "_", base)
-        base = re.sub(r"[^A-Za-z0-9._-]+", "_", base)
-        base = re.sub(r"_+", "_", base).strip("._-")
-        if not base:
-            base = "batch_fit_results"
-        if len(base) > 100:
-            base = base[:100].rstrip("._-")
-        return f"{base}.csv"
 
     def export_batch_table(self):
         """Export batch table to CSV."""
@@ -6763,10 +7349,15 @@ class ManualFitGUI(QMainWindow):
             self.stats_text.append("No batch results to export.")
             return
 
+        filename = (
+            self.regex_input.text().strip()
+            if hasattr(self, "regex_input")
+            else "failed"
+        )
         file_path, _ = QFileDialog.getSaveFileName(
             self,
             "Export Batch Table",
-            str(Path.cwd() / self._batch_export_default_filename()),
+            str(Path.cwd() / f"{filename}.csv"),
             "CSV Files (*.csv);;All Files (*.*)",
         )
         if not file_path:
@@ -6775,8 +7366,9 @@ class ManualFitGUI(QMainWindow):
         columns = (
             ["File"]
             + self.batch_capture_keys
+            + ["R2"]
             + [spec.column_name for spec in self.param_specs]
-            + ["R2", "Error", "FitMode", "FitAttempts", "FitBestSSE"]
+            + ["Error", "FitMode", "FitAttempts", "FitBestSSE"]
         )
 
         try:
@@ -6795,11 +7387,11 @@ class ManualFitGUI(QMainWindow):
                     writer.writerow(
                         [file_name]
                         + [captures.get(key, "") for key in self.batch_capture_keys]
+                        + [f"{r2_val:.6f}" if r2_val is not None else ""]
                         + [
                             f"{val:.6f}" if isinstance(val, float) else val
                             for val in params
                         ]
-                        + [f"{r2_val:.6f}" if r2_val is not None else ""]
                         + [error_text]
                         + [fit_mode]
                         + [str(int(fit_attempts)) if fit_attempts is not None else ""]
