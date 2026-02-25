@@ -6,20 +6,32 @@ Allows manual adjustment of parameters for failed automatic fits.
 
 import ast
 import html
+import os
 import math
 import sys
 import re
-import csv
+import json
 import zipfile
+from collections import deque
 from io import BytesIO
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Mapping, Optional, Pattern, Sequence, Tuple
+from datetime import datetime, timezone
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Pattern,
+    Sequence,
+    Tuple,
+)
 import numpy as np
 from pathlib import Path
 from sklearn.metrics import r2_score
 from pandas import read_csv
-from scipy.optimize import curve_fit, differential_evolution
+from scipy.optimize import curve_fit, least_squares
 
 from PyQt6.QtWidgets import (
     QApplication,
@@ -38,6 +50,7 @@ from PyQt6.QtWidgets import (
     QTextEdit,
     QFileDialog,
     QLineEdit,
+    QScrollArea,
     QTableWidget,
     QTableWidgetItem,
     QHeaderView,
@@ -48,24 +61,38 @@ from PyQt6.QtWidgets import (
     QMenu,
     QDialog,
     QDialogButtonBox,
-    QFormLayout,
+    QStyle,
+    QStyleOptionComboBox,
+    QStyleOptionHeader,
+    QStyleOptionViewItem,
+    QStyledItemDelegate,
 )
-from PyQt6.QtCore import Qt, QTimer, QSize, QEvent
+from PyQt6.QtCore import Qt, QTimer, QSize, QEvent, QRectF
 from PyQt6.QtCore import QObject, QThread, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import (
     QIcon,
     QPixmap,
     QPalette,
     QColor,
+    QPainter,
+    QPen,
+    QBrush,
     QTextCharFormat,
     QSyntaxHighlighter,
     QFont,
+    QTextDocument,
 )
 
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
-from matplotlib.widgets import SpanSelector
+
+from ordered_blended_solver import (
+    OrderedPiecewiseConfig,
+    SegmentSpec,
+    predict_ordered_piecewise,
+    refit_ordered_piecewise_from_seed,
+)
 
 # use Qt5Agg backend for better performance
 from matplotlib.pyplot import switch_backend
@@ -147,11 +174,6 @@ def stem_for_file_ref(file_ref: str) -> str:
         _zip_path, member = file_ref.split("::", 1)
         return Path(member).stem
     return Path(file_ref).stem
-
-
-def display_name_for_file_ref(file_ref: str) -> str:
-    """Display only the data-file stem (no zip archive name, no .csv suffix)."""
-    return stem_for_file_ref(file_ref)
 
 
 def clear_layout(layout):
@@ -291,6 +313,355 @@ class VerticallyCenteredTextEdit(QTextEdit):
         self.setViewportMargins(0, top_margin, 0, 0)
 
 
+_UNICODE_SUBSCRIPT_TRANS = str.maketrans(
+    {
+        "0": "₀",
+        "1": "₁",
+        "2": "₂",
+        "3": "₃",
+        "4": "₄",
+        "5": "₅",
+        "6": "₆",
+        "7": "₇",
+        "8": "₈",
+        "9": "₉",
+        "-": "₋",
+        "+": "₊",
+    }
+)
+
+
+def _format_boundary_display_name(index: int) -> str:
+    idx = max(0, int(index))
+    return f"X{str(idx).translate(_UNICODE_SUBSCRIPT_TRANS)}"
+
+
+_RICH_TEXT_ROLE = int(Qt.ItemDataRole.UserRole) + 11
+
+
+class RichTextItemDelegate(QStyledItemDelegate):
+    """Render HTML snippets stored in _RICH_TEXT_ROLE."""
+
+    def paint(self, painter, option, index):
+        html_text = index.data(_RICH_TEXT_ROLE)
+        if not html_text:
+            super().paint(painter, option, index)
+            return
+
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        opt.text = ""
+        style = opt.widget.style() if opt.widget is not None else QApplication.style()
+        style.drawControl(
+            QStyle.ControlElement.CE_ItemViewItem, opt, painter, opt.widget
+        )
+
+        text_rect = style.subElementRect(
+            QStyle.SubElement.SE_ItemViewItemText, opt, opt.widget
+        )
+        if not text_rect.isValid():
+            return
+        doc = QTextDocument()
+        doc.setDefaultFont(opt.font)
+        doc.setHtml(str(html_text))
+        doc.setTextWidth(float(max(0, text_rect.width())))
+        painter.save()
+        painter.setClipRect(text_rect)
+        y_offset = text_rect.top() + (text_rect.height() - doc.size().height()) * 0.5
+        painter.translate(text_rect.left(), y_offset)
+        doc.drawContents(
+            painter,
+            QRectF(0.0, 0.0, float(text_rect.width()), float(text_rect.height())),
+        )
+        painter.restore()
+
+    def sizeHint(self, option, index):
+        html_text = index.data(_RICH_TEXT_ROLE)
+        if not html_text:
+            return super().sizeHint(option, index)
+        doc = QTextDocument()
+        doc.setDefaultFont(option.font)
+        doc.setHtml(str(html_text))
+        size = doc.size()
+        base = super().sizeHint(option, index)
+        return QSize(
+            max(base.width(), int(math.ceil(size.width())) + 10),
+            max(base.height(), int(math.ceil(size.height())) + 6),
+        )
+
+
+class RichTextComboBox(QComboBox):
+    """QComboBox that renders HTML labels for popup items and current selection."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setItemDelegate(RichTextItemDelegate(self))
+
+    def add_rich_item(self, plain_text, user_data=None, html_text=None):
+        self.addItem(str(plain_text), user_data)
+        idx = self.count() - 1
+        if html_text is not None:
+            self.setItemData(idx, str(html_text), _RICH_TEXT_ROLE)
+
+    def paintEvent(self, event):
+        _ = event
+        idx = self.currentIndex()
+        rich_html = self.itemData(idx, _RICH_TEXT_ROLE) if idx >= 0 else None
+        if not rich_html:
+            super().paintEvent(event)
+            return
+
+        painter = QPainter(self)
+        opt = QStyleOptionComboBox()
+        self.initStyleOption(opt)
+        opt.currentText = ""
+        style = self.style()
+        style.drawComplexControl(QStyle.ComplexControl.CC_ComboBox, opt, painter, self)
+        style.drawControl(QStyle.ControlElement.CE_ComboBoxLabel, opt, painter, self)
+
+        text_rect = style.subControlRect(
+            QStyle.ComplexControl.CC_ComboBox,
+            opt,
+            QStyle.SubControl.SC_ComboBoxEditField,
+            self,
+        )
+        if not text_rect.isValid():
+            return
+        doc = QTextDocument()
+        doc.setDefaultFont(self.font())
+        doc.setHtml(str(rich_html))
+        doc.setTextWidth(float(max(0, text_rect.width())))
+        painter.save()
+        painter.setClipRect(text_rect)
+        y_offset = text_rect.top() + (text_rect.height() - doc.size().height()) * 0.5
+        painter.translate(text_rect.left(), y_offset)
+        doc.drawContents(
+            painter,
+            QRectF(0.0, 0.0, float(text_rect.width()), float(text_rect.height())),
+        )
+        painter.restore()
+
+
+class RichTextHeaderView(QHeaderView):
+    """Header view that can render selected section labels as rich text."""
+
+    def __init__(self, orientation, parent=None):
+        super().__init__(orientation, parent)
+        self._section_html_map = {}
+
+    def set_section_html_map(self, mapping):
+        self._section_html_map = {
+            int(key): str(value)
+            for key, value in dict(mapping or {}).items()
+            if value not in (None, "")
+        }
+        self.viewport().update()
+
+    def paintSection(self, painter, rect, logical_index):
+        html_text = self._section_html_map.get(int(logical_index))
+        if not html_text:
+            super().paintSection(painter, rect, logical_index)
+            return
+
+        opt = QStyleOptionHeader()
+        self.initStyleOption(opt)
+        if hasattr(self, "initStyleOptionForIndex"):
+            self.initStyleOptionForIndex(opt, int(logical_index))
+        opt.rect = rect
+        opt.section = int(logical_index)
+        opt.text = ""
+        style = self.style()
+        style.drawControl(QStyle.ControlElement.CE_HeaderSection, opt, painter, self)
+        style.drawControl(QStyle.ControlElement.CE_HeaderLabel, opt, painter, self)
+
+        text_rect = style.subElementRect(QStyle.SubElement.SE_HeaderLabel, opt, self)
+        if not text_rect.isValid():
+            text_rect = rect.adjusted(4, 0, -4, 0)
+
+        doc = QTextDocument()
+        doc.setDefaultFont(self.font())
+        doc.setHtml(str(html_text))
+        doc.setTextWidth(float(max(0, text_rect.width())))
+        painter.save()
+        painter.setClipRect(text_rect)
+        y_offset = text_rect.top() + (text_rect.height() - doc.size().height()) * 0.5
+        painter.translate(text_rect.left(), y_offset)
+        doc.drawContents(
+            painter,
+            QRectF(0.0, 0.0, float(text_rect.width()), float(text_rect.height())),
+        )
+        painter.restore()
+
+
+class MultiHandleSlider(QWidget):
+    """Horizontal slider with multiple draggable handles in [0, 1]."""
+
+    valuesChanged = pyqtSignal(object)
+    sliderPressed = pyqtSignal()
+    sliderReleased = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._values = []
+        self._labels = []
+        self._active_index = -1
+        self._handle_radius = 7
+        self._track_margin = 10
+        self.setMinimumHeight(32)
+        self.setMaximumHeight(32)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setMouseTracking(True)
+
+    def values(self):
+        return list(self._values)
+
+    def set_values(self, values):
+        arr = np.asarray(values, dtype=float).reshape(-1)
+        if arr.size == 0:
+            self._values = []
+            self.update()
+            return
+        arr = np.clip(arr, 0.0, 1.0)
+        arr = np.maximum.accumulate(arr)
+        self._values = [float(v) for v in arr.tolist()]
+        self.update()
+
+    def set_labels(self, labels):
+        if labels is None:
+            self._labels = []
+            self.update()
+            return
+        self._labels = [str(item) for item in list(labels)]
+        self.update()
+
+    def _track_geometry(self):
+        margin = int(min(max(6, self._handle_radius + 1), max(6, self.width() // 5)))
+        x0 = margin
+        x1 = max(margin + 1, self.width() - margin)
+        y = int(round(self.height() * 0.68))
+        return x0, x1, y
+
+    def _value_to_x(self, value):
+        x0, x1, _ = self._track_geometry()
+        ratio = float(np.clip(value, 0.0, 1.0))
+        return x0 + ratio * float(x1 - x0)
+
+    def _x_to_value(self, x_pos):
+        x0, x1, _ = self._track_geometry()
+        span = max(1.0, float(x1 - x0))
+        ratio = (float(x_pos) - float(x0)) / span
+        return float(np.clip(ratio, 0.0, 1.0))
+
+    def _nearest_handle_index(self, x_pos):
+        if not self._values:
+            return -1
+        distances = [abs(self._value_to_x(v) - float(x_pos)) for v in self._values]
+        return int(np.argmin(distances))
+
+    def _set_handle_from_x(self, index, x_pos, *, emit_signal):
+        if index < 0 or index >= len(self._values):
+            return
+        proposed = self._x_to_value(x_pos)
+        x0, x1, _ = self._track_geometry()
+        epsilon = 1.0 / max(1.0, float(x1 - x0))
+        lower = self._values[index - 1] + epsilon if index > 0 else 0.0
+        upper = (
+            self._values[index + 1] - epsilon if index < len(self._values) - 1 else 1.0
+        )
+        if lower > upper:
+            lower = self._values[index - 1] if index > 0 else 0.0
+            upper = self._values[index + 1] if index < len(self._values) - 1 else 1.0
+        value = float(np.clip(proposed, lower, upper))
+        changed = not np.isclose(value, self._values[index])
+        self._values[index] = value
+        self.update()
+        if changed and emit_signal:
+            self.valuesChanged.emit(self.values())
+
+    def paintEvent(self, event):
+        _ = event
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        x0, x1, y = self._track_geometry()
+
+        track_pen = QPen(QColor("#cbd5e1"), 4)
+        track_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(track_pen)
+        painter.drawLine(x0, y, x1, y)
+
+        label_font = QFont(painter.font())
+        label_font.setPointSize(max(7, int(label_font.pointSize()) - 1))
+        painter.setFont(label_font)
+        metrics = painter.fontMetrics()
+
+        for idx, value in enumerate(self._values):
+            x_pos = int(round(self._value_to_x(value)))
+            is_active = idx == self._active_index
+            painter.setPen(
+                QPen(QColor("#4b5563") if not is_active else QColor("#1d4ed8"), 1.2)
+            )
+            painter.setBrush(
+                QBrush(QColor("#6b7280") if not is_active else QColor("#2563eb"))
+            )
+            diameter = int(self._handle_radius * 2)
+            painter.drawEllipse(
+                int(x_pos - self._handle_radius),
+                int(y - self._handle_radius),
+                diameter,
+                diameter,
+            )
+
+            label = (
+                str(self._labels[idx])
+                if idx < len(self._labels) and str(self._labels[idx]).strip()
+                else _format_boundary_display_name(idx)
+            )
+            text_width = int(metrics.horizontalAdvance(label))
+            tx = int(round(x_pos - (text_width * 0.5)))
+            tx = max(0, min(tx, max(0, self.width() - text_width)))
+            baseline = max(metrics.ascent(), int(y - self._handle_radius - 4))
+            painter.setPen(QColor("#475569"))
+            painter.drawText(tx, baseline, label)
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.MouseButton.LeftButton or not self._values:
+            super().mousePressEvent(event)
+            return
+        self._active_index = self._nearest_handle_index(event.position().x())
+        if self._active_index >= 0:
+            self.sliderPressed.emit()
+            self._set_handle_from_x(
+                self._active_index,
+                event.position().x(),
+                emit_signal=True,
+            )
+        event.accept()
+
+    def mouseMoveEvent(self, event):
+        if self._active_index >= 0 and (event.buttons() & Qt.MouseButton.LeftButton):
+            self._set_handle_from_x(
+                self._active_index,
+                event.position().x(),
+                emit_signal=True,
+            )
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self._active_index >= 0:
+            self._set_handle_from_x(
+                self._active_index,
+                event.position().x(),
+                emit_signal=True,
+            )
+            self._active_index = -1
+            self.sliderReleased.emit()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+
 @dataclass(frozen=True)
 class ParameterSpec:
     key: str
@@ -318,39 +689,74 @@ class ParameterSpec:
 
 
 DEFAULT_WINDOW_TITLE = "Curve Fitting"
+FIT_DETAILS_FILENAME = "fit_details.json"
 DEFAULT_TARGET_CHANNEL = "CH2"
-DEFAULT_EXPRESSION = "abs(a * sin(b * CH3 + pi * phi) + d) ** 2"
+DEFAULT_EXPRESSION = (
+    "m*x+c ; abs(A_MI*sin(A_mod*sin(2*pi*f_mod*x+phi_mod)+phi_MI))**2+V_0 ; m*x+c"
+)
 DEFAULT_PARAM_SPECS = (
     ParameterSpec(
-        key="a",
-        symbol="A",
-        description="MI Amplitude",
-        default=0.74545,
-        min_value=0.0,
-        max_value=10.0,
-    ),
-    ParameterSpec(
-        key="b",
-        symbol="B",
-        description="Voltage to Phase",
-        default=-0.2175,
-        min_value=-2.0,
-        max_value=2.0,
-    ),
-    ParameterSpec(
-        key="phi",
-        symbol="φ",
-        description="MI Phase",
+        key="m",
+        symbol="m",
+        description="Linear slope",
         default=0.0,
         min_value=-2.0,
         max_value=2.0,
     ),
     ParameterSpec(
-        key="d",
-        symbol="D",
-        description="MI Offset",
-        default=1.7019,
-        min_value=-10.0,
+        key="c",
+        symbol="c",
+        description="Linear offset",
+        default=4.0,
+        min_value=0.0,
+        max_value=10.0,
+    ),
+    ParameterSpec(
+        key="A_MI",
+        symbol="A_{MI}",
+        description="Outer sinusoid amplitude",
+        default=2.0,
+        min_value=0.0,
+        max_value=10.0,
+    ),
+    ParameterSpec(
+        key="A_mod",
+        symbol="A_{mod}",
+        description="Inner modulation amplitude",
+        default=2.0,
+        min_value=0.0,
+        max_value=10.0,
+    ),
+    ParameterSpec(
+        key="f_mod",
+        symbol="f_{mod}",
+        description="Modulation frequency",
+        default=100.0,
+        min_value=0.0,
+        max_value=1e6,
+    ),
+    ParameterSpec(
+        key="phi_mod",
+        symbol="\\phi_{mod}",
+        description="Modulation phase",
+        default=0.0,
+        min_value=-4,
+        max_value=4,
+    ),
+    ParameterSpec(
+        key="phi_MI",
+        symbol="\\phi_{MI}",
+        description="Outer phase offset",
+        default=0.0,
+        min_value=-4,
+        max_value=4,
+    ),
+    ParameterSpec(
+        key="V_0",
+        symbol="V_{0}",
+        description="Vertical offset",
+        default=0.0,
+        min_value=0.0,
         max_value=10.0,
     ),
 )
@@ -418,16 +824,12 @@ def smooth_channel_array(values, window_size):
 
 
 @dataclass(frozen=True)
-class FitOptimizationOptions:
-    enabled: bool = False
-    n_starts: int = 10
-    per_start_maxfev: int = 1000
-    seed: int = 1
-    use_global_init: bool = True
-    de_maxiter: int = 20
-    de_popsize: int = 10
-    early_stop_r2: float = 0.999
-    early_stop_patience: int = 3
+class PiecewiseModelDefinition:
+    target_col: str
+    segment_exprs: Tuple[str, ...]
+    segment_param_names: Tuple[Tuple[str, ...], ...]
+    segment_evaluators: Tuple[Callable[..., np.ndarray], ...]
+    global_param_names: Tuple[str, ...]
 
 
 class FitCancelledError(RuntimeError):
@@ -444,79 +846,388 @@ def _sum_squared_error(y_true, y_pred):
     return float(np.dot(residual, residual))
 
 
-def fit_mode_label(options: Optional[FitOptimizationOptions]) -> str:
-    opts = (
-        options
-        if isinstance(options, FitOptimizationOptions)
-        else FitOptimizationOptions()
-    )
-    if not opts.enabled:
-        return "single-start"
-    if opts.use_global_init:
-        return "multi-start+de"
-    return "multi-start"
+def has_nonempty_values(values) -> bool:
+    if values is None:
+        return False
+    if isinstance(values, np.ndarray):
+        return bool(values.size > 0)
+    try:
+        return bool(len(values) > 0)
+    except Exception:
+        return bool(values)
 
 
-def build_fit_diagnostics_parts(
-    *,
-    mode=None,
-    attempts=None,
-    requested_starts=None,
-    seed=None,
-    de_used=None,
-    best_sse=None,
-    include_starts_suffix=False,
-):
-    parts = []
-    if mode:
-        parts.append(str(mode))
-    if attempts is not None and requested_starts is not None:
-        suffix = " starts" if include_starts_suffix else ""
-        parts.append(f"best of {attempts}/{requested_starts}{suffix}")
-    if seed is not None:
-        parts.append(f"seed={seed}")
-    if de_used is not None:
-        parts.append(f"DE={'on' if bool(de_used) else 'off'}")
-    if best_sse is not None:
+def _finite_float_or_none(value) -> Optional[float]:
+    try:
+        numeric = float(value)
+    except Exception:
+        return None
+    if not np.isfinite(numeric):
+        return None
+    return numeric
+
+
+def is_fit_row_improved(
+    candidate_row: Mapping[str, Any], baseline_row: Mapping[str, Any]
+) -> bool:
+    candidate_has_fit = has_nonempty_values(candidate_row.get("params"))
+    baseline_has_fit = has_nonempty_values(baseline_row.get("params"))
+    if candidate_has_fit and not baseline_has_fit:
+        return True
+    if not candidate_has_fit:
+        return False
+    if not baseline_has_fit:
+        return True
+
+    candidate_sse = _finite_float_or_none(candidate_row.get("fit_sse"))
+    baseline_sse = _finite_float_or_none(baseline_row.get("fit_sse"))
+    if candidate_sse is not None and baseline_sse is not None:
+        tolerance = 1e-12 * max(1.0, abs(baseline_sse))
+        return bool(candidate_sse < (baseline_sse - tolerance))
+    if candidate_sse is not None and baseline_sse is None:
+        return True
+    if candidate_sse is None and baseline_sse is not None:
+        return False
+
+    candidate_r2 = _finite_float_or_none(candidate_row.get("r2"))
+    baseline_r2 = _finite_float_or_none(baseline_row.get("r2"))
+    if candidate_r2 is not None and baseline_r2 is not None:
+        tolerance = 1e-12
+        return bool(candidate_r2 > (baseline_r2 + tolerance))
+    if candidate_r2 is not None and baseline_r2 is None:
+        return True
+    return False
+
+
+def default_boundary_ratios(n_boundaries: int) -> np.ndarray:
+    n = int(max(0, n_boundaries))
+    if n <= 0:
+        return np.asarray([], dtype=float)
+    pcts = np.linspace(1.0 / (n + 1), n / (n + 1), n)
+    ratios = np.empty(n, dtype=float)
+    prev = 0.0
+    for i, pct in enumerate(pcts):
+        denom = max(1.0 - prev, 1e-12)
+        ratios[i] = (float(pct) - prev) / denom
+        prev = float(pct)
+    return np.clip(ratios, 0.0, 1.0)
+
+
+def boundary_ratios_to_positions(
+    ratios: Sequence[float], n_boundaries: int
+) -> np.ndarray:
+    n = int(max(0, n_boundaries))
+    if n <= 0:
+        return np.asarray([], dtype=float)
+    ratio_arr = np.clip(np.asarray(ratios, dtype=float).reshape(-1), 0.0, 1.0)
+    if ratio_arr.size != n:
+        ratio_arr = default_boundary_ratios(n)
+    positions = np.empty(n, dtype=float)
+    prev = 0.0
+    for idx, ratio in enumerate(ratio_arr):
+        current = prev + (1.0 - prev) * float(ratio)
+        if idx > 0:
+            current = max(current, positions[idx - 1])
+        current = float(np.clip(current, 0.0, 1.0))
+        positions[idx] = current
+        prev = current
+    return positions
+
+
+def boundary_ratios_to_x_values(
+    ratios: Sequence[float], x_values: Sequence[float], n_boundaries: int
+) -> np.ndarray:
+    n = int(max(0, n_boundaries))
+    if n <= 0:
+        return np.asarray([], dtype=float)
+    x_arr = np.asarray(x_values, dtype=float).reshape(-1)
+    finite = x_arr[np.isfinite(x_arr)]
+    if finite.size == 0:
+        return np.asarray([], dtype=float)
+    x_min = float(np.min(finite))
+    x_max = float(np.max(finite))
+    if np.isclose(x_min, x_max):
+        x_max = x_min + 1.0
+    positions = boundary_ratios_to_positions(ratios, n)
+    span = float(x_max - x_min)
+    return np.asarray(x_min + span * positions, dtype=float)
+
+
+def _boundary_ratio_diff_step_from_x(x_values: np.ndarray) -> float:
+    x_arr = np.asarray(x_values, dtype=float).reshape(-1)
+    finite = np.sort(x_arr[np.isfinite(x_arr)])
+    if finite.size < 2:
+        return 0.02
+    span = max(float(finite[-1] - finite[0]), 1e-12)
+    deltas = np.diff(finite)
+    deltas = deltas[deltas > 0.0]
+    if deltas.size > 0:
+        base = float(np.median(deltas)) / span
+    else:
+        base = 1.0 / max(2, int(finite.size) - 1)
+    return float(np.clip(2.0 * base, 1e-4, 0.25))
+
+
+def extract_segment_parameter_names(
+    expression_text: str,
+    reserved_names: Optional[Sequence[str]] = None,
+) -> List[str]:
+    text = str(expression_text).strip()
+    if not text:
+        raise ValueError("Segment expression is empty.")
+    try:
+        tree = ast.parse(text, mode="eval")
+    except SyntaxError as exc:
+        raise ValueError(f"Invalid segment expression: {exc.msg}") from exc
+
+    reserved = set(reserved_names or ())
+    reserved |= {"np", "x"} | _EXPRESSION_HELPER_NAMES
+    collector = _ExpressionParameterCollector(reserved_names=reserved)
+    collector.visit(tree)
+
+    for name in collector.names:
+        if not _PARAMETER_NAME_RE.fullmatch(name):
+            raise ValueError(f"Invalid parameter name '{name}' in segment expression.")
+    return collector.names
+
+
+def compile_segment_expression(
+    expression_text: str,
+    parameter_names: Sequence[str],
+) -> Callable[[np.ndarray, Mapping[str, float]], np.ndarray]:
+    text = str(expression_text).strip()
+    if not text:
+        raise ValueError("Segment expression is empty.")
+    ordered_names = list(parameter_names)
+    try:
+        tree = ast.parse(text, mode="eval")
+    except SyntaxError as exc:
+        raise ValueError(f"Invalid segment expression: {exc.msg}") from exc
+
+    code = compile(tree, "<piecewise_segment>", "eval")
+    eval_globals = {
+        "__builtins__": __builtins__,
+        "np": np,
+        "math": math,
+        **_EXPRESSION_ALLOWED_FUNCTIONS,
+        **_EXPRESSION_ALLOWED_CONSTANTS,
+    }
+
+    def _evaluate(x_data: np.ndarray, param_values: Mapping[str, float]) -> np.ndarray:
+        x_arr = np.asarray(x_data, dtype=float).reshape(-1)
+        eval_locals: Dict[str, Any] = {"x": x_arr}
+        for name in ordered_names:
+            if name not in param_values:
+                raise ValueError(f"Missing parameter '{name}'.")
+            eval_locals[name] = float(param_values[name])
         try:
-            best_sse_value = float(best_sse)
-        except Exception:
-            best_sse_value = None
-        if best_sse_value is not None and np.isfinite(best_sse_value):
-            parts.append(f"SSE={best_sse_value:.6g}")
-    return parts
+            result = eval(code, eval_globals, eval_locals)
+        except Exception as exc:
+            raise ValueError(f"Segment evaluation failed: {exc}") from exc
+        out = np.asarray(result, dtype=float)
+        if out.shape == ():
+            return np.full_like(x_arr, float(out), dtype=float)
+        out = out.reshape(-1)
+        if out.size != x_arr.size:
+            raise ValueError("Segment output length does not match input length.")
+        return out
+
+    return _evaluate
 
 
-def run_multistart_fit(
-    model_func,
-    x,
-    y,
-    p0,
-    bounds,
-    options,
-    cancel_check: Optional[Callable[[], bool]] = None,
-    seed_offset: int = 0,
-):
-    opts = (
-        options
-        if isinstance(options, FitOptimizationOptions)
-        else FitOptimizationOptions()
+def build_piecewise_model_definition(
+    target_col: str,
+    segment_exprs: Sequence[str],
+    channel_names: Sequence[str],
+) -> PiecewiseModelDefinition:
+    seg_exprs = [str(expr).strip() for expr in segment_exprs]
+    if len(seg_exprs) < 1:
+        raise ValueError("Piecewise model must contain at least 1 segment expression.")
+    for idx, expr in enumerate(seg_exprs):
+        if not expr:
+            raise ValueError(f"Segment {idx + 1} expression is empty.")
+
+    channel_set = {
+        str(name).strip() for name in (channel_names or []) if str(name).strip()
+    }
+    segment_param_names: List[Tuple[str, ...]] = []
+    segment_evaluators: List[Callable[..., np.ndarray]] = []
+    global_names: List[str] = []
+    seen_global = set()
+    for seg_idx, expr in enumerate(seg_exprs):
+        seg_names = extract_segment_parameter_names(expr)
+        for name in seg_names:
+            if name in channel_set:
+                raise ValueError(
+                    f"Segment {seg_idx + 1} uses channel token '{name}'. Use 'x' for the selected x-axis channel."
+                )
+            if name not in seen_global:
+                seen_global.add(name)
+                global_names.append(name)
+        segment_param_names.append(tuple(seg_names))
+        segment_evaluators.append(compile_segment_expression(expr, seg_names))
+
+    return PiecewiseModelDefinition(
+        target_col=str(target_col),
+        segment_exprs=tuple(seg_exprs),
+        segment_param_names=tuple(segment_param_names),
+        segment_evaluators=tuple(segment_evaluators),
+        global_param_names=tuple(global_names),
     )
-    x_data = np.asarray(x, dtype=float).reshape(-1)
-    y_data = np.asarray(y, dtype=float).reshape(-1)
-    p0_arr = np.asarray(p0, dtype=float).reshape(-1)
-    lower = np.asarray(bounds[0], dtype=float).reshape(-1)
-    upper = np.asarray(bounds[1], dtype=float).reshape(-1)
-    if x_data.size != y_data.size:
-        raise ValueError("x and y must have the same length.")
-    if p0_arr.size == 0:
-        raise ValueError("Initial parameter vector is empty.")
-    if lower.size != p0_arr.size or upper.size != p0_arr.size:
-        raise ValueError("Bounds and initial parameters must have matching dimensions.")
 
-    low = np.minimum(lower, upper)
-    high = np.maximum(lower, upper)
-    bounds_tuple = (low, high)
+
+def _make_segment_specs(
+    model_def: PiecewiseModelDefinition,
+    seed_map: Mapping[str, float],
+    bounds_map: Mapping[str, Tuple[float, float]],
+    fixed_param_values: Optional[Mapping[str, float]] = None,
+) -> Sequence[SegmentSpec]:
+    fixed_map = {
+        str(key): float(value)
+        for key, value in dict(fixed_param_values or {}).items()
+        if str(key).strip()
+    }
+    segments: List[SegmentSpec] = []
+    for seg_names, seg_eval in zip(
+        model_def.segment_param_names, model_def.segment_evaluators
+    ):
+        lo: List[float] = []
+        hi: List[float] = []
+        p0: List[float] = []
+        free_names: List[str] = []
+        fixed_items: List[Tuple[str, float]] = []
+        for name in seg_names:
+            if name in fixed_map:
+                fixed_items.append((name, float(fixed_map[name])))
+                continue
+            low, high = bounds_map[name]
+            if low > high:
+                low, high = high, low
+            start = float(seed_map[name])
+            lo.append(float(low))
+            hi.append(float(high))
+            p0.append(float(np.clip(start, low, high)))
+            free_names.append(name)
+
+        def model_func(
+            x_vals,
+            *vals,
+            _free_names=tuple(free_names),
+            _fixed_items=tuple(fixed_items),
+            _eval=seg_eval,
+        ):
+            local_map = {key: float(value) for key, value in _fixed_items}
+            local_map.update(
+                {key: float(vals[idx]) for idx, key in enumerate(_free_names)}
+            )
+            return _eval(x_vals, local_map)
+
+        segments.append(
+            SegmentSpec(
+                model_func=model_func,
+                p0=p0,
+                bounds=(lo, hi),
+                n_starts=2,
+                maxfev=3000,
+            )
+        )
+    return tuple(segments)
+
+
+def _shared_to_local_flat(
+    model_def: PiecewiseModelDefinition,
+    shared_values: np.ndarray,
+    boundary_ratios: np.ndarray,
+    fixed_param_values: Optional[Mapping[str, float]] = None,
+) -> np.ndarray:
+    fixed_names = {
+        str(key).strip()
+        for key in dict(fixed_param_values or {}).keys()
+        if str(key).strip()
+    }
+    shared_map = {
+        key: float(shared_values[idx])
+        for idx, key in enumerate(model_def.global_param_names)
+    }
+    parts: List[float] = []
+    for seg_names in model_def.segment_param_names:
+        for name in seg_names:
+            if name in fixed_names:
+                continue
+            parts.append(float(shared_map[name]))
+    if boundary_ratios.size > 0:
+        parts.extend(np.asarray(boundary_ratios, dtype=float).reshape(-1).tolist())
+    return np.asarray(parts, dtype=float)
+
+
+FIT_MODE_PIECEWISE = "piecewise"
+FIT_MODE_CURVE_FIT = "curve_fit"
+
+
+def normalize_fit_mode(mode: Optional[str]) -> str:
+    text = str(mode or "").strip().lower()
+    if text in {"curve_fit", "curvefit", "curve", "fast", "standard"}:
+        return FIT_MODE_CURVE_FIT
+    return FIT_MODE_PIECEWISE
+
+
+def fit_mode_label(mode: Optional[str]) -> str:
+    normalized = normalize_fit_mode(mode)
+    if normalized == FIT_MODE_CURVE_FIT:
+        return "standard curve_fit"
+    return "piecewise"
+
+
+def run_piecewise_fit_pipeline(
+    x_data: np.ndarray,
+    y_data: np.ndarray,
+    model_def: PiecewiseModelDefinition,
+    seed_map: Mapping[str, float],
+    bounds_map: Mapping[str, Tuple[float, float]],
+    boundary_seed: Optional[np.ndarray] = None,
+    cancel_check: Optional[Callable[[], bool]] = None,
+    fixed_params: Optional[Mapping[str, float]] = None,
+) -> Dict[str, Any]:
+    x_arr = np.asarray(x_data, dtype=float).reshape(-1)
+    y_arr = np.asarray(y_data, dtype=float).reshape(-1)
+    if x_arr.size != y_arr.size:
+        raise ValueError("x and y must have equal length.")
+    if x_arr.size < 8:
+        raise ValueError("Not enough points to run piecewise fitting.")
+
+    global_names = list(model_def.global_param_names)
+    allowed_names = set(global_names)
+    global_index = {name: idx for idx, name in enumerate(global_names)}
+
+    seed_by_key: Dict[str, float] = {}
+    for name in global_names:
+        if name not in seed_map:
+            raise ValueError(f"Missing seed for parameter '{name}'.")
+        try:
+            value = float(seed_map[name])
+        except Exception as exc:
+            raise ValueError(f"Seed for parameter '{name}' is non-numeric.") from exc
+        if not np.isfinite(value):
+            raise ValueError(f"Seed for parameter '{name}' is not finite.")
+        seed_by_key[name] = float(value)
+
+    fixed_by_key: Dict[str, float] = {}
+    for raw_key, raw_value in dict(fixed_params or {}).items():
+        key = str(raw_key).strip()
+        if not key:
+            continue
+        if key not in allowed_names:
+            raise ValueError(f"Unknown fixed parameter '{key}'.")
+        try:
+            numeric = float(raw_value)
+        except Exception as exc:
+            raise ValueError(
+                f"Fixed value for parameter '{key}' is non-numeric."
+            ) from exc
+        if not np.isfinite(numeric):
+            raise ValueError(f"Fixed value for parameter '{key}' is not finite.")
+        fixed_by_key[key] = float(numeric)
+        seed_by_key[key] = float(numeric)
 
     def is_cancelled() -> bool:
         if cancel_check is None:
@@ -529,211 +1240,531 @@ def run_multistart_fit(
     if is_cancelled():
         raise FitCancelledError("cancelled")
 
-    n_starts = 1
-    if opts.enabled:
-        n_starts = max(2, int(opts.n_starts))
-    per_start_maxfev = max(20, int(opts.per_start_maxfev))
-    if not opts.enabled:
-        per_start_maxfev = max(2000, per_start_maxfev)
-    patience = opts.early_stop_patience
-    early_stop_r2 = float(opts.early_stop_r2)
-    base_seed = int(opts.seed) + int(seed_offset)
+    free_param_names = [name for name in global_names if name not in fixed_by_key]
+    free_param_indices = np.asarray(
+        [global_index[name] for name in free_param_names], dtype=int
+    )
+    fixed_index_values = [
+        (int(global_index[name]), float(value))
+        for name, value in fixed_by_key.items()
+        if name in global_index
+    ]
 
-    starts = []
-    seen = set()
-
-    def add_start(values):
-        arr = np.asarray(values, dtype=float).reshape(-1)
-        if arr.size != p0_arr.size:
-            return
-        clipped = np.clip(arr, low, high)
-        key = tuple(np.round(clipped, 12))
-        if key in seen:
-            return
-        seen.add(key)
-        starts.append(clipped)
-
-    add_start(p0_arr)
-
-    de_attempted = bool(opts.enabled and opts.use_global_init)
-    de_success = False
-    if de_attempted:
-
-        def de_objective(values):
-            if is_cancelled():
-                return np.inf
-            try:
-                predicted = model_func(x_data, *values)
-            except Exception:
-                return np.inf
-            sse = _sum_squared_error(y_data, predicted)
-            if sse is None or not np.isfinite(sse):
-                return np.inf
-            return float(sse)
-
-        def de_callback(_xk, _convergence):
-            return is_cancelled()
-
-        de_result = None
-        try:
-            de_result = differential_evolution(
-                de_objective,
-                list(zip(low, high)),
-                seed=base_seed,
-                maxiter=max(1, int(opts.de_maxiter)),
-                popsize=max(2, int(opts.de_popsize)),
-                polish=False,
-                callback=de_callback,
-                updating="deferred",
-                workers=1,
-            )
-        except Exception:
-            de_result = None
-        if is_cancelled():
-            raise FitCancelledError("cancelled")
-        if de_result is not None and np.all(np.isfinite(de_result.x)):
-            add_start(de_result.x)
-            de_success = bool(np.isfinite(float(de_result.fun)))
-
-    if opts.enabled:
-        add_start((low + high) * 0.5)
-
-    if opts.enabled and len(starts) < n_starts:
-        rng = np.random.default_rng(base_seed)
-        while len(starts) < n_starts:
-            if is_cancelled():
-                raise FitCancelledError("cancelled")
-            add_start(rng.uniform(low, high))
-    if opts.enabled and len(starts) > n_starts:
-        starts = starts[:n_starts]
-
-    if not starts:
-        add_start(p0_arr)
-
-    best_popt = None
-    best_pcov = None
-    best_r2 = float("nan")
-    best_sse = None
-    attempts = 0
-    successes = 0
-    last_error = None
-    no_improvement_count = 0
-    rescue_used = False
-
-    def attempt_start(start):
-        nonlocal attempts
-        nonlocal successes
-        nonlocal last_error
-        nonlocal no_improvement_count
-        nonlocal best_popt
-        nonlocal best_pcov
-        nonlocal best_r2
-        nonlocal best_sse
-
-        if is_cancelled():
-            raise FitCancelledError("cancelled")
-        attempts += 1
-        try:
-            popt, pcov = curve_fit(
-                model_func,
-                x_data,
-                y_data,
-                p0=start,
-                bounds=bounds_tuple,
-                method="trf",
-                maxfev=per_start_maxfev,
-            )
-            predicted = model_func(x_data, *popt)
-            sse = _sum_squared_error(y_data, predicted)
-            if sse is None or not np.isfinite(sse):
-                raise RuntimeError("Fit produced non-finite error metric.")
-            r2 = compute_r2(y_data, predicted)
-            r2 = float(r2) if r2 is not None else float("nan")
-            successes += 1
-
-            improvement_tol = 1e-12
-            if best_sse is not None:
-                improvement_tol = max(improvement_tol, abs(best_sse) * 1e-9)
-            improved = best_sse is None or (sse < (best_sse - improvement_tol))
-            if improved:
-                best_popt = np.asarray(popt, dtype=float)
-                best_pcov = np.asarray(pcov, dtype=float)
-                best_r2 = r2
-                best_sse = float(sse)
-                no_improvement_count = 0
-            elif best_sse is not None:
-                no_improvement_count += 1
-
-            if np.isfinite(best_r2) and best_r2 >= early_stop_r2:
-                return True
-            if (
-                best_sse is not None
-                and patience > 0
-                and no_improvement_count >= patience
-            ):
-                return True
-        except Exception as exc:
-            last_error = exc
-            if best_sse is not None:
-                no_improvement_count += 1
-                if patience > 0 and no_improvement_count >= patience:
-                    return True
-        return False
-
-    for start in starts:
-        if attempt_start(start):
-            break
-
-    # In basic mode, rescue from obviously bad local minima before reporting a result.
-    if (not opts.enabled) and (not np.isfinite(best_r2) or best_r2 < 0.0):
-        rescue_used = True
-        no_improvement_count = 0
-        starts_before_rescue = len(starts)
-        add_start((low + high) * 0.5)
-        rng = np.random.default_rng(base_seed + 104729)
-        draws = 0
-        target_total = max(starts_before_rescue + 5, 6)
-        while len(starts) < target_total and draws < 64:
-            if is_cancelled():
-                raise FitCancelledError("cancelled")
-            add_start(rng.uniform(low, high))
-            draws += 1
-
-        for start in starts[starts_before_rescue:]:
-            if attempt_start(start):
-                break
-
-    if best_popt is None or best_pcov is None:
-        if last_error is not None:
-            raise RuntimeError(
-                f"All fit attempts failed ({attempts}/{len(starts)}): {last_error}"
-            ) from last_error
-        raise RuntimeError(f"All fit attempts failed ({attempts}/{len(starts)}).")
-
-    if not np.isfinite(best_r2):
-        raise RuntimeError("Fit produced a non-finite R² score.")
-    if best_r2 < -1.0:
-        raise RuntimeError(
-            f"Fit converged to a poor minimum (R²={best_r2:.6f}). "
-            "Try enabling Robust mode or adjusting bounds."
+    segments = _make_segment_specs(
+        model_def,
+        seed_by_key,
+        bounds_map,
+        fixed_param_values=fixed_by_key,
+    )
+    n_boundaries = max(0, len(segments) - 1)
+    if boundary_seed is None:
+        boundary_seed_arr = default_boundary_ratios(n_boundaries)
+    else:
+        boundary_seed_arr = np.clip(
+            np.asarray(boundary_seed, dtype=float).reshape(-1), 0.0, 1.0
         )
+        if boundary_seed_arr.size != n_boundaries:
+            boundary_seed_arr = default_boundary_ratios(n_boundaries)
 
-    mode_text = fit_mode_label(opts)
-    if rescue_used and not opts.enabled:
-        mode_text = "single-start+rescue"
+    shared_seed = np.asarray(
+        [float(seed_by_key[name]) for name in global_names], dtype=float
+    )
 
-    diagnostics = {
-        "mode": mode_text,
-        "seed": base_seed,
-        "requested_starts": int(len(starts)),
-        "attempts": int(attempts),
-        "successes": int(successes),
-        "best_sse": float(best_sse) if best_sse is not None else None,
-        "de_used": bool(de_attempted),
-        "de_success": bool(de_success),
-        "rescue_used": bool(rescue_used),
+    local_to_global_idx = []
+    for seg_names in model_def.segment_param_names:
+        for name in seg_names:
+            if name in fixed_by_key:
+                continue
+            local_to_global_idx.append(global_index[name])
+    local_to_global_idx = np.asarray(local_to_global_idx, dtype=int)
+    n_local_params = int(local_to_global_idx.size)
+
+    local_seed_flat = np.empty(n_local_params + n_boundaries, dtype=float)
+    if n_local_params > 0:
+        local_seed_flat[:n_local_params] = shared_seed[local_to_global_idx]
+    if n_boundaries > 0:
+        local_seed_flat[n_local_params:] = boundary_seed_arr
+
+    if local_seed_flat.size == 0:
+        fixed_pred = predict_ordered_piecewise(
+            x_arr,
+            segments,
+            local_seed_flat,
+            prefer_jit=True,
+        )
+        fixed_sse = _sum_squared_error(y_arr, fixed_pred["y_hat"])
+        if fixed_sse is None:
+            fixed_sse = float("inf")
+        return {
+            "params_by_key": {name: float(seed_by_key[name]) for name in global_names},
+            "params_vector": np.asarray(
+                [float(seed_by_key[name]) for name in global_names], dtype=float
+            ),
+            "local_flat": np.asarray(local_seed_flat, dtype=float),
+            "boundary_ratios": np.asarray([], dtype=float),
+            "boundaries": np.asarray(fixed_pred["boundaries"], dtype=float),
+            "y_hat": np.asarray(fixed_pred["y_hat"], dtype=float),
+            "sse": float(fixed_sse),
+            "r2": compute_r2(y_arr, fixed_pred["y_hat"]),
+            "diagnostics": {
+                "fit_mode": FIT_MODE_PIECEWISE,
+                "selected_stage": "fixed_only",
+                "shared_refine_fallback": False,
+                "fixed_params": dict(fixed_by_key),
+                "free_param_count": int(len(free_param_names)),
+                "seed_refit_sse": float(fixed_sse),
+                "final_sse": float(fixed_sse),
+            },
+        }
+
+    stage_a_nfev = int(np.clip(700 * max(1, local_seed_flat.size), 3000, 14000))
+    stage_a = refit_ordered_piecewise_from_seed(
+        x_arr,
+        y_arr,
+        segments,
+        seed_params=local_seed_flat,
+        config=OrderedPiecewiseConfig(
+            robust_max_nfev=stage_a_nfev,
+            prefer_jit=True,
+        ),
+    )
+    if is_cancelled():
+        raise FitCancelledError("cancelled")
+
+    n_local = local_seed_flat.size - n_boundaries
+    stage_a_local = np.asarray(stage_a.params[:n_local], dtype=float)
+    stage_a_boundaries = np.asarray(stage_a.params[n_local:], dtype=float)
+
+    shared_init = np.asarray(shared_seed, dtype=float)
+    if n_local > 0:
+        sums = np.zeros(shared_init.size, dtype=float)
+        counts = np.zeros(shared_init.size, dtype=float)
+        np.add.at(sums, local_to_global_idx, stage_a_local[:n_local])
+        np.add.at(counts, local_to_global_idx, 1.0)
+        use_mask = counts > 0.0
+        shared_init[use_mask] = sums[use_mask] / counts[use_mask]
+    for idx, value in fixed_index_values:
+        shared_init[idx] = float(value)
+
+    shared_lo = np.asarray(
+        [float(bounds_map[name][0]) for name in free_param_names], dtype=float
+    )
+    shared_hi = np.asarray(
+        [float(bounds_map[name][1]) for name in free_param_names], dtype=float
+    )
+    free_lower = np.minimum(shared_lo, shared_hi)
+    free_upper = np.maximum(shared_lo, shared_hi)
+    shared_init_free = (
+        np.asarray(shared_init[free_param_indices], dtype=float)
+        if free_param_indices.size > 0
+        else np.asarray([], dtype=float)
+    )
+    lower = np.concatenate([free_lower, np.zeros(n_boundaries, dtype=float)])
+    upper = np.concatenate([free_upper, np.ones(n_boundaries, dtype=float)])
+    x0 = np.concatenate(
+        [
+            np.clip(shared_init_free, free_lower, free_upper),
+            np.clip(stage_a_boundaries, 0.0, 1.0),
+        ]
+    )
+
+    refined_diagnostics: Dict[str, Any] = {
+        "fit_mode": FIT_MODE_PIECEWISE,
+        "selected_stage": "seed_refit",
+        "shared_refine_fallback": False,
+        "fixed_params": dict(fixed_by_key),
+        "free_param_count": int(len(free_param_names)),
     }
-    return best_popt, best_pcov, float(best_r2), diagnostics
+
+    shared_template = np.asarray(shared_seed, dtype=float)
+    for idx, value in fixed_index_values:
+        shared_template[idx] = float(value)
+    shared_work = np.asarray(shared_template, dtype=float).copy()
+    local_work = np.empty(n_local_params + n_boundaries, dtype=float)
+    n_free = int(free_param_indices.size)
+
+    def _compose_shared_vector(free_values: np.ndarray) -> np.ndarray:
+        np.copyto(shared_work, shared_template)
+        if n_free > 0:
+            shared_work[free_param_indices] = np.asarray(free_values, dtype=float)
+        return shared_work
+
+    def _compose_local_flat(
+        shared_values: np.ndarray, boundary_values: np.ndarray
+    ) -> np.ndarray:
+        if n_local_params > 0:
+            local_work[:n_local_params] = shared_values[local_to_global_idx]
+        if n_boundaries > 0:
+            local_work[n_local_params:] = np.asarray(boundary_values, dtype=float)
+        return local_work
+
+    def residuals(vals: np.ndarray) -> np.ndarray:
+        if is_cancelled():
+            raise FitCancelledError("cancelled")
+        vals = np.asarray(vals, dtype=float).reshape(-1)
+        shared_vals = _compose_shared_vector(vals[:n_free])
+        local_flat = _compose_local_flat(shared_vals, vals[n_free:])
+        pred = predict_ordered_piecewise(
+            x_arr,
+            segments,
+            local_flat,
+            prefer_jit=True,
+        )
+        return np.asarray(pred["y_hat"] - y_arr, dtype=float)
+
+    best_shared = np.asarray(shared_init, dtype=float)
+    best_boundary = np.asarray(np.clip(stage_a_boundaries, 0.0, 1.0), dtype=float)
+    best_local_flat = np.asarray(
+        _compose_local_flat(best_shared, best_boundary),
+        dtype=float,
+    ).copy()
+    best_pred = predict_ordered_piecewise(
+        x_arr,
+        segments,
+        best_local_flat,
+        prefer_jit=True,
+    )
+    best_sse = _sum_squared_error(y_arr, best_pred["y_hat"])
+    if best_sse is None:
+        best_sse = float("inf")
+
+    if x0.size > 0:
+        try:
+            diff_step = None
+            if n_boundaries > 0:
+                diff_step = np.full(x0.size, 1e-6, dtype=float)
+                diff_step[n_free:] = _boundary_ratio_diff_step_from_x(x_arr)
+            shared_refine_nfev = int(np.clip(500 * max(1, x0.size), 2500, 14000))
+            ls = least_squares(
+                residuals,
+                x0,
+                bounds=(lower, upper),
+                method="trf",
+                loss="soft_l1",
+                f_scale=0.5,
+                max_nfev=shared_refine_nfev,
+                diff_step=diff_step,
+                x_scale="jac",
+            )
+            refined_vals = np.asarray(ls.x, dtype=float)
+            refined_shared = np.asarray(
+                _compose_shared_vector(refined_vals[:n_free]), dtype=float
+            ).copy()
+            refined_boundary = np.asarray(refined_vals[n_free:], dtype=float)
+            refined_local = np.asarray(
+                _compose_local_flat(refined_shared, refined_boundary),
+                dtype=float,
+            ).copy()
+            refined_pred = predict_ordered_piecewise(
+                x_arr,
+                segments,
+                refined_local,
+                prefer_jit=True,
+            )
+            refined_sse = _sum_squared_error(y_arr, refined_pred["y_hat"])
+            if (
+                refined_sse is not None
+                and np.isfinite(refined_sse)
+                and refined_sse <= best_sse
+            ):
+                best_shared = refined_shared
+                best_boundary = refined_boundary
+                best_local_flat = refined_local
+                best_pred = refined_pred
+                best_sse = float(refined_sse)
+                refined_diagnostics["selected_stage"] = "shared_refine"
+            else:
+                refined_diagnostics["shared_refine_fallback"] = True
+        except FitCancelledError:
+            raise
+        except Exception as exc:
+            refined_diagnostics["shared_refine_fallback"] = True
+            refined_diagnostics["shared_refine_error"] = str(exc)
+    else:
+        refined_diagnostics["shared_refine_skipped"] = True
+
+    return {
+        "params_by_key": {
+            name: float(best_shared[idx]) for idx, name in enumerate(global_names)
+        },
+        "params_vector": np.asarray(best_shared, dtype=float),
+        "local_flat": np.asarray(best_local_flat, dtype=float),
+        "boundary_ratios": np.asarray(best_boundary, dtype=float),
+        "boundaries": np.asarray(best_pred["boundaries"], dtype=float),
+        "y_hat": np.asarray(best_pred["y_hat"], dtype=float),
+        "sse": float(best_sse),
+        "r2": compute_r2(y_arr, best_pred["y_hat"]),
+        "diagnostics": {
+            **refined_diagnostics,
+            "seed_refit_sse": float(stage_a.sse),
+            "final_sse": float(best_sse),
+        },
+    }
+
+
+def run_standard_curve_fit_pipeline(
+    x_data: np.ndarray,
+    y_data: np.ndarray,
+    model_def: PiecewiseModelDefinition,
+    seed_map: Mapping[str, float],
+    bounds_map: Mapping[str, Tuple[float, float]],
+    boundary_seed: Optional[np.ndarray] = None,
+    cancel_check: Optional[Callable[[], bool]] = None,
+    fixed_params: Optional[Mapping[str, float]] = None,
+) -> Dict[str, Any]:
+    x_arr = np.asarray(x_data, dtype=float).reshape(-1)
+    y_arr = np.asarray(y_data, dtype=float).reshape(-1)
+    if x_arr.size != y_arr.size:
+        raise ValueError("x and y must have equal length.")
+    if x_arr.size < 8:
+        raise ValueError("Not enough points to run piecewise fitting.")
+
+    global_names = list(model_def.global_param_names)
+    allowed_names = set(global_names)
+    global_index = {name: idx for idx, name in enumerate(global_names)}
+
+    seed_by_key: Dict[str, float] = {}
+    for name in global_names:
+        if name not in seed_map:
+            raise ValueError(f"Missing seed for parameter '{name}'.")
+        value = float(seed_map[name])
+        if not np.isfinite(value):
+            raise ValueError(f"Seed for parameter '{name}' is not finite.")
+        seed_by_key[name] = float(value)
+
+    fixed_by_key: Dict[str, float] = {}
+    for raw_key, raw_value in dict(fixed_params or {}).items():
+        key = str(raw_key).strip()
+        if not key:
+            continue
+        if key not in allowed_names:
+            raise ValueError(f"Unknown fixed parameter '{key}'.")
+        numeric = float(raw_value)
+        if not np.isfinite(numeric):
+            raise ValueError(f"Fixed value for parameter '{key}' is not finite.")
+        fixed_by_key[key] = float(numeric)
+        seed_by_key[key] = float(numeric)
+
+    def is_cancelled() -> bool:
+        if cancel_check is None:
+            return False
+        try:
+            return bool(cancel_check())
+        except Exception:
+            return False
+
+    if is_cancelled():
+        raise FitCancelledError("cancelled")
+
+    segments = _make_segment_specs(
+        model_def,
+        seed_by_key,
+        bounds_map,
+        fixed_param_values=fixed_by_key,
+    )
+    n_boundaries = max(0, len(segments) - 1)
+    if boundary_seed is None:
+        boundary_seed_arr = default_boundary_ratios(n_boundaries)
+    else:
+        boundary_seed_arr = np.clip(
+            np.asarray(boundary_seed, dtype=float).reshape(-1), 0.0, 1.0
+        )
+        if boundary_seed_arr.size != n_boundaries:
+            boundary_seed_arr = default_boundary_ratios(n_boundaries)
+
+    free_param_names = [name for name in global_names if name not in fixed_by_key]
+    free_param_indices = np.asarray(
+        [global_index[name] for name in free_param_names], dtype=int
+    )
+    n_free = int(free_param_indices.size)
+    free_lower = np.asarray(
+        [
+            min(float(bounds_map[name][0]), float(bounds_map[name][1]))
+            for name in free_param_names
+        ],
+        dtype=float,
+    )
+    free_upper = np.asarray(
+        [
+            max(float(bounds_map[name][0]), float(bounds_map[name][1]))
+            for name in free_param_names
+        ],
+        dtype=float,
+    )
+
+    shared_seed = np.asarray(
+        [float(seed_by_key[name]) for name in global_names], dtype=float
+    )
+    shared_template = np.asarray(shared_seed, dtype=float)
+    for name, value in fixed_by_key.items():
+        shared_template[global_index[name]] = float(value)
+
+    local_to_global_idx = []
+    for seg_names in model_def.segment_param_names:
+        for name in seg_names:
+            if name in fixed_by_key:
+                continue
+            local_to_global_idx.append(global_index[name])
+    local_to_global_idx = np.asarray(local_to_global_idx, dtype=int)
+    n_local_params = int(local_to_global_idx.size)
+
+    seed_free = (
+        np.asarray(shared_template[free_param_indices], dtype=float)
+        if n_free > 0
+        else np.asarray([], dtype=float)
+    )
+    x0 = np.concatenate(
+        [
+            np.clip(seed_free, free_lower, free_upper),
+            np.clip(boundary_seed_arr, 0.0, 1.0),
+        ]
+    )
+    lower = np.concatenate([free_lower, np.zeros(n_boundaries, dtype=float)])
+    upper = np.concatenate([free_upper, np.ones(n_boundaries, dtype=float)])
+
+    shared_work = np.asarray(shared_template, dtype=float).copy()
+    local_work = np.empty(n_local_params + n_boundaries, dtype=float)
+
+    def _compose_shared_vector(free_values: np.ndarray) -> np.ndarray:
+        np.copyto(shared_work, shared_template)
+        if n_free > 0:
+            shared_work[free_param_indices] = np.asarray(free_values, dtype=float)
+        return shared_work
+
+    def _compose_local_flat(
+        shared_values: np.ndarray, boundary_values: np.ndarray
+    ) -> np.ndarray:
+        if n_local_params > 0:
+            local_work[:n_local_params] = shared_values[local_to_global_idx]
+        if n_boundaries > 0:
+            local_work[n_local_params:] = np.asarray(boundary_values, dtype=float)
+        return local_work
+
+    def _predict_from_values(values: np.ndarray) -> Dict[str, np.ndarray]:
+        shared_vals = _compose_shared_vector(values[:n_free])
+        local_flat = _compose_local_flat(shared_vals, values[n_free:])
+        pred = predict_ordered_piecewise(
+            x_arr,
+            segments,
+            local_flat,
+            prefer_jit=True,
+        )
+        return {
+            "shared": np.asarray(shared_vals, dtype=float).copy(),
+            "local": np.asarray(local_flat, dtype=float).copy(),
+            "boundary": np.asarray(values[n_free:], dtype=float).copy(),
+            "pred": pred,
+        }
+
+    seed_eval = _predict_from_values(x0)
+    best_shared = seed_eval["shared"]
+    best_local = seed_eval["local"]
+    best_boundary = seed_eval["boundary"]
+    best_pred = seed_eval["pred"]
+    best_sse = _sum_squared_error(y_arr, best_pred["y_hat"])
+    if best_sse is None:
+        best_sse = float("inf")
+
+    diagnostics: Dict[str, Any] = {
+        "fit_mode": FIT_MODE_CURVE_FIT,
+        "selected_stage": "curve_fit_seed",
+        "curve_fit_fallback": False,
+        "fixed_params": dict(fixed_by_key),
+        "free_param_count": int(len(free_param_names)),
+        "seed_refit_sse": float(best_sse),
+    }
+
+    if is_cancelled():
+        raise FitCancelledError("cancelled")
+
+    if x0.size > 0:
+        try:
+            maxfev = int(np.clip(350 * max(1, x0.size), 2000, 9000))
+
+            def model_for_curve_fit(_x, *vals):
+                if is_cancelled():
+                    raise FitCancelledError("cancelled")
+                values = np.asarray(vals, dtype=float)
+                pred = _predict_from_values(values)["pred"]
+                return np.asarray(pred["y_hat"], dtype=float)
+
+            popt, _ = curve_fit(
+                model_for_curve_fit,
+                x_arr,
+                y_arr,
+                p0=x0,
+                bounds=(lower, upper),
+                method="trf",
+                maxfev=maxfev,
+            )
+            fit_eval = _predict_from_values(np.asarray(popt, dtype=float))
+            fit_sse = _sum_squared_error(y_arr, fit_eval["pred"]["y_hat"])
+            if fit_sse is not None and np.isfinite(fit_sse) and fit_sse <= best_sse:
+                best_shared = fit_eval["shared"]
+                best_local = fit_eval["local"]
+                best_boundary = fit_eval["boundary"]
+                best_pred = fit_eval["pred"]
+                best_sse = float(fit_sse)
+                diagnostics["selected_stage"] = "curve_fit"
+            else:
+                diagnostics["curve_fit_fallback"] = True
+        except FitCancelledError:
+            raise
+        except Exception as exc:
+            diagnostics["curve_fit_fallback"] = True
+            diagnostics["curve_fit_error"] = str(exc)
+
+    return {
+        "params_by_key": {
+            name: float(best_shared[idx]) for idx, name in enumerate(global_names)
+        },
+        "params_vector": np.asarray(best_shared, dtype=float),
+        "local_flat": np.asarray(best_local, dtype=float),
+        "boundary_ratios": np.asarray(best_boundary, dtype=float),
+        "boundaries": np.asarray(best_pred["boundaries"], dtype=float),
+        "y_hat": np.asarray(best_pred["y_hat"], dtype=float),
+        "sse": float(best_sse),
+        "r2": compute_r2(y_arr, best_pred["y_hat"]),
+        "diagnostics": {
+            **diagnostics,
+            "final_sse": float(best_sse),
+        },
+    }
+
+
+def run_fit_pipeline(
+    x_data: np.ndarray,
+    y_data: np.ndarray,
+    model_def: PiecewiseModelDefinition,
+    seed_map: Mapping[str, float],
+    bounds_map: Mapping[str, Tuple[float, float]],
+    boundary_seed: Optional[np.ndarray] = None,
+    cancel_check: Optional[Callable[[], bool]] = None,
+    fixed_params: Optional[Mapping[str, float]] = None,
+    fit_mode: Optional[str] = None,
+) -> Dict[str, Any]:
+    mode = normalize_fit_mode(fit_mode)
+    if mode == FIT_MODE_CURVE_FIT:
+        return run_standard_curve_fit_pipeline(
+            x_data,
+            y_data,
+            model_def,
+            seed_map,
+            bounds_map,
+            boundary_seed=boundary_seed,
+            cancel_check=cancel_check,
+            fixed_params=fixed_params,
+        )
+    return run_piecewise_fit_pipeline(
+        x_data,
+        y_data,
+        model_def,
+        seed_map,
+        bounds_map,
+        boundary_seed=boundary_seed,
+        cancel_check=cancel_check,
+        fixed_params=fixed_params,
+    )
 
 
 _PARAMETER_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -762,24 +1793,7 @@ _EXPRESSION_ALLOWED_FUNCTIONS = {
 }
 _EXPRESSION_ALLOWED_CONSTANTS = {"pi": float(np.pi), "e": float(np.e)}
 _EXPRESSION_HELPER_NAMES = {"col", "columns", "C", "math"}
-_SUPERSCRIPT_TRANSLATION = str.maketrans(
-    {
-        "0": "⁰",
-        "1": "¹",
-        "2": "²",
-        "3": "³",
-        "4": "⁴",
-        "5": "⁵",
-        "6": "⁶",
-        "7": "⁷",
-        "8": "⁸",
-        "9": "⁹",
-        "-": "⁻",
-        "+": "⁺",
-    }
-)
-_LATEX_PARAMETER_SYMBOLS = {
-    # Lowercase greek
+_LATEX_HTML_COMMANDS = {
     "alpha": "α",
     "beta": "β",
     "gamma": "γ",
@@ -809,7 +1823,6 @@ _LATEX_PARAMETER_SYMBOLS = {
     "chi": "χ",
     "psi": "ψ",
     "omega": "ω",
-    # Uppercase greek
     "Gamma": "Γ",
     "Delta": "Δ",
     "Theta": "Θ",
@@ -827,15 +1840,15 @@ _DISPLAY_FUNCTION_NAMES = {
     "sin": "sin",
     "cos": "cos",
     "tan": "tan",
-    "arcsin": "sin⁻¹",
-    "arccos": "cos⁻¹",
-    "arctan": "tan⁻¹",
+    "arcsin": "asin",
+    "arccos": "acos",
+    "arctan": "atan",
     "sinh": "sinh",
     "cosh": "cosh",
     "tanh": "tanh",
     "exp": "exp",
     "log": "log",
-    "log10": "log₁₀",
+    "log10": "log10",
     "sqrt": "sqrt",
     "power": "pow",
     "minimum": "min",
@@ -852,19 +1865,82 @@ def _normalize_latex_symbol_token(token_text: str) -> str:
         token = token[1:-1].strip()
     if token.startswith("{") and token.endswith("}") and len(token) >= 3:
         token = token[1:-1].strip()
-    while token.startswith("\\"):
-        token = token[1:]
     token = token.strip()
     if token.startswith("{") and token.endswith("}") and len(token) >= 3:
         token = token[1:-1].strip()
     return token
 
 
-def latex_symbol_to_unicode(symbol_text: str) -> Optional[str]:
+def _normalize_latex_script_token(token_text: str) -> str:
+    token = str(token_text).strip()
+    if not token:
+        return ""
+    token = re.sub(r"_(?!\{)([A-Za-z0-9+\-]+)", r"_{\1}", token)
+    token = re.sub(r"\^(?!\{)([A-Za-z0-9+\-]+)", r"^{\1}", token)
+    balance = token.count("{") - token.count("}")
+    if balance > 0:
+        token = token + ("}" * balance)
+    return token
+
+
+def _strip_outer_braces(text: str) -> str:
+    token = str(text).strip()
+    if token.startswith("{") and token.endswith("}") and len(token) >= 2:
+        return token[1:-1].strip()
+    return token
+
+
+def _latex_fragment_to_html(text: str) -> str:
+    token = str(text).strip()
+    if not token:
+        return ""
+    if token.startswith("\\"):
+        command = token[1:]
+        mapped = _LATEX_HTML_COMMANDS.get(command)
+        if mapped is not None:
+            return mapped
+    return html.escape(token)
+
+
+def latex_symbol_to_plain(symbol_text: str) -> Optional[str]:
     token = _normalize_latex_symbol_token(symbol_text)
     if not token:
         return None
-    return _LATEX_PARAMETER_SYMBOLS.get(token)
+    return _normalize_latex_script_token(token)
+
+
+def parameter_symbol_to_html(symbol_text: str) -> str:
+    token = _normalize_latex_script_token(
+        _normalize_latex_symbol_token(str(symbol_text))
+    )
+    if not token:
+        return ""
+    match = re.match(
+        r"^(?P<base>.+?)(?:_(?P<sub>\{[^{}]*\}|[^_^]+))?(?:\^(?P<sup>\{[^{}]*\}|[^_^]+))?$",
+        token,
+    )
+    if not match:
+        return _latex_fragment_to_html(token)
+    base = _latex_fragment_to_html(match.group("base") or "")
+    sub = _strip_outer_braces(match.group("sub") or "")
+    sup = _strip_outer_braces(match.group("sup") or "")
+    out = str(base)
+    if sub:
+        out += f"<sub>{_latex_fragment_to_html(sub)}</sub>"
+    if sup:
+        out += f"<sup>{_latex_fragment_to_html(sup)}</sup>"
+    return out
+
+
+def parameter_symbol_to_mathtext(symbol_text: str) -> str:
+    token = _normalize_latex_script_token(
+        _normalize_latex_symbol_token(str(symbol_text))
+    )
+    if not token:
+        return ""
+    if token.startswith("$") and token.endswith("$") and len(token) >= 2:
+        return token
+    return f"${token}$"
 
 
 def resolve_parameter_symbol(param_key: str, symbol_hint: Optional[str] = None) -> str:
@@ -872,9 +1948,9 @@ def resolve_parameter_symbol(param_key: str, symbol_hint: Optional[str] = None) 
     if symbol_hint is not None:
         raw_symbol = str(symbol_hint).strip()
         if raw_symbol:
-            mapped_symbol = latex_symbol_to_unicode(raw_symbol)
+            mapped_symbol = latex_symbol_to_plain(raw_symbol)
             return mapped_symbol if mapped_symbol else raw_symbol
-    mapped_from_key = latex_symbol_to_unicode(key_text)
+    mapped_from_key = latex_symbol_to_plain(key_text)
     return mapped_from_key if mapped_from_key else key_text
 
 
@@ -942,10 +2018,8 @@ def _render_expression_pretty(
                 and isinstance(node.right.value, (int, float))
                 and float(node.right.value).is_integer()
             ):
-                exponent = str(int(node.right.value)).translate(
-                    _SUPERSCRIPT_TRANSLATION
-                )
-                return f"{left_render}{exponent}"
+                exponent = str(int(node.right.value))
+                return f"{left_render}^{exponent}"
             right_render = _render_expression_pretty(node.right, name_map=name_map)
             return f"{left_render}^{_parenthesize_if_binop(node.right, right_render)}"
         if isinstance(node.op, ast.Mod):
@@ -980,7 +2054,7 @@ def _render_expression_pretty(
 
     if isinstance(node, ast.Name):
         if node.id == "pi":
-            return "π"
+            return "pi"
         if node.id == "e":
             return "e"
         if name_map:
@@ -1013,7 +2087,7 @@ def format_expression_pretty(
         return _render_expression_pretty(tree.body, name_map=name_map)
     except Exception:
         fallback = text
-        fallback = re.sub(r"\b(?:np|math)\.pi\b", "π", fallback)
+        fallback = re.sub(r"\b(?:np|math)\.pi\b", "pi", fallback)
         fallback = re.sub(r"\b(?:np|math)\.e\b", "e", fallback)
         fallback = re.sub(
             r"\b(?:np|math)\.(sin|cos|tan|arcsin|arccos|arctan|sinh|cosh|tanh|exp|log10|log|sqrt|abs|power|minimum|maximum|clip)\b",
@@ -1452,6 +2526,40 @@ def extract_captures(
 _BATCH_PATTERN_MISMATCH_ERROR = "Pattern mismatch: filename does not match pattern."
 
 
+def resolve_fixed_params_from_captures(
+    parameter_capture_map: Mapping[str, Optional[str]],
+    captures: Mapping[str, Any],
+) -> Tuple[Optional[Dict[str, float]], Optional[str]]:
+    fixed_values: Dict[str, float] = {}
+    capture_map = dict(parameter_capture_map or {})
+    capture_values = dict(captures or {})
+    for param_key, capture_key in capture_map.items():
+        if not capture_key:
+            continue
+        if capture_key not in capture_values:
+            return None, (
+                f"Mapped capture '{capture_key}' for parameter '{param_key}' is missing."
+            )
+        raw_value = capture_values.get(capture_key)
+        text = str(raw_value).strip() if raw_value is not None else ""
+        if text == "":
+            return None, (
+                f"Mapped capture '{capture_key}' for parameter '{param_key}' is empty."
+            )
+        try:
+            numeric = float(text)
+        except Exception:
+            return None, (
+                f"Mapped capture '{capture_key}' for parameter '{param_key}' is non-numeric: {raw_value!r}"
+            )
+        if not np.isfinite(numeric):
+            return None, (
+                f"Mapped capture '{capture_key}' for parameter '{param_key}' is not finite: {raw_value!r}"
+            )
+        fixed_values[str(param_key)] = float(numeric)
+    return fixed_values, None
+
+
 def make_batch_result_row(
     source_index,
     file_path,
@@ -1465,12 +2573,11 @@ def make_batch_result_row(
     plot=None,
     plot_has_fit=None,
     plot_render_size=None,
-    fit_attempts=None,
-    fit_best_sse=None,
-    fit_mode=None,
-    fit_seed=None,
-    fit_requested_starts=None,
-    fit_de_used=None,
+    boundary_ratios=None,
+    boundary_values=None,
+    fit_stage=None,
+    fit_sse=None,
+    fit_diagnostics=None,
     pattern_error=None,
 ):
     return {
@@ -1486,12 +2593,11 @@ def make_batch_result_row(
         "plot": plot,
         "plot_has_fit": plot_has_fit,
         "plot_render_size": plot_render_size,
-        "fit_attempts": fit_attempts,
-        "fit_best_sse": fit_best_sse,
-        "fit_mode": fit_mode,
-        "fit_seed": fit_seed,
-        "fit_requested_starts": fit_requested_starts,
-        "fit_de_used": fit_de_used,
+        "boundary_ratios": boundary_ratios,
+        "boundary_values": boundary_values,
+        "fit_stage": fit_stage,
+        "fit_sse": fit_sse,
+        "fit_diagnostics": dict(fit_diagnostics or {}),
         "pattern_error": pattern_error,
     }
 
@@ -1503,29 +2609,26 @@ def render_batch_thumbnail(
     smoothing_enabled=False,
     smoothing_window=1,
 ):
-    """Render a row thumbnail pixmap, including fitted curve when available."""
+    """Render a row thumbnail pixmap, including all channels and fitted curve."""
     try:
         data = read_measurement_csv(row["file"])
-        time_col = "TIME" if "TIME" in data.columns else data.columns[0]
         x_col = row.get("x_channel") or (
             "CH3" if "CH3" in data.columns else data.columns[0]
         )
         y_col = row.get("y_channel") or (
             "CH2" if "CH2" in data.columns else data.columns[0]
         )
-        time_data = data[time_col].to_numpy(dtype=float, copy=True) * 1e3
-        y_data = data[y_col].to_numpy(dtype=float, copy=True)
         x_data = data[x_col].to_numpy(dtype=float, copy=True)
+        y_data = data[y_col].to_numpy(dtype=float, copy=True)
         if smoothing_enabled:
             y_data = smooth_channel_array(y_data, smoothing_window)
             x_data = smooth_channel_array(x_data, smoothing_window)
 
         # Keep thumbnail rendering lightweight: use a reduced sample count.
-        sample_count = len(time_data)
+        sample_count = len(x_data)
         max_thumbnail_points = 600
         if sample_count > max_thumbnail_points:
             step = int(np.ceil(sample_count / float(max_thumbnail_points)))
-            time_data = time_data[::step]
             y_data = y_data[::step]
             x_data = x_data[::step]
         column_data = {}
@@ -1554,17 +2657,49 @@ def render_batch_thumbnail(
         )
         fig.subplots_adjust(left=0.08, right=0.98, top=0.92, bottom=0.16)
         ax = fig.add_subplot(111)
-        ax.plot(time_data, y_data, linewidth=1.25, color="C0")
-        ax.plot(time_data, x_data, linewidth=1.25, alpha=0.45, color="C1")
+        plot_channel_names = []
+        if y_col in column_data:
+            plot_channel_names.append(str(y_col))
+        for column in data.columns:
+            key = str(column).strip()
+            if (
+                not key
+                or key == str(x_col)
+                or key in plot_channel_names
+                or key not in column_data
+            ):
+                continue
+            plot_channel_names.append(key)
+
+        for idx, channel_name in enumerate(plot_channel_names):
+            channel_values = np.asarray(column_data[channel_name], dtype=float)
+            if channel_values.size != x_data.size:
+                continue
+            is_target = str(channel_name) == str(y_col)
+            ax.plot(
+                x_data,
+                channel_values,
+                linewidth=1.25 if is_target else 1.0,
+                alpha=1.0 if is_target else 0.8,
+                color=palette_color(idx),
+            )
 
         params = row.get("params")
-        if params:
+        if params is not None:
+            try:
+                params_arr = np.asarray(params, dtype=float).reshape(-1)
+            except Exception:
+                params_arr = np.asarray([], dtype=float)
+        else:
+            params_arr = np.asarray([], dtype=float)
+        if params_arr.size > 0:
             fitted_y = model_func(
                 x_data,
-                *params,
+                *params_arr.tolist(),
                 column_data=column_data,
+                boundary_ratios=row.get("boundary_ratios"),
             )
-            ax.plot(time_data, fitted_y, linewidth=1.25, color=FIT_CURVE_COLOR)
+            ax.plot(x_data, fitted_y, linewidth=1.25, color=FIT_CURVE_COLOR)
 
         ax.set_xticks([])
         ax.set_yticks([])
@@ -1586,30 +2721,15 @@ def render_batch_thumbnail(
 
 
 class FitWorker(QObject):
-    finished = pyqtSignal(object, object, float, object)
+    finished = pyqtSignal(object)
     failed = pyqtSignal(str)
     cancelled = pyqtSignal()
 
-    def __init__(
-        self,
-        x_data,
-        y_data,
-        p0,
-        bounds,
-        model_func,
-        fit_options=None,
-    ):
+    def __init__(self, x_data, y_data, fit_context):
         super().__init__()
         self.x_data = np.asarray(x_data, dtype=float)
         self.y_data = np.asarray(y_data, dtype=float)
-        self.p0 = np.asarray(p0, dtype=float)
-        self.bounds = bounds
-        self.model_func = model_func
-        self.fit_options = (
-            fit_options
-            if isinstance(fit_options, FitOptimizationOptions)
-            else FitOptimizationOptions()
-        )
+        self.fit_context = dict(fit_context or {})
         self.cancel_requested = False
 
     def request_cancel(self):
@@ -1622,20 +2742,21 @@ class FitWorker(QObject):
                 self.cancelled.emit()
                 return
 
-            popt, pcov, r2, diagnostics = run_multistart_fit(
-                self.model_func,
+            result = run_fit_pipeline(
                 self.x_data,
                 self.y_data,
-                self.p0,
-                self.bounds,
-                self.fit_options,
+                self.fit_context["model_def"],
+                self.fit_context["seed_map"],
+                self.fit_context["bounds_map"],
+                boundary_seed=self.fit_context.get("boundary_seed"),
                 cancel_check=lambda: self.cancel_requested,
+                fixed_params=self.fit_context.get("fixed_params"),
+                fit_mode=self.fit_context.get("fit_mode"),
             )
             if self.cancel_requested:
                 self.cancelled.emit()
                 return
-
-            self.finished.emit(popt, pcov, float(r2), diagnostics)
+            self.finished.emit(result)
         except FitCancelledError:
             self.cancelled.emit()
         except Exception as exc:
@@ -1654,65 +2775,149 @@ class BatchFitWorker(QObject):
     def __init__(
         self,
         file_paths,
-        p0,
-        bounds,
-        all_param_keys,
-        active_param_keys,
-        base_params,
+        source_indices,
+        existing_rows_by_file,
         regex_pattern,
         capture_defaults,
-        expression_evaluator,
+        parameter_capture_map,
+        model_def,
+        ordered_param_keys,
+        seed_map,
+        bounds_map,
+        boundary_seed,
+        fit_mode,
         x_channel,
         y_channel,
-        fit_start_pct,
-        fit_end_pct,
-        fit_options=None,
         smoothing_enabled=False,
         smoothing_window=1,
     ):
         super().__init__()
         self.file_paths = list(file_paths)
-        self.p0 = np.asarray(p0, dtype=float)
-        self.bounds = bounds
-        self.all_param_keys = list(all_param_keys)
-        self.active_param_keys = list(active_param_keys)
-        self.base_params = [float(val) for val in base_params]
+        self.source_indices = [int(idx) for idx in list(source_indices or ())]
+        if len(self.source_indices) != len(self.file_paths):
+            self.source_indices = list(range(len(self.file_paths)))
+        self.existing_rows_by_file = {
+            str(key): dict(value or {})
+            for key, value in dict(existing_rows_by_file or {}).items()
+        }
         self.regex = re.compile(regex_pattern) if regex_pattern else None
         self.capture_defaults = dict(capture_defaults or {})
-        self.expression_evaluator = expression_evaluator
-        self.x_channel = x_channel
-        self.y_channel = y_channel
-        self.fit_start_pct = fit_start_pct
-        self.fit_end_pct = fit_end_pct
-        self.fit_options = (
-            fit_options
-            if isinstance(fit_options, FitOptimizationOptions)
-            else FitOptimizationOptions()
-        )
+        self.parameter_capture_map = {
+            str(key): (str(value) if value not in (None, "") else None)
+            for key, value in dict(parameter_capture_map or {}).items()
+        }
+        self.model_def = model_def
+        self.ordered_param_keys = list(ordered_param_keys or ())
+        self.seed_map = {
+            str(key): float(val) for key, val in dict(seed_map or {}).items()
+        }
+        self.bounds_map = {
+            str(key): (float(v[0]), float(v[1]))
+            for key, v in dict(bounds_map or {}).items()
+        }
+        self.boundary_seed = np.asarray(boundary_seed, dtype=float)
+        self.fit_mode = normalize_fit_mode(fit_mode)
+        self.x_channel = str(x_channel)
+        self.y_channel = str(y_channel)
         self.smoothing_enabled = bool(smoothing_enabled)
         self.smoothing_window = int(smoothing_window)
         self.cancel_requested = False
-        self._executor = None
-        self._futures = []
 
     def request_cancel(self):
         self.cancel_requested = True
-        futures = list(getattr(self, "_futures", []))
-        for future in futures:
+
+    def _mapping_fixed_params(
+        self, captures: Mapping[str, Any]
+    ) -> Tuple[Optional[Dict[str, float]], Optional[str]]:
+        return resolve_fixed_params_from_captures(self.parameter_capture_map, captures)
+
+    @staticmethod
+    def _copy_fit_fields_from_existing(
+        row: Dict[str, Any], existing_row: Mapping[str, Any]
+    ) -> Dict[str, Any]:
+        preserved = dict(row)
+        existing_params = existing_row.get("params")
+        if existing_params is not None:
             try:
-                future.cancel()
+                existing_params = (
+                    np.asarray(existing_params, dtype=float).reshape(-1).tolist()
+                )
             except Exception:
                 pass
-        executor = getattr(self, "_executor", None)
-        if executor is not None:
+        preserved["params"] = existing_params
+        preserved["r2"] = existing_row.get("r2")
+        preserved["fit_sse"] = existing_row.get("fit_sse")
+        preserved["fit_stage"] = existing_row.get("fit_stage")
+        preserved["fit_diagnostics"] = dict(existing_row.get("fit_diagnostics") or {})
+        preserved["error"] = (
+            None if has_nonempty_values(existing_params) else existing_row.get("error")
+        )
+        boundary_ratios = existing_row.get("boundary_ratios")
+        if boundary_ratios is not None:
             try:
-                executor.shutdown(wait=False, cancel_futures=True)
+                boundary_ratios = (
+                    np.asarray(boundary_ratios, dtype=float).reshape(-1).copy()
+                )
             except Exception:
                 pass
+        boundary_values = existing_row.get("boundary_values")
+        if boundary_values is not None:
+            try:
+                boundary_values = (
+                    np.asarray(boundary_values, dtype=float).reshape(-1).copy()
+                )
+            except Exception:
+                pass
+        preserved["boundary_ratios"] = boundary_ratios
+        preserved["boundary_values"] = boundary_values
+        return preserved
+
+    def _seed_map_with_existing_fit(
+        self, seed_map: Dict[str, float], existing_row: Mapping[str, Any]
+    ) -> Dict[str, float]:
+        updated_seed = dict(seed_map)
+        if not has_nonempty_values(existing_row.get("params")):
+            return updated_seed
+        try:
+            existing_params = np.asarray(
+                existing_row.get("params"), dtype=float
+            ).reshape(-1)
+        except Exception:
+            return updated_seed
+        for idx, key in enumerate(self.ordered_param_keys):
+            if idx >= existing_params.size:
+                break
+            value = float(existing_params[idx])
+            if (not np.isfinite(value)) or key not in updated_seed:
+                continue
+            updated_seed[key] = value
+        return updated_seed
+
+    def _boundary_seed_for_file(self, existing_row: Mapping[str, Any]) -> np.ndarray:
+        candidate = np.asarray(self.boundary_seed, dtype=float).reshape(-1)
+        if candidate.size <= 0:
+            return candidate
+        if not has_nonempty_values(existing_row.get("params")):
+            return candidate
+        existing_ratios = existing_row.get("boundary_ratios")
+        if existing_ratios is None:
+            return candidate
+        try:
+            existing_arr = np.asarray(existing_ratios, dtype=float).reshape(-1)
+        except Exception:
+            return candidate
+        if existing_arr.size != candidate.size:
+            return candidate
+        if np.any(~np.isfinite(existing_arr)):
+            return candidate
+        return np.clip(existing_arr, 0.0, 1.0)
 
     def _fit_single_file(self, source_index, file_path):
         if self.cancel_requested:
             return None
+
+        existing_row = self.existing_rows_by_file.get(str(file_path), {})
+        existing_has_fit = has_nonempty_values(existing_row.get("params"))
         extracted = extract_captures(
             stem_for_file_ref(file_path),
             self.regex,
@@ -1729,234 +2934,118 @@ class BatchFitWorker(QObject):
             pattern_error=pattern_error,
         )
 
-        data = read_measurement_csv(file_path)
-        x_data = data[self.x_channel].to_numpy(dtype=float, copy=True)
-        y_data = data[self.y_channel].to_numpy(dtype=float, copy=True)
-        if self.smoothing_enabled:
-            x_data = smooth_channel_array(x_data, self.smoothing_window)
-            y_data = smooth_channel_array(y_data, self.smoothing_window)
-        n = len(x_data)
-        start = int(np.floor((self.fit_start_pct / 100.0) * max(0, n - 1)))
-        end = int(np.ceil((self.fit_end_pct / 100.0) * max(0, n - 1))) + 1
-        start = max(0, min(n - 1, start)) if n else 0
-        end = max(start + 1, min(n, end)) if n else 0
-        fit_slice = slice(start, end)
-        x_fit = x_data[fit_slice]
-        y_fit = y_data[fit_slice]
-        column_data_fit = {}
-        for column in data.columns:
-            key = str(column).strip()
-            if not key:
-                continue
-            try:
-                column_values = data[column].to_numpy(dtype=float, copy=True)
-                if self.smoothing_enabled:
-                    column_values = smooth_channel_array(
-                        column_values,
-                        self.smoothing_window,
-                    )
-                column_data_fit[key] = column_values[fit_slice]
-            except Exception:
-                continue
+        try:
+            data = read_measurement_csv(file_path)
+            if self.x_channel not in data.columns:
+                raise KeyError(f"Missing x channel '{self.x_channel}'.")
+            if self.y_channel not in data.columns:
+                raise KeyError(f"Missing y channel '{self.y_channel}'.")
+            x_data = data[self.x_channel].to_numpy(dtype=float, copy=True)
+            y_data = data[self.y_channel].to_numpy(dtype=float, copy=True)
+            if self.smoothing_enabled:
+                x_data = smooth_channel_array(x_data, self.smoothing_window)
+                y_data = smooth_channel_array(y_data, self.smoothing_window)
 
-        base_param_map = {
-            key: self.base_params[idx] for idx, key in enumerate(self.all_param_keys)
-        }
+            seed_map = self._seed_map_with_existing_fit(self.seed_map, existing_row)
+            fixed_params, mapping_error = self._mapping_fixed_params(captures)
+            if mapping_error:
+                if existing_has_fit:
+                    return self._copy_fit_fields_from_existing(row, existing_row)
+                row["error"] = mapping_error
+                return row
+            if fixed_params:
+                for key, value in fixed_params.items():
+                    if key in seed_map:
+                        seed_map[key] = float(value)
 
-        def fit_model(x_local, *fit_params):
-            params = dict(base_param_map)
-            for idx, key in enumerate(self.active_param_keys):
-                if idx < len(fit_params):
-                    params[key] = float(fit_params[idx])
-            return self.expression_evaluator(
-                x_local,
-                params,
-                column_data=column_data_fit,
+            if self.cancel_requested:
+                return None
+
+            result = run_fit_pipeline(
+                x_data,
+                y_data,
+                self.model_def,
+                seed_map,
+                self.bounds_map,
+                boundary_seed=self._boundary_seed_for_file(existing_row),
+                cancel_check=lambda: self.cancel_requested,
+                fixed_params=fixed_params,
+                fit_mode=self.fit_mode,
             )
+            if self.cancel_requested:
+                return None
 
-        if self.cancel_requested:
+            params_by_key = dict(result.get("params_by_key") or {})
+            row["params"] = [
+                float(params_by_key.get(key, seed_map.get(key, 0.0)))
+                for key in self.ordered_param_keys
+            ]
+            row["r2"] = float(result["r2"]) if result.get("r2") is not None else None
+            row["fit_sse"] = (
+                float(result["sse"]) if result.get("sse") is not None else None
+            )
+            diagnostics = dict(result.get("diagnostics") or {})
+            diagnostics["fixed_params"] = dict(fixed_params or {})
+            boundary_values = result.get("boundary_ratios")
+            if boundary_values is None:
+                boundary_values = []
+            row["boundary_ratios"] = np.asarray(boundary_values, dtype=float)
+            n_boundaries = max(0, len(self.model_def.segment_exprs) - 1)
+            row["boundary_values"] = boundary_ratios_to_x_values(
+                row["boundary_ratios"],
+                x_data,
+                n_boundaries,
+            )
+            row["fit_stage"] = diagnostics.get("selected_stage")
+            row["fit_diagnostics"] = diagnostics
+            row["error"] = None
+            if existing_has_fit and not is_fit_row_improved(row, existing_row):
+                return self._copy_fit_fields_from_existing(row, existing_row)
+            return row
+        except FitCancelledError:
             return None
-
-        popt, _pcov, r2_val, diagnostics = run_multistart_fit(
-            fit_model,
-            x_fit,
-            y_fit,
-            self.p0,
-            self.bounds,
-            self.fit_options,
-            cancel_check=lambda: self.cancel_requested,
-            seed_offset=source_index,
-        )
-
-        if self.cancel_requested:
-            return None
-
-        merged_params = {
-            key: self.base_params[idx] for idx, key in enumerate(self.all_param_keys)
-        }
-        for idx, key in enumerate(self.active_param_keys):
-            if idx < len(popt):
-                merged_params[key] = float(popt[idx])
-        row["params"] = [float(merged_params[key]) for key in self.all_param_keys]
-        row["r2"] = float(r2_val) if r2_val is not None else None
-        row["fit_attempts"] = diagnostics.get("attempts")
-        row["fit_best_sse"] = diagnostics.get("best_sse")
-        row["fit_mode"] = diagnostics.get("mode")
-        row["fit_seed"] = diagnostics.get("seed")
-        row["fit_requested_starts"] = diagnostics.get("requested_starts")
-        row["fit_de_used"] = diagnostics.get("de_used")
-        return row
+        except Exception as exc:
+            if existing_has_fit:
+                return self._copy_fit_fields_from_existing(row, existing_row)
+            row["error"] = str(exc)
+            return row
 
     @pyqtSlot()
     def run(self):
-        results = [None] * len(self.file_paths)
-        executor = None
+        results = []
         try:
             total = len(self.file_paths)
             if total == 0:
                 self.finished.emit([])
                 return
 
-            ideal = int(QThread.idealThreadCount())
-            if ideal <= 0:
-                ideal = 4
-            max_workers = max(1, min(8, ideal))
-
             completed = 0
-            executor = ThreadPoolExecutor(max_workers=max_workers)
-            self._executor = executor
-            future_to_idx = {
-                executor.submit(self._fit_single_file, idx, file_path): idx
-                for idx, file_path in enumerate(self.file_paths)
-            }
-            self._futures = list(future_to_idx.keys())
-
-            while future_to_idx:
+            for idx, file_path in enumerate(self.file_paths):
                 if self.cancel_requested:
-                    for pending in list(future_to_idx.keys()):
-                        try:
-                            pending.cancel()
-                        except Exception:
-                            pass
-                    try:
-                        executor.shutdown(wait=False, cancel_futures=True)
-                    except Exception:
-                        pass
                     self.cancelled.emit()
                     return
-
-                done, _pending = wait(
-                    list(future_to_idx.keys()),
-                    timeout=0.1,
-                    return_when=FIRST_COMPLETED,
+                source_index = (
+                    self.source_indices[idx] if idx < len(self.source_indices) else idx
                 )
-                if not done:
-                    continue
-
-                for future in done:
-                    idx = future_to_idx.pop(future, None)
-                    if idx is None:
-                        continue
-                    try:
-                        self._futures.remove(future)
-                    except ValueError:
-                        pass
-                    except Exception:
-                        self._futures = [
-                            item for item in self._futures if item is not future
-                        ]
-
-                    if future.cancelled():
-                        if self.cancel_requested:
-                            self.cancelled.emit()
-                            return
-                        row = make_batch_result_row(
-                            source_index=idx,
-                            file_path=self.file_paths[idx],
-                            x_channel=self.x_channel,
-                            y_channel=self.y_channel,
-                            captures={},
-                            error="Cancelled",
-                            fit_mode=fit_mode_label(self.fit_options),
-                            fit_seed=int(self.fit_options.seed) + int(idx),
-                            fit_requested_starts=(
-                                max(2, int(self.fit_options.n_starts))
-                                if self.fit_options.enabled
-                                else 1
-                            ),
-                            fit_de_used=bool(
-                                self.fit_options.enabled
-                                and self.fit_options.use_global_init
-                            ),
-                            pattern_error=None,
-                        )
-                    else:
-                        try:
-                            row = future.result()
-                        except Exception as exc:
-                            extracted = extract_captures(
-                                stem_for_file_ref(self.file_paths[idx]),
-                                self.regex,
-                                self.capture_defaults,
-                            )
-                            captures = extracted if extracted is not None else {}
-                            pattern_error = (
-                                _BATCH_PATTERN_MISMATCH_ERROR
-                                if extracted is None
-                                else None
-                            )
-                            row = make_batch_result_row(
-                                source_index=idx,
-                                file_path=self.file_paths[idx],
-                                x_channel=self.x_channel,
-                                y_channel=self.y_channel,
-                                captures=captures,
-                                error=str(exc),
-                                fit_mode=fit_mode_label(self.fit_options),
-                                fit_seed=int(self.fit_options.seed) + int(idx),
-                                fit_requested_starts=(
-                                    max(2, int(self.fit_options.n_starts))
-                                    if self.fit_options.enabled
-                                    else 1
-                                ),
-                                fit_de_used=bool(
-                                    self.fit_options.enabled
-                                    and self.fit_options.use_global_init
-                                ),
-                                pattern_error=pattern_error,
-                            )
-                    if row is None:
+                row = self._fit_single_file(source_index, file_path)
+                if row is None:
+                    if self.cancel_requested:
                         self.cancelled.emit()
                         return
-
-                    results[idx] = row
-                    completed += 1
-                    self.progress.emit(completed, total, row)
+                    continue
+                results.append(row)
+                completed += 1
+                self.progress.emit(completed, total, row)
 
             if self.cancel_requested:
                 self.cancelled.emit()
                 return
-
-            self.finished.emit([row for row in results if row is not None])
+            self.finished.emit(results)
         except Exception as exc:
             if self.cancel_requested:
                 self.cancelled.emit()
             else:
                 self.failed.emit(str(exc))
-        finally:
-            futures = list(getattr(self, "_futures", []))
-            for future in futures:
-                try:
-                    future.cancel()
-                except Exception:
-                    pass
-            self._futures = []
-            self._executor = None
-            if executor is not None:
-                try:
-                    executor.shutdown(wait=False, cancel_futures=True)
-                except Exception:
-                    pass
 
 
 class ThumbnailRenderWorker(QObject):
@@ -2046,7 +3135,7 @@ class ThumbnailRenderWorker(QObject):
 
                 pixmap = self.render_thumbnail(row)
                 row["plot_full"] = pixmap
-                row["plot_has_fit"] = bool(row.get("params"))
+                row["plot_has_fit"] = has_nonempty_values(row.get("params"))
                 row["plot_render_size"] = (
                     int(self.full_thumbnail_size[0]),
                     int(self.full_thumbnail_size[1]),
@@ -2080,19 +3169,17 @@ class ManualFitGUI(QMainWindow):
         self.param_sliders = {}
         self.param_min_spinboxes = {}
         self.param_max_spinboxes = {}
-        self.param_error_labels = {}
+        self.param_lock_status_labels = {}
+        self.param_tail_spacers_by_key = {}
+        self.breakpoint_controls = {}
         self.param_row_tail_spacers = []
         self._param_slider_steps = 2000
         self._param_name_width = 88
         self._param_bound_width = 72
         self._param_value_width = 78
-        self._param_error_width = 86
         self._fit_option_label_width = 64
         self._param_tail_placeholder_width = 0
-        self._active_fit_keys = []
         self._last_fit_active_keys = []
-        self._fit_ordered_keys = []
-        self._fit_base_values = {}
         self._apply_expression_in_progress = False
         self._channel_sync_in_progress = False
         self._highlight_refresh_in_progress = False
@@ -2100,12 +3187,13 @@ class ManualFitGUI(QMainWindow):
         self._expression_edit_mode = False
         self.current_expression = f"{DEFAULT_TARGET_CHANNEL} = {DEFAULT_EXPRESSION}"
         try:
-            self._compiled_expression = compile_expression_function(
-                DEFAULT_EXPRESSION,
-                [spec.key for spec in self.param_specs],
+            self._piecewise_model = build_piecewise_model_definition(
+                target_col=DEFAULT_TARGET_CHANNEL,
+                segment_exprs=[part.strip() for part in DEFAULT_EXPRESSION.split(";")],
+                channel_names=["TIME", "CH2", "CH3", "CH4"],
             )
         except Exception:
-            self._compiled_expression = None
+            self._piecewise_model = None
 
         self.setWindowTitle(DEFAULT_WINDOW_TITLE)
         if APP_ICON_PATH.exists():
@@ -2117,34 +3205,45 @@ class ManualFitGUI(QMainWindow):
         self.current_data = None
         self.channels = {
             "CH2": "MI output voltage",
-            "CH3": "Sig Gen / TTL",
-            "CH4": "TTL / trigger",
+            "CH3": "Sig Gen",
+            "CH4": "Trigger",
             "TIME": "Time",
         }
-        self.x_channel = "CH3"
+        self.channel_units = {
+            "CH2": "s",
+            "CH3": "V",
+            "CH4": "V",
+            "TIME": "V",
+        }
+        self.x_channel = "TIME"
         self.y_channel = "CH2"
-        self.fit_region_start_pct = 0.0
-        self.fit_region_end_pct = 100.0
-        self._fit_window_bounds_ms = (None, None)
-        self._fit_boundary_positions_ms = ()
-        self._fit_boundary_pick_px = 8.0
-        self.fit_region_selector = None
-        self._suppress_fit_region_selector = False
-        self._fit_region_refresh_pending = False
-        self._plot_mouse_cid = None
         self.last_popt = None
         self.last_pcov = None
-        self.last_fit_r2 = None
-        self.last_full_r2 = None
+        self.last_r2 = None
         self.last_fit_diagnostics = None
-        self._last_r2_fit = None
-        self._last_r2_full = None
-        self.fit_options = FitOptimizationOptions()
-        self._batch_fit_options = self.fit_options
+        self.auto_fit_btn_default_text = "Auto Fit"
+        self.curve_fit_btn_default_text = "Fast Fit"
+        self._active_fit_mode = FIT_MODE_PIECEWISE
+        self.current_boundary_ratios = default_boundary_ratios(
+            max(0, len(self._piecewise_model.segment_exprs) - 1)
+            if self._piecewise_model is not None
+            else 2
+        )
+        self._last_r2 = None
+        self.param_capture_map = {}
+        self.param_capture_combos = {}
         self.fit_thread = None
         self.fit_worker = None
         self.batch_thread = None
         self.batch_worker = None
+        self.fit_tasks = {}
+        self._fit_task_counter = 0
+        self._fit_max_concurrent = max(1, int((os.cpu_count() or 2) - 1))
+        self._pending_fit_task_ids = deque()
+        self._batch_active_task_ids = set()
+        self._batch_total_tasks = 0
+        self._batch_cancel_requested = False
+        self._manual_active_task_ids = set()
         self.batch_fit_in_progress = False
         self._batch_cancel_pending = False
         self.batch_results = []
@@ -2152,8 +3251,6 @@ class ManualFitGUI(QMainWindow):
         self.batch_capture_keys = []
         self.batch_match_count = 0
         self.batch_unmatched_files = []
-        self.analysis_csv_records = []
-        self.analysis_csv_path = None
         self.analysis_records = []
         self.analysis_columns = []
         self.analysis_numeric_data = {}
@@ -2181,8 +3278,8 @@ class ManualFitGUI(QMainWindow):
         if app is not None:
             app.installEventFilter(self)
 
-        # Parameter initial values default to midpoint of bounds.
-        self.defaults = self._default_param_midpoints(self.param_specs)
+        # Parameter initial values default to ParameterSpec.default (clipped to bounds).
+        self.defaults = self._default_param_values(self.param_specs)
 
         # Optimization: timer for debouncing updates
         self.update_timer = QTimer()
@@ -2198,13 +3295,14 @@ class ManualFitGUI(QMainWindow):
         self._display_target_points = 3000
         self._plot_has_residual_axis = False
         self._last_file_load_error = ""
-        self.smoothing_enabled = False
-        self.smoothing_window = 5
+        self.smoothing_enabled = True
+        self.smoothing_window = 101
 
         # Current directory
         self.current_dir = "./AFG_measurements/"
         self._source_display_override = None
         self._source_selected_paths = []
+        self._fit_details_restore_in_progress = False
 
         # Create central widget
         central_widget = QWidget()
@@ -2218,9 +3316,13 @@ class ManualFitGUI(QMainWindow):
 
         # Shared controls/parameters/results for all modes.
         self.create_parameters_frame(main_layout)
+        self._refresh_fit_action_buttons()
+        self._refresh_batch_controls()
 
         self.tabs = QTabWidget()
         main_layout.addWidget(self.tabs)
+        if hasattr(self, "stats_text"):
+            main_layout.addWidget(self.stats_text)
 
         self.manual_tab = QWidget()
         self.batch_tab = QWidget()
@@ -2229,6 +3331,7 @@ class ManualFitGUI(QMainWindow):
         self.tabs.addTab(self.batch_tab, "Batch Processing")
         self.tabs.addTab(self.analysis_tab, "Batch Analysis")
         self.tabs.currentChanged.connect(self._on_tab_changed)
+        self._attach_tab_corner_controls()
 
         manual_layout = QVBoxLayout(self.manual_tab)
         manual_layout.setContentsMargins(6, 6, 6, 6)
@@ -2240,7 +3343,6 @@ class ManualFitGUI(QMainWindow):
         batch_layout = QVBoxLayout(self.batch_tab)
         batch_layout.setContentsMargins(6, 6, 6, 6)
         batch_layout.setSpacing(6)
-        self.create_batch_controls_frame(batch_layout)
         self.create_batch_results_frame(batch_layout)
 
         analysis_layout = QVBoxLayout(self.analysis_tab)
@@ -2254,18 +3356,39 @@ class ManualFitGUI(QMainWindow):
         QTimer.singleShot(0, self.load_files)
 
     def _on_tab_changed(self, _index):
-        if self.tabs.currentWidget() not in (self.batch_tab, self.analysis_tab):
+        current_widget = self.tabs.currentWidget() if hasattr(self, "tabs") else None
+        if hasattr(self, "tab_r2_label"):
+            self.tab_r2_label.setVisible(current_widget is self.manual_tab)
+        if current_widget not in (self.batch_tab, self.analysis_tab):
             return
         if not self._batch_preview_ready:
             self._batch_preview_ready = True
             self.prepare_batch_preview()
             self._expand_file_column_for_selected_files()
-        if self.tabs.currentWidget() == self.analysis_tab:
+        if current_widget == self.analysis_tab:
             self._refresh_batch_analysis_if_run()
+
+    def _attach_tab_corner_controls(self):
+        if not hasattr(self, "tabs"):
+            return
+        corner_widget = QWidget()
+        corner_layout = QHBoxLayout(corner_widget)
+        corner_layout.setContentsMargins(0, 0, 0, 0)
+        corner_layout.setSpacing(4)
+        self.tab_r2_label = self._new_label(
+            "R²: N/A",
+            object_name="statusLabel",
+            style_sheet="font-weight: 600; color: #334155; padding: 1px 2px;",
+        )
+        corner_layout.addWidget(self.tab_r2_label)
+        self.tabs.setCornerWidget(corner_widget, Qt.Corner.TopRightCorner)
+        self.tab_corner_controls = corner_widget
+        self.tab_r2_label.setVisible(self.tabs.currentWidget() is self.manual_tab)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._refresh_source_path_label()
+        QTimer.singleShot(0, self._sync_fit_panel_top_spacing)
 
     def eventFilter(self, watched, event):
         if (
@@ -2536,9 +3659,9 @@ class ManualFitGUI(QMainWindow):
                 padding: 0px 2px;
             }
             QDoubleSpinBox#paramBoundBox {
-                background: #f8fafc;
-                color: #334155;
-                border-color: #d7e0ea;
+                background: #ffffff;
+                color: #0f172a;
+                border-color: #94a3b8;
             }
             QDoubleSpinBox#paramValueBox {
                 background: #ffffff;
@@ -2674,8 +3797,9 @@ class ManualFitGUI(QMainWindow):
         minimum_width=None,
         fixed_width=None,
         current_index_changed=None,
+        rich_text=False,
     ):
-        combo = QComboBox()
+        combo = RichTextComboBox() if rich_text else QComboBox()
         if items:
             for item in items:
                 if isinstance(item, (tuple, list)) and len(item) >= 2:
@@ -2747,7 +3871,7 @@ class ManualFitGUI(QMainWindow):
             else str(self.current_dir).strip()
         ) or "."
         prefix = "📁 "
-        max_width = max(220, int(self.width() * 0.5))
+        max_width = max(220, int(self.width() * 0.4))
         self.source_path_label.setMaximumWidth(max_width)
         metrics = self.source_path_label.fontMetrics()
         available_for_path = max(24, max_width - metrics.horizontalAdvance(prefix))
@@ -2760,9 +3884,7 @@ class ManualFitGUI(QMainWindow):
         tooltip = [f"Current data source:\n{source_text}"]
         selected_paths = list(getattr(self, "_source_selected_paths", []) or [])
         if selected_paths:
-            preview = "\n".join(
-                display_name_for_file_ref(path) for path in selected_paths[:12]
-            )
+            preview = "\n".join(stem_for_file_ref(path) for path in selected_paths[:12])
             remaining = len(selected_paths) - 12
             if remaining > 0:
                 preview += f"\n... +{remaining} more"
@@ -2784,6 +3906,107 @@ class ManualFitGUI(QMainWindow):
         if hasattr(self, "next_file_btn"):
             self.next_file_btn.setEnabled((total > 0) and (not at_end) and (not busy))
 
+    def _current_loaded_file_path(self):
+        files = list(getattr(self, "data_files", []) or [])
+        idx = int(getattr(self, "current_file_idx", -1))
+        if 0 <= idx < len(files):
+            return files[idx]
+        return None
+
+    def _next_fit_task_id(self):
+        self._fit_task_counter = int(getattr(self, "_fit_task_counter", 0)) + 1
+        return int(self._fit_task_counter)
+
+    def _running_fit_task_count(self):
+        return sum(
+            1
+            for meta in self.fit_tasks.values()
+            if str(meta.get("status")) == "running"
+        )
+
+    def _schedule_fit_tasks(self):
+        max_running = max(1, int(getattr(self, "_fit_max_concurrent", 1)))
+        while (
+            self._running_fit_task_count() < max_running
+            and len(self._pending_fit_task_ids) > 0
+        ):
+            try:
+                task_id = int(self._pending_fit_task_ids.popleft())
+            except Exception:
+                continue
+            task = self.fit_tasks.get(task_id)
+            if task is None:
+                continue
+            if str(task.get("status")) != "pending":
+                continue
+            task["status"] = "running"
+            thread = task.get("thread")
+            if thread is not None:
+                thread.start()
+
+    def _active_fit_tasks_for_file(self, file_path):
+        target = str(file_path or "").strip()
+        if not target:
+            return []
+        return [
+            meta
+            for meta in self.fit_tasks.values()
+            if str(meta.get("file_path") or "").strip() == target
+        ]
+
+    def _is_file_fit_active(self, file_path):
+        return bool(self._active_fit_tasks_for_file(file_path))
+
+    def _refresh_fit_action_buttons(self):
+        current_file = self._current_loaded_file_path()
+        active_tasks = self._active_fit_tasks_for_file(current_file)
+        manual_tasks = [
+            meta for meta in active_tasks if str(meta.get("kind")) == "manual"
+        ]
+
+        piecewise_running = any(
+            normalize_fit_mode(meta.get("fit_mode")) == FIT_MODE_PIECEWISE
+            for meta in manual_tasks
+        )
+        curve_running = any(
+            normalize_fit_mode(meta.get("fit_mode")) == FIT_MODE_CURVE_FIT
+            for meta in manual_tasks
+        )
+        any_running = bool(active_tasks)
+
+        if hasattr(self, "auto_fit_btn"):
+            self.auto_fit_btn.setEnabled((not any_running) or piecewise_running)
+            self.auto_fit_btn.setText(
+                "Cancel" if piecewise_running else self.auto_fit_btn_default_text
+            )
+        if hasattr(self, "curve_fit_btn"):
+            self.curve_fit_btn.setEnabled((not any_running) or curve_running)
+            self.curve_fit_btn.setText(
+                "Cancel" if curve_running else self.curve_fit_btn_default_text
+            )
+        if hasattr(self, "reset_from_batch_btn"):
+            self.reset_from_batch_btn.setEnabled(not any_running)
+
+    def _refresh_batch_controls(self):
+        if not hasattr(self, "run_batch_btn") or not hasattr(self, "cancel_batch_btn"):
+            return
+        if not bool(self.batch_fit_in_progress):
+            self.run_batch_btn.setEnabled(True)
+            self.run_batch_btn.setText(self.run_batch_btn_default_text)
+            self.cancel_batch_btn.setEnabled(False)
+            self.cancel_batch_btn.setText("Cancel")
+            return
+        total = max(0, int(getattr(self, "_batch_total_tasks", 0)))
+        done = max(0, int(getattr(self, "_batch_progress_done", 0)))
+        self.run_batch_btn.setEnabled(False)
+        self.run_batch_btn.setText(f"Run Batch ({done}/{total})")
+        self.cancel_batch_btn.setEnabled(True)
+        self.cancel_batch_btn.setText(
+            "Force Stop"
+            if bool(getattr(self, "_batch_cancel_pending", False))
+            else "Cancel"
+        )
+
     def _default_param_midpoints(self, specs):
         midpoints = []
         for spec in specs:
@@ -2793,6 +4016,37 @@ class ManualFitGUI(QMainWindow):
                 low, high = high, low
             midpoints.append((low + high) * 0.5)
         return midpoints
+
+    def _default_param_values(self, specs):
+        defaults = []
+        for spec in specs:
+            low = float(spec.min_value)
+            high = float(spec.max_value)
+            if low > high:
+                low, high = high, low
+            defaults.append(float(np.clip(float(spec.default), low, high)))
+        return defaults
+
+    def _apply_param_spec_defaults_to_controls(self):
+        defaults = self._default_param_values(self.param_specs)
+        self.defaults = list(defaults)
+        changed = False
+        for idx, spec in enumerate(self.param_specs):
+            spinbox = self.param_spinboxes.get(spec.key)
+            if spinbox is None:
+                continue
+            low = float(spinbox.minimum())
+            high = float(spinbox.maximum())
+            if low > high:
+                low, high = high, low
+            target = float(np.clip(defaults[idx], low, high))
+            if not np.isclose(float(spinbox.value()), target):
+                changed = True
+                spinbox.blockSignals(True)
+                spinbox.setValue(target)
+                spinbox.blockSignals(False)
+            self._sync_slider_from_spinbox(spec.key)
+        return changed
 
     def _new_compact_int_spinbox(
         self,
@@ -2884,17 +4138,6 @@ class ManualFitGUI(QMainWindow):
         spinbox.setValue(float(value))
         return spinbox
 
-    def _sync_fit_optimization_controls(self):
-        if not hasattr(self, "fit_enabled_cb"):
-            return
-        enabled = bool(self.fit_enabled_cb.isChecked())
-        for widget in getattr(self, "_fit_robust_widgets", []):
-            widget.setEnabled(enabled)
-
-        de_enabled = enabled and bool(self.fit_use_de_cb.isChecked())
-        for widget in getattr(self, "_fit_de_widgets", []):
-            widget.setEnabled(de_enabled)
-
     def _effective_smoothing_window(self):
         window = int(getattr(self, "smoothing_window", 1))
         if window <= 1:
@@ -2918,11 +4161,26 @@ class ManualFitGUI(QMainWindow):
         self.channel_cache = rebuilt
         self._expression_channel_data_cache = dict(rebuilt)
 
+    def _sync_smoothing_window_enabled(self):
+        spin = getattr(self, "smoothing_window_spin", None)
+        if spin is None:
+            return
+        toggle = getattr(self, "smoothing_toggle_btn", None)
+        if toggle is None:
+            toggle = getattr(self, "smoothing_enable_cb", None)
+        enabled = bool(toggle and toggle.isChecked())
+        spin.setEnabled(enabled)
+
+    def _on_show_channels_toggled(self):
+        self.update_plot(fast=False)
+        self._autosave_fit_details()
+
     def _on_smoothing_controls_changed(self):
-        enabled = bool(
-            getattr(self, "smoothing_enable_cb", None)
-            and self.smoothing_enable_cb.isChecked()
-        )
+        toggle = getattr(self, "smoothing_toggle_btn", None)
+        if toggle is None:
+            toggle = getattr(self, "smoothing_enable_cb", None)
+        enabled = bool(toggle and toggle.isChecked())
+        self._sync_smoothing_window_enabled()
         window = (
             int(self.smoothing_window_spin.value())
             if hasattr(self, "smoothing_window_spin")
@@ -2963,6 +4221,7 @@ class ManualFitGUI(QMainWindow):
                 residual_ylim = None
 
         self._rebuild_channel_cache_from_raw()
+        self._sync_breakpoint_sliders_from_state()
         for row in self.batch_results:
             row["plot_full"] = None
             row["plot"] = None
@@ -2970,7 +4229,7 @@ class ManualFitGUI(QMainWindow):
         if self.batch_results:
             self.update_batch_table()
             self.queue_visible_thumbnail_render()
-        self.update_plot(fast=False)
+        self.update_plot(fast=False, preserve_view=False)
         if hasattr(self, "ax") and self.ax is not None:
             if main_xlim is not None:
                 try:
@@ -2993,6 +4252,7 @@ class ManualFitGUI(QMainWindow):
                 pass
         if hasattr(self, "canvas") and self.canvas is not None:
             self.canvas.draw_idle()
+        self._autosave_fit_details()
 
     def _sync_fit_panel_top_spacing(self):
         spacer = getattr(self, "fit_panel_top_spacer", None)
@@ -3018,28 +4278,27 @@ class ManualFitGUI(QMainWindow):
             int(getattr(self, "_param_header_to_rows_gap", 0)) + header_height
         )
         spacer.setFixedHeight(max(0, target_height))
+        self._sync_param_pane_height()
 
-    def _current_fit_optimization_options(self):
-        base = (
-            self.fit_options
-            if isinstance(self.fit_options, FitOptimizationOptions)
-            else FitOptimizationOptions()
-        )
-        if not hasattr(self, "fit_enabled_cb"):
-            return base
-        opts = FitOptimizationOptions(
-            enabled=bool(self.fit_enabled_cb.isChecked()),
-            n_starts=max(2, int(self.fit_n_starts_spin.value())),
-            per_start_maxfev=max(20, int(self.fit_per_start_fev_spin.value())),
-            seed=base.seed,
-            use_global_init=bool(self.fit_use_de_cb.isChecked()),
-            de_maxiter=max(1, int(self.fit_de_maxiter_spin.value())),
-            de_popsize=max(2, int(self.fit_de_popsize_spin.value())),
-            early_stop_r2=float(self.fit_early_stop_r2_spin.value()),
-            early_stop_patience=max(0, int(self.fit_patience_spin.value())),
-        )
-        self.fit_options = opts
-        return opts
+    def _sync_param_pane_height(self):
+        scroll = getattr(self, "param_controls_scroll", None)
+        fit_panel = getattr(self, "fit_panel_widget", None)
+        if scroll is None or fit_panel is None:
+            return
+        fit_height = 0
+        try:
+            fit_height = max(
+                int(fit_panel.height()),
+                int(fit_panel.minimumSizeHint().height()),
+                int(fit_panel.sizeHint().height()),
+            )
+        except Exception:
+            fit_height = int(getattr(fit_panel, "height", lambda: 0)())
+        fit_height = max(0, int(fit_height))
+        if fit_height <= 0:
+            return
+        if scroll.minimumHeight() != fit_height or scroll.maximumHeight() != fit_height:
+            scroll.setFixedHeight(fit_height)
 
     def _make_param_header_label(self, text, width=None):
         return self._new_label(
@@ -3051,6 +4310,11 @@ class ManualFitGUI(QMainWindow):
 
     def _display_symbol_for_param(self, key, symbol_hint=None):
         return resolve_parameter_symbol(key, symbol_hint)
+
+    def _display_symbol_for_param_html(self, key, symbol_hint=None):
+        return parameter_symbol_to_html(
+            self._display_symbol_for_param(key, symbol_hint)
+        )
 
     def _parameter_symbol_map(self):
         mapping = {}
@@ -3064,22 +4328,273 @@ class ManualFitGUI(QMainWindow):
                 return self._display_symbol_for_param(spec.key, spec.symbol)
         return self._display_symbol_for_param(key, key)
 
+    def _display_name_for_param_key_mathtext(self, key):
+        return parameter_symbol_to_mathtext(self._display_name_for_param_key(key))
+
+    def _ordered_parameter_sections(self):
+        ordered_keys = self._ordered_param_keys()
+        model_def = self._piecewise_model
+        if (
+            model_def is None
+            or not getattr(model_def, "segment_param_names", None)
+            or len(model_def.segment_param_names) == 0
+        ):
+            return [{"kind": "segment", "index": 1, "keys": list(ordered_keys)}]
+
+        sections = []
+        seen = set()
+        segment_param_names = list(model_def.segment_param_names)
+        total_segments = len(segment_param_names)
+        for seg_idx, seg_names in enumerate(segment_param_names, start=1):
+            unique_keys = []
+            for raw_name in seg_names:
+                key = str(raw_name)
+                if key in seen or key not in ordered_keys:
+                    continue
+                unique_keys.append(key)
+                seen.add(key)
+            sections.append({"kind": "segment", "index": seg_idx, "keys": unique_keys})
+            if seg_idx < total_segments:
+                sections.append({"kind": "boundary", "index": seg_idx, "keys": []})
+
+        trailing = [key for key in ordered_keys if key not in seen]
+        if trailing:
+            sections.append({"kind": "shared", "index": 0, "keys": trailing})
+        return sections
+
+    def _build_param_section_header(self, title, tooltip=""):
+        label = self._new_label(
+            str(title),
+            object_name="statusLabel",
+            tooltip=tooltip,
+            alignment=Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+            style_sheet="font-weight: 700; color: #0f172a; padding: 2px 0 0 0;",
+        )
+        return label
+
+    def _build_param_boundary_marker(self, boundary_index):
+        _ = boundary_index
+        divider = QWidget()
+        divider.setFixedHeight(8)
+        divider.setStyleSheet("border-top: 1px solid #cbd5e1;")
+        return divider
+
+    def _build_top_breakpoint_controls_widget(self):
+        container = QWidget()
+        container.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Maximum)
+        container.setMinimumWidth(320)
+
+        outer = QVBoxLayout(container)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(2)
+
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+
+        min_label = self._new_label(
+            "Start",
+            object_name="paramInline",
+            width=56,
+            alignment=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+            style_sheet="color: #64748b;",
+        )
+        row.addWidget(min_label)
+
+        slider = MultiHandleSlider()
+        slider.valuesChanged.connect(self._on_breakpoint_values_changed)
+        slider.sliderPressed.connect(self._on_breakpoint_slider_pressed)
+        slider.sliderReleased.connect(self._on_breakpoint_slider_released)
+        row.addWidget(slider, 1)
+
+        max_label = self._new_label(
+            "End",
+            object_name="paramInline",
+            width=56,
+            alignment=Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+            style_sheet="color: #64748b;",
+        )
+        row.addWidget(max_label)
+        outer.addLayout(row)
+
+        self.breakpoint_controls = {
+            "slider": slider,
+            "container": container,
+        }
+        return container
+
+    def _current_segment_boundary_count(self):
+        model_def = getattr(self, "_piecewise_model", None)
+        if model_def is None:
+            return 0
+        return max(0, len(model_def.segment_exprs) - 1)
+
+    def _boundary_ratios_to_positions(self, ratios, n_boundaries):
+        return boundary_ratios_to_positions(ratios, n_boundaries)
+
+    def _boundary_positions_to_ratios(self, positions, n_boundaries):
+        n = int(max(0, n_boundaries))
+        if n <= 0:
+            return np.asarray([], dtype=float)
+        pos_arr = np.asarray(positions, dtype=float).reshape(-1)
+        if pos_arr.size != n:
+            return default_boundary_ratios(n)
+        pos_arr = np.clip(pos_arr, 0.0, 1.0)
+        pos_arr = np.maximum.accumulate(pos_arr)
+        ratios = np.empty(n, dtype=float)
+        prev = 0.0
+        for idx, position in enumerate(pos_arr):
+            denom = max(1.0 - prev, 1e-12)
+            ratios[idx] = float(np.clip((float(position) - prev) / denom, 0.0, 1.0))
+            prev = float(position)
+        return ratios
+
+    def _x_axis_range_for_boundary_controls(self):
+        if self.current_data is None:
+            return (0.0, 1.0)
+        try:
+            x_values = np.asarray(
+                self._get_channel_data(self.x_channel), dtype=float
+            ).reshape(-1)
+        except Exception:
+            return (0.0, 1.0)
+        finite = x_values[np.isfinite(x_values)]
+        if finite.size == 0:
+            return (0.0, 1.0)
+        x_min = float(np.min(finite))
+        x_max = float(np.max(finite))
+        if np.isclose(x_min, x_max):
+            x_max = x_min + 1.0
+        return (x_min, x_max)
+
+    def _format_compact_number(self, value):
+        numeric = float(value)
+        if not np.isfinite(numeric):
+            return "n/a"
+        magnitude = abs(numeric)
+        if magnitude >= 1e4 or (magnitude > 0.0 and magnitude < 1e-3):
+            return f"{numeric:.3e}"
+        return f"{numeric:.6g}"
+
+    def _sync_breakpoint_sliders_from_state(self):
+        n_boundaries = self._current_segment_boundary_count()
+        control = (
+            self.breakpoint_controls
+            if isinstance(self.breakpoint_controls, dict)
+            else {}
+        )
+        slider = control.get("slider")
+
+        if n_boundaries <= 0:
+            self.current_boundary_ratios = np.asarray([], dtype=float)
+            if slider is not None:
+                slider.blockSignals(True)
+                slider.set_values([])
+                slider.blockSignals(False)
+                slider.setEnabled(False)
+            return
+
+        ratios = np.asarray(
+            getattr(
+                self, "current_boundary_ratios", default_boundary_ratios(n_boundaries)
+            ),
+            dtype=float,
+        ).reshape(-1)
+        if ratios.size != n_boundaries:
+            ratios = default_boundary_ratios(n_boundaries)
+        ratios = np.clip(ratios, 0.0, 1.0)
+        self.current_boundary_ratios = ratios
+        positions = self._boundary_ratios_to_positions(ratios, n_boundaries)
+        x_min, x_max = self._x_axis_range_for_boundary_controls()
+        axis_label = self._channel_axis_label(self.x_channel)
+        if slider is not None:
+            slider.blockSignals(True)
+            slider.set_values(positions.tolist())
+            slider.set_labels(
+                [_format_boundary_display_name(idx) for idx in range(n_boundaries)]
+            )
+            slider.blockSignals(False)
+            slider.setEnabled(True)
+            slider.setToolTip(f"Boundary positions X₀, X₁, ... on {axis_label}.")
+        if hasattr(self, "formula_label") and not getattr(
+            self, "_expression_edit_mode", False
+        ):
+            self._set_formula_label()
+
+    def _on_breakpoint_values_changed(self, positions):
+        n_boundaries = self._current_segment_boundary_count()
+        if n_boundaries <= 0:
+            return
+
+        pos_arr = np.asarray(positions, dtype=float).reshape(-1)
+        if pos_arr.size != n_boundaries:
+            pos_arr = self._boundary_ratios_to_positions(
+                getattr(
+                    self,
+                    "current_boundary_ratios",
+                    default_boundary_ratios(n_boundaries),
+                ),
+                n_boundaries,
+            )
+        pos_arr = np.clip(pos_arr, 0.0, 1.0)
+        pos_arr = np.maximum.accumulate(pos_arr)
+        self.current_boundary_ratios = self._boundary_positions_to_ratios(
+            pos_arr, n_boundaries
+        )
+        self._sync_breakpoint_sliders_from_state()
+        self.update_plot(fast=True)
+
+    def _on_breakpoint_slider_pressed(self):
+        self.slider_active = True
+
+    def _on_breakpoint_slider_released(self):
+        self.slider_active = False
+        self.do_full_update()
+
     def _create_param_label(self, spec, width):
         """Create a one-line parameter label."""
         symbol_text = self._display_symbol_for_param(spec.key, spec.symbol)
+        symbol_html = self._display_symbol_for_param_html(spec.key, spec.symbol)
         tooltip = str(spec.description)
         if symbol_text != spec.key:
             tooltip = f"{tooltip} ({spec.key})"
-        return self._new_label(
-            f"{symbol_text}:",
+        label = self._new_label(
+            f"{symbol_html}:",
             object_name="paramInline",
             tooltip=tooltip,
             width=width,
             alignment=Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
         )
+        label.setTextFormat(Qt.TextFormat.RichText)
+        return label
 
     def _ordered_param_keys(self):
         return [spec.key for spec in self.param_specs]
+
+    def _channel_display_name(self, channel_name):
+        key = str(channel_name)
+        alias = str(self.channels.get(key, "")).strip()
+        return alias if alias else key
+
+    def _channel_unit(self, channel_name):
+        key = str(channel_name)
+        unit = str(getattr(self, "channel_units", {}).get(key, "")).strip()
+        return unit
+
+    def _channel_axis_label(self, channel_name):
+        base = self._channel_display_name(channel_name)
+        unit = self._channel_unit(channel_name)
+        return f"{base} [{unit}]" if unit else base
+
+    def _channel_legend_label(self, channel_name):
+        key = str(channel_name)
+        base = self._channel_display_name(key)
+        if base and base != key:
+            text = f"{key} ({base})"
+        else:
+            text = key
+        unit = self._channel_unit(key)
+        return f"{text} [{unit}]" if unit else text
 
     def get_current_param_map(self):
         values = {}
@@ -3091,6 +4606,300 @@ class ManualFitGUI(QMainWindow):
             else:
                 values[spec.key] = 0.0
         return values
+
+    def _available_capture_keys(self):
+        keys = []
+        config = self._resolve_batch_capture_config(show_errors=False)
+        if config is not None and config.regex is not None:
+            for key in config.regex.groupindex.keys():
+                text = str(key).strip()
+                if text and text not in keys:
+                    keys.append(text)
+        return keys
+
+    def _capture_preview_values(self):
+        config = self._resolve_batch_capture_config(show_errors=False)
+        if config is None or config.regex is None:
+            return {}
+
+        file_path = self._current_loaded_file_path()
+        if not file_path:
+            candidates = list(getattr(self, "batch_files", []) or [])
+            if not candidates:
+                candidates = list(getattr(self, "data_files", []) or [])
+            file_path = candidates[0] if candidates else None
+        if not file_path:
+            return {}
+
+        extracted = extract_captures(
+            stem_for_file_ref(file_path),
+            config.regex,
+            config.defaults,
+        )
+        if extracted is None:
+            return {}
+        return {str(key): str(value) for key, value in dict(extracted).items()}
+
+    def _on_param_capture_mapping_changed(self, capture_key, _index):
+        combo = self.param_capture_combos.get(capture_key)
+        if combo is None:
+            return
+        selected = combo.currentData()
+        self.param_capture_map[str(capture_key)] = (
+            str(selected) if selected not in (None, "") else None
+        )
+        self._sync_param_slider_lock_state()
+        self._autosave_fit_details()
+
+    def _locked_param_keys_from_capture_mapping(self):
+        mapping = self._current_param_capture_map()
+        locked = set()
+        for key, capture_key in mapping.items():
+            if capture_key not in (None, ""):
+                locked.add(str(key))
+        return locked
+
+    def _parsed_numeric_param_values_from_mapping(self):
+        preview_values = self._capture_preview_values()
+        mapping = self._current_param_capture_map()
+        out: Dict[str, float] = {}
+        for param_key, capture_key in mapping.items():
+            if capture_key in (None, ""):
+                continue
+            raw_value = preview_values.get(str(capture_key))
+            text = str(raw_value).strip() if raw_value is not None else ""
+            if not text:
+                continue
+            try:
+                numeric = float(text)
+            except Exception:
+                continue
+            if not np.isfinite(numeric):
+                continue
+            out[str(param_key)] = float(numeric)
+        return out
+
+    def _sync_param_slider_lock_state(self):
+        param_capture_map = self._current_param_capture_map()
+        mapped_values = self._parsed_numeric_param_values_from_mapping()
+        any_value_changed = False
+        for key, slider in self.param_sliders.items():
+            if slider is None:
+                continue
+            capture_key = param_capture_map.get(str(key))
+            is_locked = capture_key not in (None, "")
+            min_box = self.param_min_spinboxes.get(key)
+            max_box = self.param_max_spinboxes.get(key)
+            value_box = self.param_spinboxes.get(key)
+            lock_status_label = self.param_lock_status_labels.get(key)
+            tail_spacer = self.param_tail_spacers_by_key.get(key)
+
+            for widget in (slider, min_box, max_box, value_box, tail_spacer):
+                if widget is None:
+                    continue
+                widget.setVisible(not is_locked)
+                widget.setEnabled(not is_locked)
+
+            if is_locked and str(key) in mapped_values and value_box is not None:
+                locked_value = float(mapped_values[str(key)])
+                if min_box is not None and locked_value < float(min_box.value()):
+                    min_box.setValue(locked_value)
+                if max_box is not None and locked_value > float(max_box.value()):
+                    max_box.setValue(locked_value)
+                if not np.isclose(float(value_box.value()), locked_value):
+                    value_box.blockSignals(True)
+                    value_box.setValue(locked_value)
+                    value_box.blockSignals(False)
+                    any_value_changed = True
+            if is_locked:
+                if lock_status_label is not None:
+                    lock_status_label.setText(f'Bound to field "{capture_key}"')
+                    lock_status_label.setToolTip(
+                        f'Parameter is fixed from filename field "{capture_key}".'
+                    )
+                    lock_status_label.show()
+            else:
+                slider.setToolTip("Sweep value across active bounds")
+                if lock_status_label is not None:
+                    lock_status_label.hide()
+                if value_box is not None:
+                    value_box.setToolTip("Current value")
+                if min_box is not None:
+                    min_box.setToolTip("Lower bound")
+                if max_box is not None:
+                    max_box.setToolTip("Upper bound")
+        if any_value_changed:
+            self.update_plot(fast=False)
+
+    def _parameter_display_items(self):
+        items = []
+        seen = {}
+        for param_key in self._ordered_param_keys():
+            symbol_token = str(self._display_name_for_param_key(param_key)).strip()
+            if not symbol_token:
+                symbol_token = str(param_key)
+            count = int(seen.get(symbol_token, 0)) + 1
+            seen[symbol_token] = count
+            plain_label = symbol_token if count == 1 else f"{symbol_token} {count}"
+            rich_base = parameter_symbol_to_html(symbol_token) or html.escape(
+                symbol_token
+            )
+            rich_label = (
+                rich_base
+                if count == 1
+                else f"{rich_base} <span style='color:#64748b;'>{count}</span>"
+            )
+            items.append(
+                {
+                    "plain": plain_label,
+                    "html": rich_label,
+                    "key": str(param_key),
+                }
+            )
+        return items
+
+    def _refresh_param_capture_mapping_controls(self):
+        if not hasattr(self, "capture_mapping_layout"):
+            return
+        clear_layout(self.capture_mapping_layout)
+        self.param_capture_combos = {}
+
+        capture_keys = self._available_capture_keys()
+        param_keys = self._ordered_param_keys()
+        parameter_items = self._parameter_display_items()
+        next_map = {}
+        if not capture_keys:
+            self.capture_mapping_layout.addWidget(
+                self._new_label(
+                    "No named fields in Pattern.",
+                    object_name="statusLabel",
+                    style_sheet="color: #64748b; font-style: italic;",
+                ),
+                0,
+                0,
+                1,
+                2,
+            )
+            self.param_capture_map = {}
+            self._sync_param_slider_lock_state()
+            return
+
+        self.capture_mapping_layout.addWidget(
+            self._new_label(
+                "Field",
+                object_name="statusLabel",
+                style_sheet="font-weight: 700; color: #334155;",
+            ),
+            0,
+            0,
+        )
+        self.capture_mapping_layout.addWidget(
+            self._new_label(
+                "Parameter",
+                object_name="statusLabel",
+                style_sheet="font-weight: 700; color: #334155;",
+            ),
+            0,
+            1,
+        )
+        self.capture_mapping_layout.addWidget(
+            self._new_label(
+                "Value",
+                object_name="statusLabel",
+                style_sheet="font-weight: 700; color: #334155;",
+            ),
+            0,
+            2,
+        )
+
+        preview_values = self._capture_preview_values()
+
+        for row_idx, capture_key in enumerate(capture_keys, start=1):
+            mapped = self.param_capture_map.get(capture_key)
+            if mapped not in param_keys:
+                mapped = None
+            next_map[capture_key] = mapped
+
+            label = self._new_label(
+                str(capture_key),
+                object_name="paramInline",
+                tooltip=f"Filename field '{capture_key}'",
+                alignment=Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+            )
+            combo = self._new_combobox(minimum_width=150, rich_text=True)
+            if isinstance(combo, RichTextComboBox):
+                combo.add_rich_item("Unbound", None, "Unbound")
+                for item in parameter_items:
+                    combo.add_rich_item(item["plain"], item["key"], item["html"])
+            else:
+                combo.addItem("Unbound", None)
+                for item in parameter_items:
+                    combo.addItem(str(item["plain"]), item["key"])
+            target_idx = combo.findData(mapped)
+            if target_idx < 0:
+                target_idx = 0
+            combo.setCurrentIndex(target_idx)
+            combo.currentIndexChanged.connect(
+                lambda index, key=capture_key: self._on_param_capture_mapping_changed(
+                    key, index
+                )
+            )
+            value_text = str(preview_values.get(str(capture_key), "")).strip()
+            value_label = self._new_label(
+                value_text if value_text else "—",
+                object_name="paramInline",
+                tooltip=(
+                    f"Parsed value for '{capture_key}' from current file."
+                    if value_text
+                    else f"No parsed value available for '{capture_key}'."
+                ),
+                alignment=Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                style_sheet="color: #475569;",
+            )
+            self.capture_mapping_layout.addWidget(label, row_idx, 0)
+            self.capture_mapping_layout.addWidget(combo, row_idx, 1)
+            self.capture_mapping_layout.addWidget(value_label, row_idx, 2)
+            self.param_capture_combos[capture_key] = combo
+
+        self.param_capture_map = next_map
+        self._sync_param_slider_lock_state()
+
+    def _current_param_capture_map(self):
+        mapping = {key: None for key in self._ordered_param_keys()}
+        for capture_key, param_key in self.param_capture_map.items():
+            target = str(param_key) if param_key not in (None, "") else None
+            if target in mapping:
+                mapping[target] = str(capture_key)
+        return mapping
+
+    def _current_file_fixed_params_from_mapping(
+        self,
+    ) -> Tuple[Optional[Dict[str, float]], Optional[str]]:
+        parameter_capture_map = self._current_param_capture_map()
+        if not any(value not in (None, "") for value in parameter_capture_map.values()):
+            return {}, None
+
+        capture_config = self._resolve_batch_capture_config(show_errors=True)
+        if capture_config is None:
+            return None, "Capture pattern is invalid."
+        if capture_config.regex is None:
+            return (
+                None,
+                "Pattern is required when field-to-parameter mappings are used.",
+            )
+
+        file_path = self._current_loaded_file_path()
+        if not file_path:
+            return None, "No current file loaded for field-to-parameter mapping."
+
+        extracted = extract_captures(
+            stem_for_file_ref(file_path),
+            capture_config.regex,
+            capture_config.defaults,
+        )
+        if extracted is None:
+            return None, _BATCH_PATTERN_MISMATCH_ERROR
+        return resolve_fixed_params_from_captures(parameter_capture_map, extracted)
 
     def _available_channel_names(self):
         names = []
@@ -3229,79 +5038,178 @@ class ManualFitGUI(QMainWindow):
         self._sync_slider_from_spinbox(key)
         self.update_plot(fast=False)
 
-    def _build_fit_context(self, channel_data=None):
-        ordered_keys = self._ordered_param_keys()
+    def _build_fit_context(
+        self,
+        seed_overrides=None,
+        fixed_params=None,
+        fit_mode: Optional[str] = None,
+    ):
+        model_def = self._piecewise_model
+        if model_def is None:
+            raise ValueError("No compiled piecewise model is available.")
+        ordered_keys = list(model_def.global_param_names)
         if not ordered_keys:
             raise ValueError("No parameters are available for fitting.")
-
-        current_values = self.get_current_param_map()
-        lower, upper = self._parameter_bounds()
-        bounds_by_key = {
-            key: (float(lower[idx]), float(upper[idx]))
-            for idx, key in enumerate(ordered_keys)
+        fixed_map = {
+            str(key): float(value)
+            for key, value in dict(fixed_params or {}).items()
+            if str(key).strip()
         }
 
-        active_keys = self.get_fit_parameter_keys()
+        current_values = self.get_current_param_map()
+        spec_by_key = {spec.key: spec for spec in self.param_specs}
+        bounds_by_key = {}
+        seed_map = {}
+        missing_keys = []
+        for key in ordered_keys:
+            min_box = self.param_min_spinboxes.get(key)
+            max_box = self.param_max_spinboxes.get(key)
+            if min_box is not None and max_box is not None:
+                low = float(min_box.value())
+                high = float(max_box.value())
+            else:
+                spec = spec_by_key.get(key)
+                if spec is None:
+                    missing_keys.append(key)
+                    continue
+                low = float(spec.min_value)
+                high = float(spec.max_value)
+            if low > high:
+                low, high = high, low
+            bounds_by_key[key] = (low, high)
 
-        p0 = []
-        lower_active = []
-        upper_active = []
-        for key in active_keys:
+            if key in current_values:
+                seed = float(current_values[key])
+            else:
+                spec = spec_by_key.get(key)
+                if spec is None:
+                    missing_keys.append(key)
+                    continue
+                seed = float(spec.default)
+            seed_map[key] = float(np.clip(seed, low, high))
+        if missing_keys:
+            missing_text = ", ".join(dict.fromkeys(missing_keys))
+            raise ValueError(
+                f"Model/UI parameter mismatch. Missing controls for: {missing_text}"
+            )
+        for key, value in fixed_map.items():
+            if key in seed_map:
+                seed_map[key] = float(value)
+        if seed_overrides:
+            for key, value in seed_overrides.items():
+                if key not in seed_map or key in fixed_map:
+                    continue
+                low, high = bounds_by_key[key]
+                seed_map[key] = float(
+                    np.clip(float(value), min(low, high), max(low, high))
+                )
+
+        for key in ordered_keys:
+            if key in fixed_map:
+                continue
             low, high = bounds_by_key[key]
             if np.isclose(low, high):
                 raise ValueError(
                     f"Bounds for '{key}' are equal; expand them before fitting."
                 )
-            start = float(np.clip(current_values[key], low, high))
-            p0.append(start)
-            lower_active.append(low)
-            upper_active.append(high)
 
-        evaluator = self._compiled_expression
-        if evaluator is None:
-            raise ValueError("No compiled model expression is available.")
-        baseline = dict(current_values)
-        channels = channel_data or {}
-
-        def fit_model(x_data, *fit_params):
-            values = dict(baseline)
-            for idx, key in enumerate(active_keys):
-                values[key] = float(fit_params[idx])
-            return evaluator(
-                x_data,
-                values,
-                column_data=channels,
-            )
+        n_boundaries = max(0, len(model_def.segment_exprs) - 1)
+        boundary_seed = np.asarray(
+            getattr(
+                self,
+                "current_boundary_ratios",
+                default_boundary_ratios(n_boundaries),
+            ),
+            dtype=float,
+        )
+        if boundary_seed.size != n_boundaries:
+            boundary_seed = default_boundary_ratios(n_boundaries)
 
         return {
             "ordered_keys": ordered_keys,
-            "active_keys": active_keys,
-            "base_values": baseline,
-            "p0": np.asarray(p0, dtype=float),
-            "bounds": (lower_active, upper_active),
-            "fit_model": fit_model,
+            "seed_map": seed_map,
+            "bounds_map": bounds_by_key,
+            "model_def": model_def,
+            "boundary_seed": boundary_seed,
+            "fixed_params": fixed_map,
+            "fit_mode": normalize_fit_mode(fit_mode),
         }
 
-    def _merge_active_fit_result(
-        self, ordered_keys, active_keys, base_values, fitted_active_values
+    def evaluate_model_map(
+        self,
+        x_data,
+        param_values,
+        channel_data=None,
+        boundary_ratios=None,
     ):
-        merged = dict(base_values)
-        for idx, key in enumerate(active_keys):
-            if idx < len(fitted_active_values):
-                merged[key] = float(fitted_active_values[idx])
-        return [float(merged[key]) for key in ordered_keys]
-
-    def evaluate_model_map(self, x_data, param_values, channel_data=None):
-        if self._compiled_expression is None:
-            raise ValueError("No compiled function expression is available.")
-        return self._compiled_expression(
-            x_data,
-            param_values,
-            column_data=channel_data,
+        _ = channel_data
+        model_def = self._piecewise_model
+        if model_def is None:
+            raise ValueError("No compiled piecewise model is available.")
+        bounds_map = {
+            spec.key: (
+                float(self.param_min_spinboxes[spec.key].value())
+                if spec.key in self.param_min_spinboxes
+                else float(spec.min_value),
+                float(self.param_max_spinboxes[spec.key].value())
+                if spec.key in self.param_max_spinboxes
+                else float(spec.max_value),
+            )
+            for spec in self.param_specs
+        }
+        missing_bounds = [
+            key for key in model_def.global_param_names if key not in bounds_map
+        ]
+        if missing_bounds:
+            missing_text = ", ".join(missing_bounds)
+            raise ValueError(
+                f"Model/UI parameter mismatch. Missing bounds for: {missing_text}"
+            )
+        seed_map = {}
+        missing_keys = []
+        current_values = self.get_current_param_map()
+        for key in model_def.global_param_names:
+            if key in param_values:
+                seed_map[key] = float(param_values[key])
+                continue
+            if key in current_values:
+                seed_map[key] = float(current_values[key])
+                continue
+            missing_keys.append(key)
+        if missing_keys:
+            missing_text = ", ".join(missing_keys)
+            raise ValueError(
+                f"Model/UI parameter mismatch. Missing parameter values: {missing_text}"
+            )
+        segments = _make_segment_specs(model_def, seed_map, bounds_map)
+        shared = np.asarray(
+            [seed_map[key] for key in model_def.global_param_names], dtype=float
         )
+        n_boundaries = max(0, len(segments) - 1)
+        if boundary_ratios is None:
+            b = np.asarray(
+                getattr(
+                    self,
+                    "current_boundary_ratios",
+                    default_boundary_ratios(n_boundaries),
+                ),
+                dtype=float,
+            )
+        else:
+            b = np.asarray(boundary_ratios, dtype=float)
+        if b.size != n_boundaries:
+            b = default_boundary_ratios(n_boundaries)
+        local_flat = _shared_to_local_flat(model_def, shared, np.clip(b, 0.0, 1.0))
+        pred = predict_ordered_piecewise(
+            np.asarray(x_data, dtype=float).reshape(-1),
+            segments,
+            local_flat,
+            prefer_jit=True,
+        )
+        return np.asarray(pred["y_hat"], dtype=float)
 
-    def evaluate_model(self, x_data, params, channel_data=None):
-        """Evaluate active fit model from either ordered list or key-value map."""
+    def evaluate_model(self, x_data, params, channel_data=None, boundary_ratios=None):
+        """Evaluate active piecewise model from ordered list or key-value map."""
         ordered_keys = self._ordered_param_keys()
         if isinstance(params, dict):
             values = {key: float(params[key]) for key in ordered_keys if key in params}
@@ -3312,8 +5220,8 @@ class ManualFitGUI(QMainWindow):
                 x_data,
                 values,
                 channel_data=channel_data,
+                boundary_ratios=boundary_ratios,
             )
-
         if len(params) != len(ordered_keys):
             raise ValueError(
                 f"Expected {len(ordered_keys)} parameters, got {len(params)}."
@@ -3323,40 +5231,195 @@ class ManualFitGUI(QMainWindow):
             x_data,
             values,
             channel_data=channel_data,
+            boundary_ratios=boundary_ratios,
         )
 
     def _snapshot_full_model_function(self):
         ordered_keys = list(self._ordered_param_keys())
-        evaluator = self._compiled_expression
-        if evaluator is None:
-            raise ValueError("No compiled function expression is available.")
 
-        def model_func(x_data, *params, column_data=None):
+        def model_func(x_data, *params, column_data=None, boundary_ratios=None):
             if len(params) != len(ordered_keys):
                 raise ValueError(
                     f"Expected {len(ordered_keys)} parameters, got {len(params)}."
                 )
             values = {key: float(params[idx]) for idx, key in enumerate(ordered_keys)}
-            return evaluator(
+            return self.evaluate_model_map(
                 x_data,
                 values,
-                column_data=column_data,
+                channel_data=column_data,
+                boundary_ratios=boundary_ratios,
             )
 
         return model_func
+
+    def _breakpoint_value_map(self, n_boundaries):
+        n = int(max(0, n_boundaries))
+        if n <= 0:
+            return {}
+        ratios = np.asarray(
+            getattr(self, "current_boundary_ratios", default_boundary_ratios(n)),
+            dtype=float,
+        ).reshape(-1)
+        if ratios.size != n:
+            ratios = default_boundary_ratios(n)
+        ratios = np.clip(ratios, 0.0, 1.0)
+        positions = self._boundary_ratios_to_positions(ratios, n)
+        x_min, x_max = self._x_axis_range_for_boundary_controls()
+        span = float(x_max - x_min)
+        values = x_min + span * positions
+        return {f"break{idx + 1}": float(val) for idx, val in enumerate(values)}
+
+    def _piecewise_boundary_conditions(self, segment_count, include_break_values=False):
+        n_segments = int(max(0, segment_count))
+        if n_segments <= 0:
+            return []
+        if n_segments == 1:
+            return ["all x"]
+        n_boundaries = max(0, n_segments - 1)
+        value_map = (
+            self._breakpoint_value_map(n_boundaries) if include_break_values else {}
+        )
+
+        def break_display_name(name):
+            text = str(name)
+            match = re.fullmatch(r"break(\d+)", text)
+            if match is None:
+                return text
+            try:
+                index = int(match.group(1)) - 1
+            except Exception:
+                index = 0
+            return _format_boundary_display_name(max(0, index))
+
+        def break_token(name):
+            display_name = break_display_name(name)
+            if name not in value_map:
+                return display_name
+            return f"{display_name} ({self._format_compact_number(value_map[name])})"
+
+        conditions = []
+        for seg_idx in range(1, n_segments + 1):
+            if seg_idx == 1:
+                conditions.append(f"x < {break_token('break1')}")
+            elif seg_idx == n_segments:
+                last_break = f"break{n_boundaries}"
+                conditions.append(f"x >= {break_token(last_break)}")
+            else:
+                left_break = f"break{seg_idx - 1}"
+                right_break = f"break{seg_idx}"
+                conditions.append(
+                    f"{break_token(left_break)} <= x < {break_token(right_break)}"
+                )
+        return conditions
+
+    def _piecewise_left_brace_rows(self, row_count):
+        rows = int(max(1, row_count))
+        if rows == 1:
+            return ["{"]
+        if rows == 2:
+            return ["⎧", "⎩"]
+        mid_idx = rows // 2
+        out = []
+        for idx in range(rows):
+            if idx == 0:
+                out.append("⎧")
+            elif idx == rows - 1:
+                out.append("⎩")
+            elif idx == mid_idx:
+                out.append("⎨")
+            else:
+                out.append("⎪")
+        return out
+
+    def _build_piecewise_formula_html(self, target_col, segment_exprs):
+        symbol_map = self._parameter_symbol_map()
+        conditions = self._piecewise_boundary_conditions(len(segment_exprs))
+        brace_rows = self._piecewise_left_brace_rows(len(segment_exprs))
+        brace_cell_style = (
+            "padding:0 4px 1px 2px; font-family:serif; font-size:18px; "
+            "font-weight:700; line-height:1.0; color:#111827;"
+        )
+        pipe_cell_style = (
+            "padding:0 4px 1px 8px; font-family:serif; font-size:18px; "
+            "font-weight:700; line-height:1.0; color:#111827;"
+        )
+        rows = []
+        brace_cells = []
+        for expr_text, cond_text in zip(segment_exprs, conditions):
+            pretty_expr = format_expression_pretty(expr_text, name_map=symbol_map)
+            colored_expr = self._colorize_formula_text_html(
+                pretty_expr,
+                target_col=target_col,
+                rhs_expression=expr_text,
+            )
+            rows.append(
+                "<tr>"
+                f"<td style='padding:0 0 1px 0;'>{colored_expr}</td>"
+                f"<td style='{pipe_cell_style}'>|</td>"
+                f"<td style='padding:0 0 1px 0; color:#334155;'>{html.escape(str(cond_text))}</td>"
+                "</tr>"
+            )
+        for brace_char in brace_rows:
+            brace_cells.append(
+                "<tr>"
+                f"<td style='{brace_cell_style}'>{html.escape(str(brace_char))}</td>"
+                "</tr>"
+            )
+        rows_html = "".join(rows)
+        brace_html = "".join(brace_cells)
+        return (
+            "<table style='margin:0 auto; border-collapse:collapse;'>"
+            "<tr>"
+            f"<td style='font-family:serif; font-size:15px; color:#111827; white-space:nowrap; vertical-align:middle; padding:0 2px 0 0;'>{html.escape(str(target_col))}(x) =</td>"
+            "<td style='vertical-align:middle;'>"
+            "<table style='border-collapse:collapse;'>"
+            f"{brace_html}"
+            "</table>"
+            "</td>"
+            "<td style='vertical-align:middle;'>"
+            "<table style='border-collapse:collapse;'>"
+            f"{rows_html}"
+            "</table>"
+            "</td>"
+            "</tr>"
+            "</table>"
+        )
 
     def _set_formula_label(self):
         """Populate the formula label from the active expression."""
         target_col = None
         rhs_expression = None
+        segment_exprs = None
         try:
-            target_col, rhs_expression, _rhs_columns = self._parse_equation_text(
+            target_col, seg_exprs = self._parse_equation_text(
                 self.current_expression,
                 strict=False,
             )
+            segment_exprs = list(seg_exprs)
+            rhs_expression = " ; ".join(seg_exprs)
         except Exception:
             target_col = None
             rhs_expression = None
+
+        self.formula_label.setTextFormat(Qt.TextFormat.RichText)
+        if target_col is not None and segment_exprs is not None:
+            self.formula_label.setText(
+                self._build_piecewise_formula_html(target_col, segment_exprs)
+            )
+            boundary_help = "\n".join(
+                f"Segment {idx}: {cond}"
+                for idx, cond in enumerate(
+                    self._piecewise_boundary_conditions(len(segment_exprs)),
+                    start=1,
+                )
+            )
+            display_text = f"{target_col} = {' ; '.join(segment_exprs)}"
+            self.formula_label.setToolTip(
+                f"Python: {self.current_expression}\nDisplay: {display_text}\n\n"
+                f"{boundary_help}\n\n"
+                "Click equation to edit."
+            )
+            return
 
         pretty_equation = format_equation_pretty(
             self.current_expression,
@@ -3368,7 +5431,6 @@ class ManualFitGUI(QMainWindow):
             target_col=target_col,
             rhs_expression=rhs_expression,
         )
-        self.formula_label.setTextFormat(Qt.TextFormat.RichText)
         self.formula_label.setText(
             '<span style="font-family:serif; font-size:15px; '
             'white-space: normal;">'
@@ -3390,12 +5452,13 @@ class ManualFitGUI(QMainWindow):
         param_tokens = set()
         if rhs_expression:
             try:
-                param_names = extract_expression_parameter_names(
-                    rhs_expression,
-                    reserved_names=self._expression_reserved_names(),
+                _target, seg_exprs = self._parse_equation_text(
+                    f"{target_col or self.y_channel} = {rhs_expression}",
+                    strict=True,
                 )
-                for name in param_names:
-                    param_tokens.add(str(symbol_map.get(name, name)))
+                for seg_expr in seg_exprs:
+                    for name in extract_segment_parameter_names(seg_expr):
+                        param_tokens.add(str(symbol_map.get(name, name)))
             except Exception:
                 param_tokens = set()
 
@@ -3403,7 +5466,7 @@ class ManualFitGUI(QMainWindow):
         if target_col:
             column_tokens.add(str(target_col))
         column_tokens_upper = {token.upper() for token in column_tokens}
-        constant_tokens = {"π", "e", "pi"}
+        constant_tokens = {"e", "pi"}
 
         token_set = set(column_tokens) | set(param_tokens) | set(constant_tokens)
         special_tokens = sorted(
@@ -3417,8 +5480,9 @@ class ManualFitGUI(QMainWindow):
         )
 
         number_token_re = r"(?<![A-Za-z_])(?:\d+\.\d*|\d*\.?\d+)(?:[eE][-+]?\d+)?"
-        token_parts = [number_token_re, r"[A-Za-z_][A-Za-z0-9_]*"]
+        token_parts = [number_token_re]
         token_parts.extend(re.escape(token) for token in special_tokens)
+        token_parts.append(r"[A-Za-z_][A-Za-z0-9_]*")
         token_re = re.compile("|".join(token_parts))
         number_re = re.compile(rf"^{number_token_re}$")
 
@@ -3430,23 +5494,30 @@ class ManualFitGUI(QMainWindow):
             if start > cursor:
                 parts.append(html.escape(text[cursor:start]))
             token = match.group(0)
-            escaped = html.escape(token)
+            rendered = html.escape(token)
             style = None
             if token.upper() in column_tokens_upper:
                 style = f"color:{_EXPRESSION_COLUMN_COLOR}; font-weight:600;"
             elif token in param_tokens:
                 style = f"color:{_EXPRESSION_PARAM_COLOR}; font-weight:600;"
+                rendered = parameter_symbol_to_html(token)
             elif token in constant_tokens or number_re.fullmatch(token):
                 style = f"color:{_EXPRESSION_CONSTANT_COLOR};"
             if style:
-                parts.append(f'<span style="{style}">{escaped}</span>')
+                parts.append(f'<span style="{style}">{rendered}</span>')
             else:
-                parts.append(escaped)
+                parts.append(rendered)
             cursor = end
 
         if cursor < len(text):
             parts.append(html.escape(text[cursor:]))
-        return "".join(parts)
+        rendered = "".join(parts)
+        rendered = re.sub(
+            r"\^(-?\d+)",
+            lambda m: f"<sup>{html.escape(m.group(1))}</sup>",
+            rendered,
+        )
+        return rendered
 
     def _is_expression_editor_child(self, widget):
         if widget is None or not hasattr(self, "expression_editor_widget"):
@@ -3519,11 +5590,6 @@ class ManualFitGUI(QMainWindow):
         self.ax_residual = None
         self.canvas = FigureCanvas(self.fig)
         self.fig.subplots_adjust(left=0.08, right=0.98, top=0.95, bottom=0.16)
-        if self._plot_mouse_cid is None:
-            self._plot_mouse_cid = self.canvas.mpl_connect(
-                "button_press_event",
-                self.on_plot_mouse_press,
-            )
 
         # Add matplotlib navigation toolbar
         self.toolbar = NavigationToolbar(self.canvas, self)
@@ -3531,7 +5597,6 @@ class ManualFitGUI(QMainWindow):
         self.toolbar.setMaximumHeight(28)
         layout.addWidget(self.toolbar)
         layout.addWidget(self.canvas)
-        self._recreate_fit_region_selector()
 
         group.setLayout(layout)
         parent_layout.addWidget(group)
@@ -3543,10 +5608,14 @@ class ManualFitGUI(QMainWindow):
         layout.setContentsMargins(5, 5, 5, 5)
         layout.setSpacing(4)
 
-        top_controls_layout = QHBoxLayout()
-        top_controls_layout.setSpacing(6)
+        top_controls_layout = QVBoxLayout()
+        top_controls_layout.setSpacing(4)
 
         equation_host = QWidget()
+        equation_host.setMaximumWidth(760)
+        equation_host.setSizePolicy(
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum
+        )
         equation_host_layout = QVBoxLayout(equation_host)
         equation_host_layout.setContentsMargins(0, 0, 0, 0)
         equation_host_layout.setSpacing(0)
@@ -3554,8 +5623,8 @@ class ManualFitGUI(QMainWindow):
         equation_slot_layout.setContentsMargins(0, 0, 0, 0)
         equation_slot_layout.setSpacing(0)
         self.formula_label = ClickableLabel(self.current_expression)
-        self.formula_label.setMinimumHeight(24)
-        self.formula_label.setMaximumHeight(56)
+        self.formula_label.setMinimumHeight(40)
+        self.formula_label.setMaximumHeight(10000)
         self.formula_label.setWordWrap(True)
         self.formula_label.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum
@@ -3566,8 +5635,9 @@ class ManualFitGUI(QMainWindow):
 
         self.expression_editor_widget = QWidget()
         self.expression_editor_widget.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum
         )
+        self.expression_editor_widget.setMaximumWidth(760)
         self.expression_editor_widget.setMinimumHeight(
             self.formula_label.minimumHeight()
         )
@@ -3584,17 +5654,24 @@ class ManualFitGUI(QMainWindow):
         self.function_input = VerticallyCenteredTextEdit()
         self.function_input.setAcceptRichText(False)
         self.function_input.setPlaceholderText(
-            "Example: CH2 = offset + amp*sin(2*pi*freq*CH3 + phase)"
+            "Example: CH2 = seg1 ; seg2 ; ... ; segN"
         )
         self.function_input.setPlainText(self.current_expression)
         self.function_input.setMinimumHeight(self.formula_label.minimumHeight())
         self.function_input.setMaximumHeight(self.formula_label.maximumHeight())
+        self.function_input.setMaximumWidth(760)
         self.function_input.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding
+        )
+        self.function_input.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+        self.function_input.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
         self.function_input.setStyleSheet("padding: 1px 4px;")
         self.function_input.document().setDocumentMargin(1)
-        self.function_input.setToolTip("Equation format: target_column = expression")
+        self.function_input.setToolTip(
+            "Equation format: TARGET = seg1 ; seg2 ; ... ; segN (semicolon-separated)"
+        )
         self.function_input.textChanged.connect(self._on_expression_text_changed)
         self.function_input.focus_left.connect(self._on_expression_input_focus_left)
         self.function_input.apply_requested.connect(
@@ -3639,7 +5716,17 @@ class ManualFitGUI(QMainWindow):
         editor_layout.addWidget(self.function_status_label)
         equation_slot_layout.addWidget(self.expression_editor_widget, 0, 0)
         equation_host_layout.addLayout(equation_slot_layout)
-        top_controls_layout.addWidget(equation_host, 5)
+        top_equation_row = QHBoxLayout()
+        top_equation_row.setContentsMargins(0, 0, 0, 0)
+        top_equation_row.setSpacing(10)
+        top_equation_row.addWidget(equation_host, 1)
+        self.breakpoint_top_widget = self._build_top_breakpoint_controls_widget()
+        top_equation_row.addWidget(
+            self.breakpoint_top_widget,
+            0,
+            Qt.AlignmentFlag.AlignVCenter,
+        )
+        top_controls_layout.addLayout(top_equation_row)
 
         source_file_widget = QWidget()
         source_file_layout = QVBoxLayout(source_file_widget)
@@ -3674,210 +5761,49 @@ class ManualFitGUI(QMainWindow):
         file_layout.addWidget(self.next_file_btn)
         self._sync_file_navigation_buttons()
         source_file_layout.addLayout(file_layout)
-        top_controls_layout.addWidget(source_file_widget, 3)
 
-        fit_opts = (
-            self.fit_options
-            if isinstance(self.fit_options, FitOptimizationOptions)
-            else FitOptimizationOptions()
+        channel_layout = QHBoxLayout()
+        channel_layout.setSpacing(4)
+        channel_layout.addWidget(self._make_param_header_label("X", width=20))
+        self.x_channel_combo = self._new_combobox(
+            current_index_changed=self._on_x_channel_changed
         )
+        channel_layout.addWidget(self.x_channel_combo, 1)
+        channel_layout.addWidget(self._make_param_header_label("Y", width=20))
+        self.y_channel_combo = self._new_combobox(
+            current_index_changed=self._on_y_channel_changed
+        )
+        channel_layout.addWidget(self.y_channel_combo, 1)
+        source_file_layout.addLayout(channel_layout)
+
         fit_widget = QWidget()
         fit_widget_layout = QVBoxLayout(fit_widget)
         fit_widget_layout.setContentsMargins(0, 0, 0, 0)
-        fit_widget_layout.setSpacing(2)
-        fit_options_layout = QGridLayout()
-        fit_options_layout.setHorizontalSpacing(6)
-        fit_options_layout.setVerticalSpacing(2)
+        fit_widget_layout.setSpacing(4)
 
-        fit_enabled_tooltip = "Enable deterministic multi-start fitting."
-        self.fit_enabled_label = self._new_label("Robust")
-        self.fit_enabled_label.setToolTip(fit_enabled_tooltip)
-        self.fit_enabled_cb = self._new_checkbox(
-            "",
-            checked=fit_opts.enabled,
-            tooltip=fit_enabled_tooltip,
+        file_group = QGroupBox("")
+        file_group_layout = QVBoxLayout(file_group)
+        file_group_layout.setContentsMargins(6, 6, 6, 6)
+        file_group_layout.setSpacing(4)
+        file_group_layout.addWidget(
+            self._new_label(
+                "File Options",
+                style_sheet="font-weight: 600; color: #374151; padding: 1px 2px;",
+            )
         )
-        fit_options_layout.addWidget(
-            self._build_fit_option_cell(self.fit_enabled_label, self.fit_enabled_cb),
-            0,
-            0,
-        )
-        fit_use_de_tooltip = "Run differential evolution before local solves."
-        self.fit_use_de_label = self._new_label("DE Init")
-        self.fit_use_de_label.setToolTip(fit_use_de_tooltip)
-        self.fit_use_de_cb = self._new_checkbox(
-            "",
-            checked=fit_opts.use_global_init,
-            tooltip=fit_use_de_tooltip,
-        )
-        fit_options_layout.addWidget(
-            self._build_fit_option_cell(self.fit_use_de_label, self.fit_use_de_cb),
-            0,
-            1,
-        )
-        self.fit_n_starts_spin = self._new_compact_int_spinbox(
-            2,
-            128,
-            fit_opts.n_starts,
-            tooltip="Number of bounded local starts.",
-        )
-        self.fit_de_maxiter_spin = self._new_compact_int_spinbox(
-            1, 500, fit_opts.de_maxiter
-        )
-        self.fit_de_popsize_spin = self._new_compact_int_spinbox(
-            2, 200, fit_opts.de_popsize
-        )
-        self.fit_starts_label = self._new_label("#")
-        fit_options_layout.addWidget(
-            self._build_fit_option_cell(self.fit_starts_label, self.fit_n_starts_spin),
-            1,
-            0,
-        )
-        self.fit_fev_label = self._new_label("Calls")
-        self.fit_per_start_fev_spin = self._new_compact_int_spinbox(
-            20,
-            200000,
-            fit_opts.per_start_maxfev,
-            single_step=50,
-            tooltip="Maximum evaluations per local solve.",
-        )
-        fit_options_layout.addWidget(
-            self._build_fit_option_cell(
-                self.fit_fev_label,
-                self.fit_per_start_fev_spin,
-            ),
-            1,
-            1,
-        )
-        self.fit_stop_r2_label = self._new_label("R2")
-        self.fit_early_stop_r2_spin = self._new_compact_float_spinbox(
-            0.0,
-            1.0,
-            fit_opts.early_stop_r2,
-            decimals=3,
-            single_step=0.001,
-        )
-        fit_options_layout.addWidget(
-            self._build_fit_option_cell(
-                self.fit_stop_r2_label,
-                self.fit_early_stop_r2_spin,
-            ),
-            3,
-            0,
-        )
-        self.fit_de_iter_label = self._new_label("DE iter")
-        fit_options_layout.addWidget(
-            self._build_fit_option_cell(
-                self.fit_de_iter_label,
-                self.fit_de_maxiter_spin,
-            ),
-            2,
-            0,
-        )
-        self.fit_de_pop_label = self._new_label("DE prop")
-        fit_options_layout.addWidget(
-            self._build_fit_option_cell(
-                self.fit_de_pop_label,
-                self.fit_de_popsize_spin,
-            ),
-            2,
-            1,
-        )
-        self.fit_patience_label = self._new_label("Patience")
-        self.fit_patience_spin = self._new_compact_int_spinbox(
-            0,
-            64,
-            fit_opts.early_stop_patience,
-            tooltip="Stop after this many non-improving starts.",
-        )
-        fit_options_layout.addWidget(
-            self._build_fit_option_cell(
-                self.fit_patience_label,
-                self.fit_patience_spin,
-            ),
-            3,
-            1,
-        )
+        file_group_layout.addWidget(source_file_widget)
+        fit_widget_layout.addWidget(file_group)
 
-        self.smoothing_enable_label = self._new_label("Smooth")
-        self.smoothing_enable_label.setToolTip(
-            "Apply moving-average smoothing to channels before fitting/analysis."
+        fit_group = QGroupBox("")
+        fit_group_layout = QVBoxLayout(fit_group)
+        fit_group_layout.setContentsMargins(6, 6, 6, 6)
+        fit_group_layout.setSpacing(4)
+        fit_group_layout.addWidget(
+            self._new_label(
+                "Fit Options",
+                style_sheet="font-weight: 600; color: #374151; padding: 1px 2px;",
+            )
         )
-        self.smoothing_enable_cb = self._new_checkbox(
-            "",
-            checked=self.smoothing_enabled,
-            tooltip="Apply moving-average smoothing to channels before fitting/analysis.",
-        )
-        fit_options_layout.addWidget(
-            self._build_fit_option_cell(
-                self.smoothing_enable_label,
-                self.smoothing_enable_cb,
-            ),
-            4,
-            0,
-        )
-
-        self.smoothing_window_label = self._new_label("Win")
-        self.smoothing_window_label.setToolTip("Smoothing window size (odd samples).")
-        self.smoothing_window_spin = self._new_compact_int_spinbox(
-            1,
-            101,
-            self._effective_smoothing_window(),
-            single_step=2,
-            tooltip="Smoothing window size (odd samples).",
-        )
-        fit_options_layout.addWidget(
-            self._build_fit_option_cell(
-                self.smoothing_window_label,
-                self.smoothing_window_spin,
-            ),
-            4,
-            1,
-        )
-        fit_options_layout.setColumnStretch(0, 1)
-        fit_options_layout.setColumnStretch(1, 1)
-
-        self._fit_robust_widgets = [
-            self.fit_use_de_label,
-            self.fit_use_de_cb,
-            self.fit_starts_label,
-            self.fit_n_starts_spin,
-            self.fit_fev_label,
-            self.fit_per_start_fev_spin,
-            self.fit_patience_label,
-            self.fit_patience_spin,
-            self.fit_stop_r2_label,
-            self.fit_early_stop_r2_spin,
-        ]
-        self._fit_de_widgets = [
-            self.fit_de_iter_label,
-            self.fit_de_maxiter_spin,
-            self.fit_de_pop_label,
-            self.fit_de_popsize_spin,
-        ]
-
-        self.fit_enabled_cb.toggled.connect(self._sync_fit_optimization_controls)
-        self.fit_use_de_cb.toggled.connect(self._sync_fit_optimization_controls)
-        self.smoothing_enable_cb.toggled.connect(self._on_smoothing_controls_changed)
-        self.smoothing_window_spin.valueChanged.connect(
-            self._on_smoothing_controls_changed
-        )
-
-        fit_actions_row = QHBoxLayout()
-        fit_actions_row.setSpacing(4)
-        self.auto_fit_btn = self._new_button(
-            "Auto Fit",
-            handler=self.auto_fit,
-            primary=True,
-        )
-        fit_actions_row.addWidget(self.auto_fit_btn)
-
-        self.cancel_fit_btn = self._new_button(
-            "Cancel",
-            handler=self.cancel_auto_fit,
-            enabled=False,
-        )
-        fit_actions_row.addWidget(self.cancel_fit_btn)
 
         self.show_residuals_cb = self._new_button(
             "Residuals",
@@ -3885,17 +5811,77 @@ class ManualFitGUI(QMainWindow):
             checked=False,
             toggled_handler=lambda: self.update_plot(fast=False),
         )
-        fit_actions_row.addWidget(self.show_residuals_cb)
-        fit_actions_row.addStretch(1)
-        fit_widget_layout.addLayout(fit_actions_row)
-
-        fit_widget_layout.addLayout(fit_options_layout)
-        self.fit_result_summary_label = self._new_label(
-            "R² (fit/full): N/A / N/A",
-            object_name="statusLabel",
+        self.show_channels_cb = self._new_button(
+            "Channels",
+            checkable=True,
+            checked=True,
+            toggled_handler=self._on_show_channels_toggled,
+            tooltip="Show or hide all measured channel traces on the main plot.",
         )
-        fit_widget_layout.addWidget(self.fit_result_summary_label)
-        self._sync_fit_optimization_controls()
+
+        self.smoothing_toggle_btn = self._new_button(
+            "Smooth",
+            checkable=True,
+            checked=self.smoothing_enabled,
+            toggled_handler=self._on_smoothing_controls_changed,
+            tooltip="Apply moving-average smoothing to channels before fitting/analysis.",
+        )
+        self.smoothing_enable_cb = self.smoothing_toggle_btn
+
+        fit_actions_row = QHBoxLayout()
+        fit_actions_row.setSpacing(4)
+        self.auto_fit_btn = self._new_button(
+            self.auto_fit_btn_default_text,
+            handler=self.auto_fit,
+            primary=True,
+        )
+        fit_actions_row.addWidget(self.auto_fit_btn)
+        self.curve_fit_btn = self._new_button(
+            self.curve_fit_btn_default_text,
+            handler=self.auto_fit_curve,
+        )
+        fit_actions_row.addWidget(self.curve_fit_btn)
+
+        self.reset_from_batch_btn = self._new_button(
+            "Reset",
+            handler=self.reset_params_from_batch,
+            tooltip="Load parameters for the current file from the batch table row.",
+        )
+        fit_actions_row.addWidget(self.reset_from_batch_btn)
+        fit_actions_row.addStretch(1)
+        fit_group_layout.addLayout(fit_actions_row)
+
+        fit_view_row = QHBoxLayout()
+        fit_view_row.setSpacing(4)
+        fit_view_row.addWidget(self.show_residuals_cb)
+        fit_view_row.addWidget(self.show_channels_cb)
+        fit_view_row.addWidget(self.smoothing_toggle_btn)
+        fit_view_row.addWidget(
+            self._new_label(
+                "N",
+                object_name="paramInline",
+                tooltip="Smoothing window size (odd samples).",
+                style_sheet="font-weight: 600; color: #475569;",
+            )
+        )
+
+        self.smoothing_window_spin = self._new_compact_int_spinbox(
+            1,
+            101,
+            self._effective_smoothing_window(),
+            single_step=2,
+            tooltip="Smoothing window size (odd samples).",
+        )
+        self.smoothing_window_spin.valueChanged.connect(
+            self._on_smoothing_controls_changed
+        )
+        fit_view_row.addWidget(self.smoothing_window_spin)
+        fit_view_row.addStretch(1)
+        fit_group_layout.addLayout(fit_view_row)
+
+        fit_widget_layout.addWidget(fit_group)
+        self._sync_smoothing_window_enabled()
+        self.create_batch_controls_frame(fit_widget_layout)
         layout.addLayout(top_controls_layout)
 
         self.expression_highlighter = ExpressionSyntaxHighlighter(
@@ -3927,26 +5913,56 @@ class ManualFitGUI(QMainWindow):
         param_header_layout.addWidget(
             self._make_param_header_label("Value", width=self._param_value_width)
         )
-        param_header_layout.addWidget(
-            self._make_param_header_label("StdErr", width=self._param_error_width)
-        )
         params_and_fit_layout = QHBoxLayout()
         params_and_fit_layout.setSpacing(8)
 
         params_left_widget = QWidget()
+        params_left_widget.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum
+        )
         params_left_layout = QVBoxLayout(params_left_widget)
         params_left_layout.setContentsMargins(0, 0, 0, 0)
         params_left_layout.setSpacing(6)
         self._param_header_to_rows_gap = params_left_layout.spacing()
         params_left_layout.addWidget(self.param_header_widget)
 
-        self.param_controls_layout = QVBoxLayout()
+        self.param_controls_widget = QWidget()
+        self.param_controls_layout = QVBoxLayout(self.param_controls_widget)
         self.param_controls_layout.setSpacing(6)
-        params_left_layout.addLayout(self.param_controls_layout)
-        params_and_fit_layout.addWidget(params_left_widget, 1)
+        self.param_controls_layout.setContentsMargins(0, 0, 0, 0)
 
-        fit_widget.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Maximum)
+        self.param_controls_scroll = QScrollArea()
+        self.param_controls_scroll.setWidgetResizable(True)
+        self.param_controls_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.param_controls_scroll.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        self.param_controls_scroll.setAlignment(
+            Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft
+        )
+        self.param_controls_scroll.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum
+        )
+        self.param_controls_scroll.setStyleSheet("QScrollArea { border: none; }")
+        self.param_controls_scroll.setWidget(self.param_controls_widget)
+        params_left_layout.addWidget(
+            self.param_controls_scroll, 0, Qt.AlignmentFlag.AlignTop
+        )
+        params_and_fit_layout.addWidget(
+            params_left_widget, 1, Qt.AlignmentFlag.AlignTop
+        )
+
+        right_panel_width = 420
+        fit_widget.setFixedWidth(right_panel_width)
+        fit_widget.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Maximum)
+        self.fit_panel_widget = fit_widget
         fit_right_widget = QWidget()
+        fit_right_widget.setFixedWidth(right_panel_width)
+        fit_right_widget.setSizePolicy(
+            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Maximum
+        )
         fit_right_layout = QVBoxLayout(fit_right_widget)
         fit_right_layout.setContentsMargins(0, 0, 0, 0)
         fit_right_layout.setSpacing(0)
@@ -3956,8 +5972,16 @@ class ManualFitGUI(QMainWindow):
         )
         self.fit_panel_top_spacer.setFixedHeight(0)
         fit_right_layout.addWidget(self.fit_panel_top_spacer)
-        fit_right_layout.addWidget(fit_widget, 0, Qt.AlignmentFlag.AlignTop)
-        params_and_fit_layout.addWidget(fit_right_widget, 0, Qt.AlignmentFlag.AlignTop)
+        fit_right_layout.addWidget(
+            fit_widget,
+            0,
+            Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignRight,
+        )
+        params_and_fit_layout.addWidget(
+            fit_right_widget,
+            0,
+            Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignRight,
+        )
         params_status_layout = QVBoxLayout()
         params_status_layout.setContentsMargins(0, 0, 0, 0)
         params_status_layout.setSpacing(0)
@@ -3967,7 +5991,6 @@ class ManualFitGUI(QMainWindow):
         self._rebuild_channel_token_buttons()
         self._set_formula_label()
         self._set_expression_edit_mode(False)
-        self._update_param_error_labels()
         self._sync_fit_panel_top_spacing()
         QTimer.singleShot(0, self._sync_fit_panel_top_spacing)
         self._sync_param_row_tail_spacers()
@@ -3976,7 +5999,6 @@ class ManualFitGUI(QMainWindow):
         self.stats_text = SingleLineStatusLabel("")
         self.stats_text.setObjectName("statsLine")
         self.stats_text.setStyleSheet("padding: 0px 2px; margin: 0px;")
-        params_status_layout.addWidget(self.stats_text)
 
         group.setLayout(layout)
         parent_layout.addWidget(group)
@@ -4030,7 +6052,7 @@ class ManualFitGUI(QMainWindow):
             rhs_text = right.strip()
         else:
             if strict:
-                raise ValueError("Use equation form: Col = expression")
+                raise ValueError("Use equation form: TARGET = seg1 ; seg2 ; ... ; segN")
             lhs_text = self.y_channel
             rhs_text = equation
 
@@ -4045,17 +6067,14 @@ class ManualFitGUI(QMainWindow):
             raise ValueError(
                 f"Target column '{lhs_text}' is not in CSV columns ({available})."
             )
-
-        rhs_columns = []
-        seen = set()
-        for token_name in re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\b", rhs_text):
-            resolved = self._resolve_column_name(token_name)
-            if resolved is None or resolved in seen:
-                continue
-            seen.add(resolved)
-            rhs_columns.append(resolved)
-
-        return target_col, rhs_text, rhs_columns
+        segments = [part.strip() for part in rhs_text.split(";")]
+        if len(segments) < 1:
+            raise ValueError(
+                "Use one or more segment expressions: TARGET = seg1 ; seg2 ; ... ; segN"
+            )
+        if any(not seg for seg in segments):
+            raise ValueError("Each segment expression must be non-empty.")
+        return target_col, segments
 
     def _on_expression_text_changed(self):
         self._refresh_expression_highlighting()
@@ -4107,12 +6126,17 @@ class ManualFitGUI(QMainWindow):
             params = []
             if expression_text:
                 try:
-                    _target, rhs_expr, _rhs_columns = self._parse_equation_text(
-                        expression_text, strict=False
+                    _target, seg_exprs = self._parse_equation_text(
+                        expression_text,
+                        strict=False,
                     )
-                    params = extract_expression_parameter_names(
-                        rhs_expr, reserved_names=self._expression_reserved_names()
-                    )
+                    seen = set()
+                    for seg_expr in seg_exprs:
+                        seg_params = extract_segment_parameter_names(seg_expr)
+                        for name in seg_params:
+                            if name not in seen:
+                                seen.add(name)
+                                params.append(name)
                 except Exception:
                     params = []
             self.expression_highlighter.set_context(columns, params)
@@ -4120,17 +6144,11 @@ class ManualFitGUI(QMainWindow):
             self._highlight_refresh_in_progress = False
 
     def _rebuild_channel_token_buttons(self):
-        seen = []
-        seen_set = set()
-        for name in self._available_channel_names():
-            if name in seen_set:
-                continue
-            seen_set.add(name)
-            seen.append(name)
+        tokens = ["x"]
 
         if hasattr(self, "channel_token_menu"):
             self.channel_token_menu.clear()
-            for token_name in seen:
+            for token_name in tokens:
                 action = self.channel_token_menu.addAction(token_name)
                 action.triggered.connect(
                     lambda _checked=False, t=token_name: self._insert_expression_token(
@@ -4138,11 +6156,11 @@ class ManualFitGUI(QMainWindow):
                     )
                 )
             if hasattr(self, "insert_token_btn"):
-                self.insert_token_btn.setEnabled(bool(seen))
+                self.insert_token_btn.setEnabled(bool(tokens))
 
         if hasattr(self, "channel_tokens_layout"):
             clear_layout(self.channel_tokens_layout)
-            for token_name in seen:
+            for token_name in tokens:
                 self._add_channel_token_button(token_name, token_name)
             self.channel_tokens_layout.addStretch(1)
         self._refresh_expression_highlighting()
@@ -4164,16 +6182,14 @@ class ManualFitGUI(QMainWindow):
                 for idx, spec in enumerate(self.param_specs)
             }
             existing_specs = {spec.key: spec for spec in self.param_specs}
+            current_values = self.get_current_param_map()
 
             try:
-                target_col, rhs_expression, rhs_columns = self._parse_equation_text(
+                target_col, segment_exprs = self._parse_equation_text(
                     expression_text, strict=True
                 )
                 self.y_channel = target_col
-                if rhs_columns:
-                    if self.x_channel not in rhs_columns:
-                        self.x_channel = rhs_columns[0]
-                elif self.x_channel == self.y_channel:
+                if self.x_channel == self.y_channel:
                     available = [
                         col
                         for col in self._available_channel_names()
@@ -4182,10 +6198,12 @@ class ManualFitGUI(QMainWindow):
                     if available:
                         self.x_channel = available[0]
 
-                reserved_names = self._expression_reserved_names()
-                param_names = extract_expression_parameter_names(
-                    rhs_expression, reserved_names=reserved_names
+                model_def = build_piecewise_model_definition(
+                    target_col=target_col,
+                    segment_exprs=segment_exprs,
+                    channel_names=self._available_channel_names(),
                 )
+                param_names = list(model_def.global_param_names)
                 new_specs = []
                 new_defaults = []
                 for key in param_names:
@@ -4201,13 +6219,14 @@ class ManualFitGUI(QMainWindow):
                         symbol_hint = key
                         description = f"Parameter {key}"
                         decimals = 6
-                        min_val, max_val = -20.0, 20.0
+                        min_val, max_val = -10.0, 10.0
 
                     min_val = float(min_val)
                     max_val = float(max_val)
                     if min_val > max_val:
                         min_val, max_val = max_val, min_val
-                    default_val = float((min_val + max_val) * 0.5)
+                    default_val = float(current_values.get(key, 0.0))
+                    default_val = float(np.clip(default_val, min_val, max_val))
                     new_specs.append(
                         ParameterSpec(
                             key=key,
@@ -4220,11 +6239,6 @@ class ManualFitGUI(QMainWindow):
                         )
                     )
                     new_defaults.append(default_val)
-
-                compiled = compile_expression_function(
-                    rhs_expression,
-                    param_names,
-                )
             except Exception as exc:
                 self._set_function_status(f"Function error: {exc}", is_error=True)
                 self._refresh_expression_highlighting()
@@ -4232,42 +6246,64 @@ class ManualFitGUI(QMainWindow):
 
             self.param_specs = new_specs
             self.defaults = new_defaults
-            self.current_expression = f"{target_col} = {rhs_expression}"
+            self.current_expression = f"{target_col} = {' ; '.join(segment_exprs)}"
             self._set_expression_editor_text(self.current_expression)
-            self._compiled_expression = compiled
+            self._piecewise_model = model_def
+            self.current_boundary_ratios = default_boundary_ratios(
+                max(0, len(model_def.segment_exprs) - 1)
+            )
             self.last_popt = None
             self.last_pcov = None
-            self.last_fit_r2 = None
-            self.last_full_r2 = None
+            self.last_r2 = None
+            self._last_r2 = None
             self._last_fit_active_keys = []
             self.rebuild_manual_param_controls()
             self._refresh_channel_combos()
             self._set_formula_label()
             self._set_function_status("", is_error=False)
             self._refresh_expression_highlighting()
-            self.update_plot(fast=False)
+            self.update_plot(fast=False, preserve_view=False)
             self._reset_plot_home_view()
             if self.batch_results:
                 for row in self.batch_results:
                     row["params"] = None
                     row["r2"] = None
                     row["error"] = None
+                    row["boundary_ratios"] = None
+                    row["boundary_values"] = None
+                    row["fit_stage"] = None
+                    row["fit_sse"] = None
+                    row["fit_diagnostics"] = {}
                     row["plot_full"] = None
                     row["plot"] = None
                 self.update_batch_table()
                 self._refresh_batch_analysis_if_run()
                 self.queue_visible_thumbnail_render()
+            self._autosave_fit_details()
             return True
         finally:
             self._apply_expression_in_progress = False
 
     def create_param_control(self, spec, default_val):
-        """Create a compact row for lower/upper bounds, value, and fit stderr."""
+        """Create a compact row for lower/upper bounds and current value."""
         key = spec.key
         layout = QHBoxLayout()
         layout.setSpacing(6)
 
-        layout.addWidget(self._create_param_label(spec, width=self._param_name_width))
+        name_label = self._create_param_label(spec, width=self._param_name_width)
+        layout.addWidget(name_label)
+
+        lock_status_label = self._new_label(
+            "",
+            object_name="statusLabel",
+            alignment=Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
+            style_sheet="color: #64748b; font-style: italic;",
+        )
+        lock_status_label.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
+        )
+        lock_status_label.hide()
+        layout.addWidget(lock_status_label, 1)
 
         min_box = self._new_compact_param_spinbox(
             spec,
@@ -4318,18 +6354,15 @@ class ManualFitGUI(QMainWindow):
         )
         layout.addWidget(value_box)
 
-        std_err_label = self._new_label(
-            "",
-            width=self._param_error_width,
-            alignment=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
-            object_name="paramInline",
-            tooltip="Auto-fit standard error for this parameter.",
-        )
-        layout.addWidget(std_err_label)
         tail_spacer = QWidget()
         tail_spacer.setFixedWidth(max(0, int(self._param_tail_placeholder_width)))
         tail_spacer.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         layout.addWidget(tail_spacer)
+
+        container_layout = QVBoxLayout()
+        container_layout.setSpacing(1)
+        container_layout.setContentsMargins(0, 0, 0, 0)
+        container_layout.addLayout(layout)
 
         def slider_to_spinbox(position):
             value = self._slider_position_to_value(key, position)
@@ -4349,7 +6382,15 @@ class ManualFitGUI(QMainWindow):
         slider.sliderPressed.connect(slider_pressed)
         slider.sliderReleased.connect(slider_released)
 
-        return (layout, value_box, slider, min_box, max_box, std_err_label, tail_spacer)
+        return (
+            container_layout,
+            value_box,
+            slider,
+            min_box,
+            max_box,
+            lock_status_label,
+            tail_spacer,
+        )
 
     def _sync_param_row_tail_spacers(self):
         if not hasattr(self, "param_row_tail_spacers"):
@@ -4380,31 +6421,81 @@ class ManualFitGUI(QMainWindow):
         self.param_sliders.clear()
         self.param_min_spinboxes.clear()
         self.param_max_spinboxes.clear()
-        self.param_error_labels.clear()
+        self.param_lock_status_labels.clear()
+        self.param_tail_spacers_by_key.clear()
         self.param_row_tail_spacers.clear()
 
-        for idx, spec in enumerate(self.param_specs):
-            default_val = self.defaults[idx] if idx < len(self.defaults) else 0.0
+        spec_by_key = {spec.key: spec for spec in self.param_specs}
+        default_by_key = {
+            spec.key: (self.defaults[idx] if idx < len(self.defaults) else 0.0)
+            for idx, spec in enumerate(self.param_specs)
+        }
 
-            (
-                control_layout,
-                spinbox,
-                slider,
-                min_box,
-                max_box,
-                std_err_label,
-                tail_spacer,
-            ) = self.create_param_control(spec, default_val)
-            self.param_spinboxes[spec.key] = spinbox
-            self.param_sliders[spec.key] = slider
-            self.param_min_spinboxes[spec.key] = min_box
-            self.param_max_spinboxes[spec.key] = max_box
-            self.param_error_labels[spec.key] = std_err_label
-            self.param_row_tail_spacers.append(tail_spacer)
-            self.param_controls_layout.addLayout(control_layout)
-            self._sync_slider_from_spinbox(spec.key)
+        for section in self._ordered_parameter_sections():
+            kind = str(section.get("kind"))
+            keys = [str(key) for key in (section.get("keys") or [])]
+
+            if kind == "segment":
+                seg_idx = int(section.get("index", 0))
+                tooltip = ""
+                model_def = self._piecewise_model
+                if model_def is not None and 1 <= seg_idx <= len(
+                    model_def.segment_exprs
+                ):
+                    tooltip = str(model_def.segment_exprs[seg_idx - 1])
+                self.param_controls_layout.addWidget(
+                    self._build_param_section_header(
+                        f"Segment {seg_idx}",
+                        tooltip=tooltip,
+                    )
+                )
+                if not keys:
+                    self.param_controls_layout.addWidget(
+                        self._new_label(
+                            "Shared parameters are listed in earlier segments.",
+                            object_name="statusLabel",
+                            style_sheet="color: #64748b; font-style: italic;",
+                        )
+                    )
+            elif kind == "boundary":
+                self.param_controls_layout.addWidget(
+                    self._build_param_boundary_marker(section.get("index", 0))
+                )
+            elif kind == "shared":
+                self.param_controls_layout.addWidget(
+                    self._build_param_section_header("Shared Parameters")
+                )
+
+            for key in keys:
+                spec = spec_by_key.get(key)
+                if spec is None:
+                    continue
+                default_val = float(default_by_key.get(key, 0.0))
+                (
+                    control_layout,
+                    spinbox,
+                    slider,
+                    min_box,
+                    max_box,
+                    lock_status_label,
+                    tail_spacer,
+                ) = self.create_param_control(spec, default_val)
+                self.param_spinboxes[spec.key] = spinbox
+                self.param_sliders[spec.key] = slider
+                self.param_min_spinboxes[spec.key] = min_box
+                self.param_max_spinboxes[spec.key] = max_box
+                self.param_lock_status_labels[spec.key] = lock_status_label
+                self.param_tail_spacers_by_key[spec.key] = tail_spacer
+                self.param_row_tail_spacers.append(tail_spacer)
+                self.param_controls_layout.addLayout(control_layout)
+                self._sync_slider_from_spinbox(spec.key)
+
+        self.param_controls_layout.addStretch(1)
+        self._sync_breakpoint_sliders_from_state()
+        self._refresh_param_capture_mapping_controls()
         self._sync_param_row_tail_spacers()
         QTimer.singleShot(0, self._sync_param_row_tail_spacers)
+        QTimer.singleShot(0, self._sync_fit_panel_top_spacing)
 
     def _edit_channel_names(self):
         channel_names = self._available_channel_names()
@@ -4420,30 +6511,70 @@ class ManualFitGUI(QMainWindow):
         dialog_layout.setSpacing(8)
 
         help_label = self._new_label(
-            "Set display names used in legends and labels.",
+            "Set display names and units used in legends and axes.",
             style_sheet="color: #4b5563;",
         )
         dialog_layout.addWidget(help_label)
 
-        form_layout = QFormLayout()
-        form_layout.setLabelAlignment(
-            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        grid_layout = QGridLayout()
+        grid_layout.setHorizontalSpacing(6)
+        grid_layout.setVerticalSpacing(4)
+        grid_layout.addWidget(
+            self._new_label(
+                "Channel",
+                object_name="statusLabel",
+                style_sheet="font-weight: 700; color: #334155;",
+            ),
+            0,
+            0,
+        )
+        grid_layout.addWidget(
+            self._new_label(
+                "Name",
+                object_name="statusLabel",
+                style_sheet="font-weight: 700; color: #334155;",
+            ),
+            0,
+            1,
+        )
+        grid_layout.addWidget(
+            self._new_label(
+                "Unit",
+                object_name="statusLabel",
+                style_sheet="font-weight: 700; color: #334155;",
+            ),
+            0,
+            2,
         )
         editors = {}
         first_editor = None
-        for channel_name in channel_names:
-            editor = self._new_line_edit(
+        for row_idx, channel_name in enumerate(channel_names, start=1):
+            channel_label = self._new_label(
+                str(channel_name),
+                object_name="paramInline",
+                alignment=Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+            )
+            name_editor = self._new_line_edit(
                 str(self.channels.get(channel_name, channel_name))
             )
-            editor.setPlaceholderText(str(channel_name))
-            editor.setToolTip(
+            name_editor.setPlaceholderText(str(channel_name))
+            name_editor.setToolTip(
                 f"Display label for {channel_name}. Leave blank to use {channel_name}."
             )
-            form_layout.addRow(f"{channel_name}:", editor)
-            editors[channel_name] = editor
+            unit_editor = self._new_line_edit(
+                str(getattr(self, "channel_units", {}).get(channel_name, ""))
+            )
+            unit_editor.setPlaceholderText("unit")
+            unit_editor.setToolTip(
+                f"Unit for {channel_name} (for example V, mV, s, ms)."
+            )
+            grid_layout.addWidget(channel_label, row_idx, 0)
+            grid_layout.addWidget(name_editor, row_idx, 1)
+            grid_layout.addWidget(unit_editor, row_idx, 2)
+            editors[channel_name] = (name_editor, unit_editor)
             if first_editor is None:
-                first_editor = editor
-        dialog_layout.addLayout(form_layout)
+                first_editor = name_editor
+        dialog_layout.addLayout(grid_layout)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -4465,11 +6596,13 @@ class ManualFitGUI(QMainWindow):
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
 
-        for channel_name, editor in editors.items():
-            value = editor.text().strip()
+        for channel_name, (name_editor, unit_editor) in editors.items():
+            value = name_editor.text().strip()
+            unit = unit_editor.text().strip()
             self.channels[channel_name] = value or channel_name
+            self.channel_units[channel_name] = unit
 
-        self.update_plot(fast=False)
+        self.update_plot(fast=False, preserve_view=False)
 
     def _refresh_channel_combos(self):
         if self._channel_sync_in_progress:
@@ -4496,11 +6629,19 @@ class ManualFitGUI(QMainWindow):
                 existing_label = str(self.channels.get(key, "")).strip()
                 if not existing_label:
                     self.channels[key] = key
+                if key not in self.channel_units:
+                    self.channel_units[key] = ""
 
+            x_fallback = "TIME" if "TIME" in channel_columns else None
+            if x_fallback is None:
+                for col in channel_columns:
+                    if col != self.y_channel:
+                        x_fallback = col
+                        break
+                if x_fallback is None:
+                    x_fallback = channel_columns[0]
             x_choice = (
-                self.x_channel
-                if self.x_channel in channel_columns
-                else ("CH3" if "CH3" in channel_columns else channel_columns[0])
+                self.x_channel if self.x_channel in channel_columns else x_fallback
             )
             y_choice = (
                 self.y_channel
@@ -4518,127 +6659,123 @@ class ManualFitGUI(QMainWindow):
                 expr_text = self._expression_editor_text()
                 if expr_text:
                     try:
-                        _old_target, rhs_expr, _rhs_cols = self._parse_equation_text(
+                        _old_target, seg_exprs = self._parse_equation_text(
                             expr_text, strict=False
                         )
-                        normalized = f"{self.y_channel} = {rhs_expr}"
+                        normalized = f"{self.y_channel} = {' ; '.join(seg_exprs)}"
                         if normalized != expr_text:
                             self.current_expression = normalized
                             self._set_expression_editor_text(normalized)
                     except Exception:
                         pass
+            if hasattr(self, "x_channel_combo"):
+                self.x_channel_combo.blockSignals(True)
+                self.x_channel_combo.clear()
+                for col in channel_columns:
+                    self.x_channel_combo.addItem(col, col)
+                x_idx = self.x_channel_combo.findData(self.x_channel)
+                if x_idx >= 0:
+                    self.x_channel_combo.setCurrentIndex(x_idx)
+                self.x_channel_combo.blockSignals(False)
+            if hasattr(self, "y_channel_combo"):
+                self.y_channel_combo.blockSignals(True)
+                self.y_channel_combo.clear()
+                for col in channel_columns:
+                    self.y_channel_combo.addItem(col, col)
+                y_idx = self.y_channel_combo.findData(self.y_channel)
+                if y_idx >= 0:
+                    self.y_channel_combo.setCurrentIndex(y_idx)
+                self.y_channel_combo.blockSignals(False)
+            self._sync_breakpoint_sliders_from_state()
             self._rebuild_channel_token_buttons()
         finally:
             self._channel_sync_in_progress = False
 
-    def _set_fit_region(self, start_pct, end_pct, refresh=True):
-        start = float(np.clip(start_pct, 0.0, 100.0))
-        end = float(np.clip(end_pct, 0.0, 100.0))
-        if start > end:
-            start, end = end, start
-
-        self.fit_region_start_pct = start
-        self.fit_region_end_pct = end
-
-        if refresh:
-            self.update_plot(fast=False)
-
-    def _schedule_fit_region_refresh(self):
-        """Schedule redraw after SpanSelector event completes to avoid UI lag."""
-        if self._fit_region_refresh_pending:
+    def _on_x_channel_changed(self, _index):
+        if self._channel_sync_in_progress:
             return
-        self._fit_region_refresh_pending = True
-
-        def _refresh():
-            self._fit_region_refresh_pending = False
-            self.update_plot(fast=False)
-
-        QTimer.singleShot(0, _refresh)
-
-    def reset_fit_region(self):
-        self._set_fit_region(0.0, 100.0, refresh=True)
-
-    def _fit_region_is_full_area(self):
-        return bool(
-            np.isclose(self.fit_region_start_pct, 0.0, atol=1e-9)
-            and np.isclose(self.fit_region_end_pct, 100.0, atol=1e-9)
-        )
-
-    def get_fit_slice(self, n_points):
-        start = int(
-            np.floor((self.fit_region_start_pct / 100.0) * max(0, n_points - 1))
-        )
-        end = int(np.ceil((self.fit_region_end_pct / 100.0) * max(0, n_points - 1))) + 1
-        start = max(0, min(n_points - 1, start)) if n_points else 0
-        end = max(start + 1, min(n_points, end)) if n_points else 0
-        return slice(start, end)
-
-    def _fit_window_times(self, time_data, fit_slice):
-        n_points = len(time_data)
-        if n_points == 0:
-            return None, None, 0, 0
-        start_idx = int(fit_slice.start if fit_slice.start is not None else 0)
-        end_idx = int(fit_slice.stop if fit_slice.stop is not None else n_points)
-        start_idx = max(0, min(n_points - 1, start_idx))
-        end_idx = max(start_idx + 1, min(n_points, end_idx))
-        return (
-            float(time_data[start_idx]),
-            float(time_data[end_idx - 1]),
-            start_idx,
-            end_idx,
-        )
-
-    def _draw_fit_window_overlay(self, time_data, fit_slice):
-        fit_start_t, fit_end_t, start_idx, end_idx = self._fit_window_times(
-            time_data, fit_slice
-        )
-        self._fit_window_bounds_ms = (fit_start_t, fit_end_t)
-        boundary_positions = []
-        if fit_start_t is None or fit_end_t is None:
-            self._fit_boundary_positions_ms = ()
+        if not hasattr(self, "x_channel_combo"):
             return
-
-        if start_idx > 0:
-            self.ax.axvline(
-                fit_start_t,
-                color="#dc2626",
-                linestyle="--",
-                linewidth=1.2,
-                alpha=0.9,
-                zorder=4,
-                label="Fit boundary",
-            )
-            boundary_positions.append(float(fit_start_t))
-        if end_idx < len(time_data):
-            self.ax.axvline(
-                fit_end_t,
-                color="#dc2626",
-                linestyle="--",
-                linewidth=1.2,
-                alpha=0.9,
-                zorder=4,
-                label="_nolegend_",
-            )
-            boundary_positions.append(float(fit_end_t))
-        self._fit_boundary_positions_ms = tuple(boundary_positions)
-
-    def _split_inside_outside_fit(self, values, fit_slice):
-        values = np.asarray(values, dtype=float)
-        inside = np.full_like(values, np.nan, dtype=float)
-        outside = values.copy()
-        inside[fit_slice] = values[fit_slice]
-        outside[fit_slice] = np.nan
-        return inside, outside
-
-    def _toolbar_mode_active(self):
-        return bool(getattr(self.toolbar, "mode", ""))
-
-    def _reset_plot_home_view(self):
-        """Reset toolbar navigation so Home returns to the current plot view."""
-        toolbar = getattr(self, "toolbar", None)
-        if toolbar is None:
+        data = self.x_channel_combo.currentData()
+        if not data:
             return
+        self.x_channel = str(data)
+        if self.x_channel == self.y_channel and self.current_data is not None:
+            for col in self._available_channel_names():
+                if col != self.x_channel:
+                    self.y_channel = col
+                    break
+        self._sync_breakpoint_sliders_from_state()
+        self.update_plot(fast=False, preserve_view=False)
+
+    def _on_y_channel_changed(self, _index):
+        if self._channel_sync_in_progress:
+            return
+        if not hasattr(self, "y_channel_combo"):
+            return
+        data = self.y_channel_combo.currentData()
+        if not data:
+            return
+        self.y_channel = str(data)
+        if self.x_channel == self.y_channel and self.current_data is not None:
+            for col in self._available_channel_names():
+                if col != self.y_channel:
+                    self.x_channel = col
+                    break
         try:
+            _old_target, seg_exprs = self._parse_equation_text(
+                self._expression_editor_text(),
+                strict=False,
+            )
+            normalized = f"{self.y_channel} = {' ; '.join(seg_exprs)}"
+            self.current_expression = normalized
+            self._set_expression_editor_text(normalized)
+            self._set_formula_label()
+        except Exception:
+            pass
+        self._sync_breakpoint_sliders_from_state()
+        self.update_plot(fast=False, preserve_view=False)
+
+    def _set_toolbar_home_limits(
+        self,
+        home_main_xlim,
+        home_main_ylim,
+        home_residual_ylim=None,
+        *,
+        keep_current_view=False,
+    ):
+        toolbar = getattr(self, "toolbar", None)
+        if toolbar is None or not hasattr(self, "ax") or self.ax is None:
+            return
+        current_main_xlim = None
+        current_main_ylim = None
+        current_residual_ylim = None
+        if keep_current_view:
+            try:
+                current_main_xlim = tuple(self.ax.get_xlim())
+            except Exception:
+                current_main_xlim = None
+            try:
+                current_main_ylim = tuple(self.ax.get_ylim())
+            except Exception:
+                current_main_ylim = None
+            if hasattr(self, "ax_residual") and self.ax_residual is not None:
+                try:
+                    current_residual_ylim = tuple(self.ax_residual.get_ylim())
+                except Exception:
+                    current_residual_ylim = None
+        try:
+            if home_main_xlim is not None:
+                self.ax.set_xlim(*home_main_xlim)
+            if home_main_ylim is not None:
+                self.ax.set_ylim(*home_main_ylim)
+            if (
+                home_residual_ylim is not None
+                and hasattr(self, "ax_residual")
+                and self.ax_residual is not None
+            ):
+                self.ax_residual.set_ylim(*home_residual_ylim)
+
             nav_stack = getattr(toolbar, "_nav_stack", None)
             if nav_stack is not None:
                 nav_stack.clear()
@@ -4649,352 +6786,44 @@ class ManualFitGUI(QMainWindow):
             if callable(set_history_buttons):
                 set_history_buttons()
         except Exception:
+            return
+        if not keep_current_view:
+            return
+        try:
+            if current_main_xlim is not None:
+                self.ax.set_xlim(*current_main_xlim)
+            if current_main_ylim is not None:
+                self.ax.set_ylim(*current_main_ylim)
+            if (
+                current_residual_ylim is not None
+                and hasattr(self, "ax_residual")
+                and self.ax_residual is not None
+            ):
+                self.ax_residual.set_ylim(*current_residual_ylim)
+        except Exception:
             pass
 
-    def _fit_boundary_click_distance_px(self, event):
-        if event is None or event.x is None:
-            return None
-        if not self._fit_boundary_positions_ms:
-            return None
-        distances = []
-        for x_data in self._fit_boundary_positions_ms:
-            try:
-                x_px = float(self.ax.transData.transform((float(x_data), 0.0))[0])
-            except Exception:
-                continue
-            distances.append(abs(float(event.x) - x_px))
-        if not distances:
-            return None
-        return float(min(distances))
-
-    def on_plot_mouse_press(self, event):
-        if not bool(getattr(event, "dblclick", False)):
+    def _reset_plot_home_view(self):
+        """Reset toolbar Home target to the current plotted extents."""
+        if not hasattr(self, "ax") or self.ax is None:
             return
-        if self.current_data is None or self.cached_time_data is None:
-            return
-        if event.inaxes != self.ax:
-            return
-        if self._toolbar_mode_active():
-            return
-        if self._fit_region_is_full_area():
-            return
-
-        distance_px = self._fit_boundary_click_distance_px(event)
-        if distance_px is None:
-            return
-        if distance_px <= float(self._fit_boundary_pick_px):
-            self.reset_fit_region()
-
-    def _recreate_fit_region_selector(self):
-        if not hasattr(self, "ax"):
-            return
-
-        if self.fit_region_selector is not None:
-            try:
-                self.fit_region_selector.set_active(False)
-                self.fit_region_selector.disconnect_events()
-            except Exception:
-                pass
-            self.fit_region_selector = None
-
-        selector_kwargs = dict(
-            useblit=True,
-            interactive=True,
-            props=dict(
-                facecolor="none",
-                edgecolor="#dc2626",
-                linewidth=1.1,
-                alpha=0.9,
-            ),
-        )
+        main_xlim = None
+        main_ylim = None
+        residual_ylim = None
         try:
-            self.fit_region_selector = SpanSelector(
-                self.ax,
-                self.on_fit_span_selected,
-                "horizontal",
-                drag_from_anywhere=True,
-                **selector_kwargs,
-            )
-        except TypeError:
-            self.fit_region_selector = SpanSelector(
-                self.ax,
-                self.on_fit_span_selected,
-                "horizontal",
-                **selector_kwargs,
-            )
-
-    def _sync_fit_region_selector(self):
-        if self.fit_region_selector is None:
-            return
-        fit_start_t, fit_end_t = self._fit_window_bounds_ms
-        if fit_start_t is None or fit_end_t is None:
-            return
-        self._suppress_fit_region_selector = True
+            main_xlim = tuple(self.ax.get_xlim())
+        except Exception:
+            pass
         try:
-            self.fit_region_selector.extents = (float(fit_start_t), float(fit_end_t))
-        finally:
-            self._suppress_fit_region_selector = False
-
-    def on_fit_span_selected(self, x_min, x_max):
-        if self._suppress_fit_region_selector:
-            return
-        if self.current_data is None or self.cached_time_data is None:
-            return
-        if self._toolbar_mode_active():
-            return
-        if x_min is None or x_max is None:
-            return
-
-        lo = float(min(x_min, x_max))
-        hi = float(max(x_min, x_max))
-        if np.isclose(lo, hi):
-            return
-
-        time_data = self.cached_time_data
-        if len(time_data) < 2:
-            return
-
-        t_min = float(min(time_data[0], time_data[-1]))
-        t_max = float(max(time_data[0], time_data[-1]))
-        if np.isclose(t_min, t_max):
-            return
-
-        lo = float(np.clip(lo, t_min, t_max))
-        hi = float(np.clip(hi, t_min, t_max))
-        if hi <= lo:
-            return
-
-        start_pct = ((lo - t_min) / (t_max - t_min)) * 100.0
-        end_pct = ((hi - t_min) / (t_max - t_min)) * 100.0
-        min_gap = 100.0 / max(1, len(time_data) - 1)
-        if (end_pct - start_pct) < min_gap:
-            center = 0.5 * (start_pct + end_pct)
-            start_pct = max(0.0, center - (0.5 * min_gap))
-            end_pct = min(100.0, start_pct + min_gap)
-            if (end_pct - start_pct) < min_gap:
-                start_pct = max(0.0, end_pct - min_gap)
-
-        self._set_fit_region(start_pct, end_pct, refresh=False)
-        self._schedule_fit_region_refresh()
-
-    def create_stats_frame(self, parent_layout):
-        """Create file selection + auto-fit controls + stats display section."""
-        group = QGroupBox("")
-        layout = QVBoxLayout()
-        layout.setContentsMargins(5, 5, 5, 5)
-        layout.setSpacing(4)
-
-        source_layout = QHBoxLayout()
-        source_layout.setSpacing(4)
-        source_layout.addWidget(self._make_param_header_label("Source", width=48))
-        self.source_path_label = ClickableLabel("")
-        self.source_path_label.setObjectName("sourcePathLabel")
-        self.source_path_label.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.source_path_label.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
-        )
-        self.source_path_label.clicked.connect(self.browse_directory)
-        self._refresh_source_path_label()
-        source_layout.addWidget(self.source_path_label, 1)
-        layout.addLayout(source_layout)
-
-        file_layout = QHBoxLayout()
-        file_layout.setSpacing(4)
-        file_layout.addWidget(self._make_param_header_label("File", width=48))
-        self.file_combo = self._new_combobox(current_index_changed=self.on_file_changed)
-        file_layout.addWidget(self.file_combo, 1)
-        self.prev_file_btn = self._make_compact_tool_button(
-            "◀", "Previous File", self.prev_file
-        )
-        file_layout.addWidget(self.prev_file_btn)
-        self.next_file_btn = self._make_compact_tool_button(
-            "▶", "Next File", self.next_file
-        )
-        file_layout.addWidget(self.next_file_btn)
-        self._sync_file_navigation_buttons()
-        layout.addLayout(file_layout)
-
-        # Auto-fit control buttons
-        btn_layout = QHBoxLayout()
-        btn_layout.setSpacing(4)
-
-        self.auto_fit_btn = self._new_button(
-            "Auto Fit",
-            handler=self.auto_fit,
-            primary=True,
-        )
-        btn_layout.addWidget(self.auto_fit_btn)
-
-        self.cancel_fit_btn = self._new_button(
-            "Cancel",
-            handler=self.cancel_auto_fit,
-            enabled=False,
-        )
-        btn_layout.addWidget(self.cancel_fit_btn)
-
-        self.show_residuals_cb = self._new_button(
-            "Residuals",
-            checkable=True,
-            checked=False,
-            toggled_handler=lambda: self.update_plot(fast=False),
-        )
-        btn_layout.addWidget(self.show_residuals_cb)
-
-        layout.addLayout(btn_layout)
-
-        fit_opts = (
-            self.fit_options
-            if isinstance(self.fit_options, FitOptimizationOptions)
-            else FitOptimizationOptions()
-        )
-        fit_options_layout = QGridLayout()
-        fit_options_layout.setHorizontalSpacing(6)
-        fit_options_layout.setVerticalSpacing(2)
-
-        fit_enabled_tooltip = "Enable deterministic multi-start fitting."
-        self.fit_enabled_label = self._new_label("Robust")
-        self.fit_enabled_label.setToolTip(fit_enabled_tooltip)
-        self.fit_enabled_cb = self._new_checkbox(
-            "",
-            checked=fit_opts.enabled,
-            tooltip=fit_enabled_tooltip,
-        )
-        fit_options_layout.addWidget(
-            self._build_fit_option_cell(self.fit_enabled_label, self.fit_enabled_cb),
-            0,
-            0,
-        )
-        fit_use_de_tooltip = "Run differential evolution before local solves."
-        self.fit_use_de_label = self._new_label("DE Init")
-        self.fit_use_de_label.setToolTip(fit_use_de_tooltip)
-        self.fit_use_de_cb = self._new_checkbox(
-            "",
-            checked=fit_opts.use_global_init,
-            tooltip=fit_use_de_tooltip,
-        )
-        fit_options_layout.addWidget(
-            self._build_fit_option_cell(self.fit_use_de_label, self.fit_use_de_cb),
-            0,
-            1,
-        )
-        self.fit_n_starts_spin = self._new_compact_int_spinbox(
-            2,
-            128,
-            fit_opts.n_starts,
-            tooltip="Number of bounded local starts.",
-        )
-        self.fit_de_maxiter_spin = self._new_compact_int_spinbox(
-            1, 500, fit_opts.de_maxiter
-        )
-        self.fit_de_popsize_spin = self._new_compact_int_spinbox(
-            2, 200, fit_opts.de_popsize
-        )
-        self.fit_starts_label = self._new_label("#")
-        fit_options_layout.addWidget(
-            self._build_fit_option_cell(self.fit_starts_label, self.fit_n_starts_spin),
-            1,
-            0,
-        )
-        self.fit_fev_label = self._new_label("Calls")
-        self.fit_per_start_fev_spin = self._new_compact_int_spinbox(
-            20,
-            200000,
-            fit_opts.per_start_maxfev,
-            single_step=50,
-            tooltip="Maximum evaluations per local solve.",
-        )
-        fit_options_layout.addWidget(
-            self._build_fit_option_cell(
-                self.fit_fev_label,
-                self.fit_per_start_fev_spin,
-            ),
-            1,
-            1,
-        )
-        self.fit_stop_r2_label = self._new_label("R2")
-        self.fit_early_stop_r2_spin = self._new_compact_float_spinbox(
-            0.0,
-            1.0,
-            fit_opts.early_stop_r2,
-            decimals=3,
-            single_step=0.001,
-        )
-        fit_options_layout.addWidget(
-            self._build_fit_option_cell(
-                self.fit_stop_r2_label,
-                self.fit_early_stop_r2_spin,
-            ),
-            1,
-            2,
-        )
-
-        self.fit_de_iter_label = self._new_label("DE iter")
-        fit_options_layout.addWidget(
-            self._build_fit_option_cell(
-                self.fit_de_iter_label,
-                self.fit_de_maxiter_spin,
-            ),
-            2,
-            0,
-        )
-        self.fit_de_pop_label = self._new_label("DE prop")
-        fit_options_layout.addWidget(
-            self._build_fit_option_cell(
-                self.fit_de_pop_label,
-                self.fit_de_popsize_spin,
-            ),
-            2,
-            1,
-        )
-        self.fit_patience_label = self._new_label("Patience")
-        self.fit_patience_spin = self._new_compact_int_spinbox(
-            0,
-            64,
-            fit_opts.early_stop_patience,
-            tooltip="Stop after this many non-improving starts.",
-        )
-        fit_options_layout.addWidget(
-            self._build_fit_option_cell(
-                self.fit_patience_label,
-                self.fit_patience_spin,
-            ),
-            2,
-            2,
-        )
-        fit_options_layout.setColumnStretch(0, 1)
-        fit_options_layout.setColumnStretch(1, 1)
-        fit_options_layout.setColumnStretch(2, 1)
-
-        self._fit_robust_widgets = [
-            self.fit_use_de_label,
-            self.fit_use_de_cb,
-            self.fit_starts_label,
-            self.fit_n_starts_spin,
-            self.fit_fev_label,
-            self.fit_per_start_fev_spin,
-            self.fit_stop_r2_label,
-            self.fit_early_stop_r2_spin,
-            self.fit_patience_label,
-            self.fit_patience_spin,
-        ]
-        self._fit_de_widgets = [
-            self.fit_de_iter_label,
-            self.fit_de_maxiter_spin,
-            self.fit_de_pop_label,
-            self.fit_de_popsize_spin,
-        ]
-
-        self.fit_enabled_cb.toggled.connect(self._sync_fit_optimization_controls)
-        self.fit_use_de_cb.toggled.connect(self._sync_fit_optimization_controls)
-        self._sync_fit_optimization_controls()
-        layout.addLayout(fit_options_layout)
-
-        # Single-line shared status display
-        self.stats_text = SingleLineStatusLabel("")
-        layout.addWidget(self.stats_text)
-
-        group.setLayout(layout)
-        parent_layout.addWidget(group)
+            main_ylim = tuple(self.ax.get_ylim())
+        except Exception:
+            pass
+        if hasattr(self, "ax_residual") and self.ax_residual is not None:
+            try:
+                residual_ylim = tuple(self.ax_residual.get_ylim())
+            except Exception:
+                residual_ylim = None
+        self._set_toolbar_home_limits(main_xlim, main_ylim, residual_ylim)
 
     def create_batch_controls_frame(self, parent_layout):
         """Create batch-only controls (shared params/settings are above tabs)."""
@@ -5005,7 +6834,7 @@ class ManualFitGUI(QMainWindow):
         layout.setSpacing(4)
 
         batch_label = self._new_label(
-            "Batch actions (uses shared model/params/fit window above)",
+            "Batch Actions",
             style_sheet="font-weight: 600; color: #374151; padding: 1px 2px;",
         )
         layout.addWidget(batch_label)
@@ -5016,13 +6845,19 @@ class ManualFitGUI(QMainWindow):
             handler=self.run_batch_fit,
         )
 
-        export_table_btn = self._new_button(
-            "Export CSV", handler=self.export_batch_table
+        export_fit_btn = self._new_button(
+            "Export Fit",
+            handler=self.export_fit_details,
+            tooltip="Export equation, parameter specs, and fit results to JSON.",
+        )
+        import_fit_btn = self._new_button(
+            "Import Fit",
+            handler=self.import_fit_details,
+            tooltip="Import equation, parameter specs, and fit results from JSON.",
         )
 
         regex_layout = QHBoxLayout()
         regex_layout.setSpacing(4)
-        regex_layout.addWidget(self._new_label("Pattern:"))
         self.regex_input = self._new_line_edit(
             "",
             placeholder="Example: data_{freq}_{idx}_ALL",
@@ -5040,10 +6875,19 @@ class ManualFitGUI(QMainWindow):
         layout.addLayout(regex_layout)
 
         self.batch_parse_feedback_label = self._new_label(
-            "Use {field} placeholders to extract columns.",
+            "",
             object_name="statusLabel",
         )
+        self.batch_parse_feedback_label.hide()
         layout.addWidget(self.batch_parse_feedback_label)
+
+        self.capture_mapping_widget = QWidget()
+        self.capture_mapping_layout = QGridLayout(self.capture_mapping_widget)
+        self.capture_mapping_layout.setContentsMargins(0, 0, 0, 0)
+        self.capture_mapping_layout.setHorizontalSpacing(6)
+        self.capture_mapping_layout.setVerticalSpacing(2)
+        layout.addWidget(self.capture_mapping_widget)
+        self._refresh_param_capture_mapping_controls()
 
         actions_row = QHBoxLayout()
         actions_row.setSpacing(4)
@@ -5054,7 +6898,8 @@ class ManualFitGUI(QMainWindow):
             enabled=False,
         )
         actions_row.addWidget(self.cancel_batch_btn)
-        actions_row.addWidget(export_table_btn)
+        actions_row.addWidget(export_fit_btn)
+        actions_row.addWidget(import_fit_btn)
         actions_row.addStretch(1)
         layout.addLayout(actions_row)
 
@@ -5071,6 +6916,10 @@ class ManualFitGUI(QMainWindow):
         self.batch_table.setColumnCount(0)
         self.batch_table.setRowCount(0)
         self.batch_table.cellClicked.connect(self._on_batch_table_cell_clicked)
+        self.batch_table_header = RichTextHeaderView(
+            Qt.Orientation.Horizontal, self.batch_table
+        )
+        self.batch_table.setHorizontalHeader(self.batch_table_header)
         batch_header = self.batch_table.horizontalHeader()
         batch_header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         batch_header.setStretchLastSection(True)
@@ -5101,21 +6950,7 @@ class ManualFitGUI(QMainWindow):
 
         source_row = QHBoxLayout()
         source_row.setSpacing(4)
-        source_row.addWidget(self._new_label("Analysis Source:"))
-        self.analysis_source_combo = self._new_combobox(
-            items=[
-                ("Completed Batch Run", "run"),
-                ("Loaded Batch CSV", "csv"),
-            ],
-            current_index_changed=self._on_analysis_source_changed,
-        )
-        source_row.addWidget(self.analysis_source_combo)
-        self.analysis_load_csv_btn = self._new_button(
-            "Load Batch CSV",
-            handler=self.load_batch_analysis_csv,
-            enabled=False,
-        )
-        source_row.addWidget(self.analysis_load_csv_btn)
+        source_row.addWidget(self._new_label("Analysis Source: Completed Batch Run"))
         self.analysis_status_label = self._new_label(
             "Using completed batch results (0 rows).",
             object_name="statusLabel",
@@ -5128,6 +6963,7 @@ class ManualFitGUI(QMainWindow):
         controls_row.addWidget(self._new_label("Field (X):"))
         self.analysis_x_combo = self._new_combobox(
             current_index_changed=self.update_batch_analysis_plot,
+            rich_text=True,
         )
         controls_row.addWidget(self.analysis_x_combo, 2)
         self.analysis_clear_x_btn = self._new_button(
@@ -5200,11 +7036,6 @@ class ManualFitGUI(QMainWindow):
         group.setLayout(layout)
         parent_layout.addWidget(group)
 
-    def _on_analysis_source_changed(self):
-        source = self.analysis_source_combo.currentData()
-        self.analysis_load_csv_btn.setEnabled(source == "csv")
-        self._refresh_batch_analysis_data(preserve_selection=True)
-
     def _batch_row_error_text(self, row):
         pattern_error = str(row.get("pattern_error") or "").strip()
         fit_error = str(row.get("error") or "").strip()
@@ -5220,44 +7051,32 @@ class ManualFitGUI(QMainWindow):
             parts.append(fit_error)
         return " | ".join(parts)
 
-    def load_batch_analysis_csv(self):
-        """Load a previously exported batch CSV for analysis."""
-        file_path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Select Batch CSV",
-            str(Path.cwd()),
-            "CSV Files (*.csv);;All Files (*.*)",
-        )
-        if not file_path:
-            return
-        try:
-            frame = read_csv(file_path, header=0)
-            self.analysis_csv_records = frame.to_dict("records")
-            self.analysis_csv_path = file_path
-            csv_idx = self.analysis_source_combo.findData("csv")
-            if csv_idx >= 0:
-                self.analysis_source_combo.setCurrentIndex(csv_idx)
-            self._refresh_batch_analysis_data(preserve_selection=False)
-            self.stats_text.append(
-                f"✓ Loaded analysis CSV: {Path(file_path).name} ({len(self.analysis_csv_records)} rows)"
-            )
-        except Exception as exc:
-            self.stats_text.append(f"✗ Failed to load analysis CSV: {exc}")
-
     def _extract_analysis_records_from_batch(self):
         records = []
+        param_columns = self._batch_parameter_column_items()
         for row in self.batch_results:
             record = {
-                "File": display_name_for_file_ref(row["file"]),
+                "File": stem_for_file_ref(row["file"]),
                 "__file_ref": row["file"],
             }
             captures = row.get("captures") or {}
             for key, value in captures.items():
                 record[key] = value
-            params = row.get("params") or []
-            for idx, spec in enumerate(self.param_specs):
-                record[spec.column_name] = params[idx] if idx < len(params) else None
+            params = self._as_float_array(row.get("params"))
+            boundary_values = self._as_float_array(row.get("boundary_values"))
+            for item in param_columns:
+                idx = int(item["index"])
+                if item["kind"] == "param":
+                    value = float(params[idx]) if params.size > idx else None
+                else:
+                    value = (
+                        float(boundary_values[idx])
+                        if boundary_values.size > idx
+                        else None
+                    )
+                record[str(item["key"])] = value
             record["R2"] = row.get("r2")
+            record["SSE"] = row.get("fit_sse")
             record["Error"] = self._batch_row_error_text(row)
             records.append(record)
         return records
@@ -5286,6 +7105,22 @@ class ManualFitGUI(QMainWindow):
                 numeric.append(np.nan)
         return np.asarray(numeric, dtype=float)
 
+    def _analysis_field_display_text(self, field_key):
+        key_text = str(field_key).strip()
+        if not key_text:
+            return ("", "")
+        label_text = key_text
+        for item in self._batch_parameter_column_items():
+            item_key = str(item.get("key", "")).strip()
+            if item_key != key_text:
+                continue
+            token = str(item.get("token", "")).strip()
+            if token:
+                label_text = token
+            break
+        label_html = parameter_symbol_to_html(label_text) or html.escape(label_text)
+        return (label_text, label_html)
+
     def _default_analysis_x_field(self, numeric_columns):
         for key in self.batch_capture_keys:
             if key in numeric_columns:
@@ -5296,21 +7131,8 @@ class ManualFitGUI(QMainWindow):
         return numeric_columns[0] if numeric_columns else None
 
     def _refresh_batch_analysis_data(self, preserve_selection):
-        source = self.analysis_source_combo.currentData()
-        if source == "csv":
-            raw_records = list(self.analysis_csv_records)
-            if raw_records:
-                file_name = (
-                    Path(self.analysis_csv_path).name
-                    if self.analysis_csv_path
-                    else "CSV"
-                )
-                base_status = f"Loaded CSV: {file_name}"
-            else:
-                base_status = "Loaded CSV"
-        else:
-            raw_records = self._extract_analysis_records_from_batch()
-            base_status = "Using completed batch results"
+        raw_records = self._extract_analysis_records_from_batch()
+        base_status = "Using completed batch results"
 
         records = list(raw_records)
         self.analysis_status_label.setText(f"{base_status} ({len(records)} rows).")
@@ -5326,9 +7148,9 @@ class ManualFitGUI(QMainWindow):
 
         numeric_columns = list(self.analysis_numeric_data.keys())
         self.analysis_param_columns = [
-            spec.column_name
-            for spec in self.param_specs
-            if spec.column_name in self.analysis_numeric_data
+            str(item["key"])
+            for item in self._batch_parameter_column_items()
+            if str(item["key"]) in self.analysis_numeric_data
         ]
         if not self.analysis_param_columns:
             self.analysis_param_columns = [
@@ -5342,9 +7164,18 @@ class ManualFitGUI(QMainWindow):
 
         self.analysis_x_combo.blockSignals(True)
         self.analysis_x_combo.clear()
-        self.analysis_x_combo.addItem("Select X Axis...", None)
+        if isinstance(self.analysis_x_combo, RichTextComboBox):
+            self.analysis_x_combo.add_rich_item(
+                "Select X Axis...", None, "Select X Axis..."
+            )
+        else:
+            self.analysis_x_combo.addItem("Select X Axis...", None)
         for key in numeric_columns:
-            self.analysis_x_combo.addItem(key, key)
+            plain_label, rich_label = self._analysis_field_display_text(key)
+            if isinstance(self.analysis_x_combo, RichTextComboBox):
+                self.analysis_x_combo.add_rich_item(plain_label, key, rich_label)
+            else:
+                self.analysis_x_combo.addItem(plain_label, key)
         self.analysis_x_combo.blockSignals(False)
 
         chosen_x = (
@@ -5371,6 +7202,12 @@ class ManualFitGUI(QMainWindow):
             if button.isChecked()
         ]
 
+    def _toggle_analysis_param(self, key):
+        control = self.analysis_param_buttons.get(str(key))
+        if control is None:
+            return
+        control.setChecked(not control.isChecked())
+
     def _rebuild_analysis_param_buttons(self, previous_params):
         while self.analysis_params_button_layout.count():
             item = self.analysis_params_button_layout.takeAt(0)
@@ -5380,14 +7217,37 @@ class ManualFitGUI(QMainWindow):
 
         self.analysis_param_buttons = {}
         for key in self.analysis_param_columns:
-            button = self._new_button(
-                key,
-                checkable=True,
-                checked=(not previous_params or key in previous_params),
+            control = self._new_checkbox(
+                "",
+                checked=(key in previous_params),
                 toggled_handler=self.update_batch_analysis_plot,
+                tooltip=f"Parameter '{key}'",
             )
-            self.analysis_params_button_layout.addWidget(button)
-            self.analysis_param_buttons[key] = button
+            display_label = str(self._display_name_for_param_key(key)).strip() or str(
+                key
+            )
+            display_html = parameter_symbol_to_html(display_label) or html.escape(
+                display_label
+            )
+            if display_label != str(key):
+                display_html = f"{display_html} <span style='color:#64748b;'>({html.escape(str(key))})</span>"
+            label = ClickableLabel(display_html)
+            label.setTextFormat(Qt.TextFormat.RichText)
+            label.setToolTip(f"Parameter '{key}'")
+            label.clicked.connect(
+                lambda _checked=False, param_key=str(key): self._toggle_analysis_param(
+                    param_key
+                )
+            )
+
+            item_widget = QWidget()
+            item_layout = QHBoxLayout(item_widget)
+            item_layout.setContentsMargins(0, 0, 2, 0)
+            item_layout.setSpacing(2)
+            item_layout.addWidget(control)
+            item_layout.addWidget(label)
+            self.analysis_params_button_layout.addWidget(item_widget)
+            self.analysis_param_buttons[str(key)] = control
         self.analysis_params_button_layout.addStretch()
 
     def _select_all_analysis_params(self):
@@ -5426,7 +7286,7 @@ class ManualFitGUI(QMainWindow):
         matches = [
             file_path
             for file_path in self.data_files
-            if display_name_for_file_ref(file_path) == display_name
+            if stem_for_file_ref(file_path) == display_name
         ]
         if len(matches) == 1:
             return matches[0]
@@ -5526,9 +7386,12 @@ class ManualFitGUI(QMainWindow):
             file_refs_sorted = [file_refs[int(order_idx)] for order_idx in order]
             color = palette_color(idx)
             target_ax = axes[idx] if len(axes) > 1 else axes[0]
+            param_plot_label = self._display_name_for_param_key_mathtext(param_name)
 
             if show_points:
-                scatter_label = param_name if not show_series_line else "_nolegend_"
+                scatter_label = (
+                    param_plot_label if not show_series_line else "_nolegend_"
+                )
                 scatter = target_ax.scatter(
                     x_sorted, y_sorted, s=26, color=color, label=scatter_label
                 )
@@ -5541,7 +7404,7 @@ class ManualFitGUI(QMainWindow):
                     linewidth=1.4,
                     alpha=0.85,
                     color=color,
-                    label=param_name,
+                    label=param_plot_label,
                 )
 
             if show_fit_lines:
@@ -5552,7 +7415,9 @@ class ManualFitGUI(QMainWindow):
                         float(np.min(x_sorted)), float(np.max(x_sorted)), 200
                     )
                     y_line = slope * x_line + intercept
-                    fit_label = f"{param_name} fit" if len(axes) == 1 else "Best fit"
+                    fit_label = (
+                        f"{param_plot_label} fit" if len(axes) == 1 else "Best fit"
+                    )
                     target_ax.plot(
                         x_line,
                         y_line,
@@ -5563,7 +7428,7 @@ class ManualFitGUI(QMainWindow):
                     )
 
             if len(axes) > 1:
-                target_ax.set_ylabel(param_name)
+                target_ax.set_ylabel(param_plot_label)
                 target_ax.grid(True, alpha=0.25)
                 if show_legend:
                     target_ax.legend(loc="best", fontsize=8)
@@ -5580,7 +7445,11 @@ class ManualFitGUI(QMainWindow):
                 axes[0].legend(loc="best", fontsize=8)
             axes[0].grid(True, alpha=0.3)
 
-        axes[-1].set_xlabel(x_field)
+        if x_field in self.analysis_param_columns:
+            x_axis_label = self._display_name_for_param_key_mathtext(x_field)
+        else:
+            x_axis_label = x_field
+        axes[-1].set_xlabel(x_axis_label)
         self.analysis_fig.tight_layout()
         self.analysis_canvas.draw_idle()
 
@@ -5649,6 +7518,858 @@ class ManualFitGUI(QMainWindow):
                 return row_idx
         return None
 
+    def _find_batch_result_index_by_file(self, file_path):
+        if not file_path:
+            return None
+        for idx, row in enumerate(self.batch_results):
+            if row.get("file") == file_path:
+                return idx
+        return None
+
+    def _rebuild_batch_capture_keys_from_rows(self):
+        keys = []
+        for row in self.batch_results:
+            captures = dict(row.get("captures") or {})
+            for key in captures.keys():
+                text = str(key).strip()
+                if text and text not in keys:
+                    keys.append(text)
+        self.batch_capture_keys = keys
+
+    def _batch_parameter_column_items(self):
+        items = []
+        for idx, spec in enumerate(self.param_specs):
+            token = (
+                str(self._display_name_for_param_key(spec.key)).strip()
+                or spec.column_name
+            )
+            items.append(
+                {
+                    "kind": "param",
+                    "index": int(idx),
+                    "key": str(spec.column_name),
+                    "token": token,
+                }
+            )
+        n_boundaries = max(
+            0,
+            len(self._piecewise_model.segment_exprs) - 1
+            if self._piecewise_model is not None
+            else 0,
+        )
+        for idx in range(n_boundaries):
+            items.append(
+                {
+                    "kind": "boundary",
+                    "index": int(idx),
+                    "key": f"X_{idx}",
+                    "token": _format_boundary_display_name(idx),
+                }
+            )
+        return items
+
+    @staticmethod
+    def _as_float_array(values):
+        if values is None:
+            return np.asarray([], dtype=float)
+        try:
+            return np.asarray(values, dtype=float).reshape(-1)
+        except Exception:
+            return np.asarray([], dtype=float)
+
+    @staticmethod
+    def _json_float_or_none(value):
+        if value is None:
+            return None
+        try:
+            numeric = float(value)
+        except Exception:
+            return None
+        if not np.isfinite(numeric):
+            return None
+        return float(numeric)
+
+    @staticmethod
+    def _float_list_or_none(values):
+        if values is None:
+            return None
+        try:
+            arr = np.asarray(values, dtype=float).reshape(-1)
+        except Exception:
+            return None
+        finite = arr[np.isfinite(arr)]
+        if finite.size != arr.size:
+            return None
+        return [float(v) for v in arr]
+
+    def _fit_details_sidecar_path(self):
+        base_dir = None
+        source_text = str(getattr(self, "current_dir", "")).strip()
+        if source_text:
+            source_path = Path(source_text).expanduser()
+            if source_path.is_dir():
+                base_dir = source_path
+            elif source_path.is_file():
+                base_dir = source_path.parent
+        if base_dir is None:
+            selected = list(getattr(self, "_source_selected_paths", []) or [])
+            if selected:
+                selected_parent = Path(selected[0]).expanduser().parent
+                if selected_parent.exists():
+                    base_dir = selected_parent
+        if base_dir is None:
+            return None
+        return Path(base_dir) / FIT_DETAILS_FILENAME
+
+    def _serialize_fit_parameter_specs(self):
+        serialized = []
+        for spec in self.param_specs:
+            min_box = self.param_min_spinboxes.get(spec.key)
+            max_box = self.param_max_spinboxes.get(spec.key)
+            value_box = self.param_spinboxes.get(spec.key)
+            serialized.append(
+                {
+                    "key": str(spec.key),
+                    "symbol": str(spec.symbol),
+                    "description": str(spec.description),
+                    "default": float(spec.default),
+                    "min_value": float(spec.min_value),
+                    "max_value": float(spec.max_value),
+                    "decimals": int(spec.decimals),
+                    "ui_min": (
+                        float(min_box.value())
+                        if min_box is not None
+                        else float(spec.min_value)
+                    ),
+                    "ui_max": (
+                        float(max_box.value())
+                        if max_box is not None
+                        else float(spec.max_value)
+                    ),
+                    "value": (
+                        float(value_box.value())
+                        if value_box is not None
+                        else float(spec.default)
+                    ),
+                }
+            )
+        return serialized
+
+    def _serialize_fit_batch_rows(self):
+        rows = []
+        for row in list(getattr(self, "batch_results", []) or []):
+            file_ref = str(row.get("file") or "").strip()
+            if not file_ref:
+                continue
+            rows.append(
+                {
+                    "file": file_ref,
+                    "file_stem": stem_for_file_ref(file_ref),
+                    "captures": dict(row.get("captures") or {}),
+                    "params": self._float_list_or_none(row.get("params")),
+                    "r2": self._json_float_or_none(row.get("r2")),
+                    "error": (
+                        str(row.get("error"))
+                        if row.get("error") not in (None, "")
+                        else None
+                    ),
+                    "x_channel": str(row.get("x_channel") or ""),
+                    "y_channel": str(row.get("y_channel") or ""),
+                    "boundary_ratios": self._float_list_or_none(
+                        row.get("boundary_ratios")
+                    ),
+                    "boundary_values": self._float_list_or_none(
+                        row.get("boundary_values")
+                    ),
+                    "fit_sse": self._json_float_or_none(row.get("fit_sse")),
+                    "fit_diagnostics": dict(row.get("fit_diagnostics") or {}),
+                    "pattern_error": (
+                        str(row.get("pattern_error"))
+                        if row.get("pattern_error") not in (None, "")
+                        else None
+                    ),
+                }
+            )
+        return rows
+
+    def _batch_table_export_matrix(self):
+        """Return the same columns/rows used by Export CSV."""
+        param_columns = self._batch_parameter_column_items()
+        columns = (
+            ["File"]
+            + self.batch_capture_keys
+            + ["R2"]
+            + [str(item["key"]) for item in param_columns]
+            + ["SSE", "Error"]
+        )
+        rows = []
+        for row in list(getattr(self, "batch_results", []) or []):
+            file_name = stem_for_file_ref(row.get("file", ""))
+            captures = dict(row.get("captures") or {})
+            params = self._as_float_array(row.get("params"))
+            boundary_values = self._as_float_array(row.get("boundary_values"))
+            r2_val = row.get("r2")
+            sse_val = row.get("fit_sse")
+            error_text = self._batch_row_error_text(row)
+            param_values = []
+            for item in param_columns:
+                idx = int(item["index"])
+                if item["kind"] == "param":
+                    value = float(params[idx]) if params.size > idx else ""
+                else:
+                    value = (
+                        float(boundary_values[idx])
+                        if boundary_values.size > idx
+                        else ""
+                    )
+                if isinstance(value, (float, np.floating)):
+                    param_values.append(f"{float(value):.6f}")
+                else:
+                    param_values.append(value)
+            rows.append(
+                [file_name]
+                + [captures.get(key, "") for key in self.batch_capture_keys]
+                + [f"{r2_val:.6f}" if r2_val is not None else ""]
+                + param_values
+                + [f"{float(sse_val):.6g}" if sse_val is not None else ""]
+                + [error_text]
+            )
+        return columns, rows
+
+    def _table_export_rows_to_batch_results(self, payload):
+        """Convert exported CSV-style table payload back into batch row objects."""
+        table_payload = dict(payload.get("batch_table_export") or {})
+        columns = [str(col) for col in list(table_payload.get("columns") or [])]
+        rows = list(table_payload.get("rows") or [])
+        if not columns or not rows:
+            return []
+        if "File" not in columns or "R2" not in columns or "SSE" not in columns:
+            return []
+        try:
+            file_idx = columns.index("File")
+            r2_idx = columns.index("R2")
+            sse_idx = columns.index("SSE")
+            error_idx = columns.index("Error")
+        except Exception:
+            return []
+
+        capture_keys = columns[file_idx + 1 : r2_idx]
+        param_key_to_item = {
+            str(item["key"]): dict(item)
+            for item in self._batch_parameter_column_items()
+        }
+        param_cols = columns[r2_idx + 1 : sse_idx]
+        current_params = list(self.get_current_params())
+        imported = []
+        for row_values in rows:
+            values = list(row_values) if isinstance(row_values, (list, tuple)) else []
+            if len(values) < len(columns):
+                values += [""] * (len(columns) - len(values))
+            file_stem = str(values[file_idx]).strip()
+            if not file_stem:
+                continue
+            captures = {
+                str(capture_key): str(values[file_idx + 1 + idx]).strip()
+                for idx, capture_key in enumerate(capture_keys)
+            }
+            params_map = {}
+            boundaries_map = {}
+            for idx, col_name in enumerate(param_cols, start=r2_idx + 1):
+                item = param_key_to_item.get(str(col_name))
+                if item is None:
+                    continue
+                numeric = self._json_float_or_none(values[idx])
+                if numeric is None:
+                    continue
+                if item.get("kind") == "param":
+                    params_map[int(item["index"])] = float(numeric)
+                else:
+                    boundaries_map[int(item["index"])] = float(numeric)
+
+            param_values = []
+            for i in range(len(self.param_specs)):
+                if i in params_map:
+                    param_values.append(float(params_map[i]))
+                else:
+                    fallback = current_params[i] if i < len(current_params) else 0.0
+                    param_values.append(float(fallback))
+
+            expected_boundaries = max(
+                0,
+                len(self._piecewise_model.segment_exprs) - 1
+                if self._piecewise_model is not None
+                else 0,
+            )
+            boundary_values = []
+            for i in range(expected_boundaries):
+                if i in boundaries_map:
+                    boundary_values.append(float(boundaries_map[i]))
+
+            error_text = (
+                str(values[error_idx]).strip() if error_idx < len(values) else ""
+            )
+            imported.append(
+                {
+                    "file_stem": file_stem,
+                    "captures": captures,
+                    "params": param_values,
+                    "r2": self._json_float_or_none(values[r2_idx]),
+                    "fit_sse": self._json_float_or_none(values[sse_idx]),
+                    "error": error_text if error_text else None,
+                    "boundary_values": (
+                        boundary_values
+                        if len(boundary_values) == expected_boundaries
+                        else None
+                    ),
+                }
+            )
+        return imported
+
+    def _collect_fit_details_payload(self):
+        ratios = self._float_list_or_none(getattr(self, "current_boundary_ratios", []))
+        table_columns, table_rows = self._batch_table_export_matrix()
+        payload = {
+            "format": "manual_fit_gui_details",
+            "version": 1,
+            "saved_at_utc": datetime.now(timezone.utc).isoformat(),
+            "gui": {
+                "equation": str(getattr(self, "current_expression", "")).strip(),
+                "x_channel": str(getattr(self, "x_channel", "")).strip(),
+                "y_channel": str(getattr(self, "y_channel", "")).strip(),
+                "show_channels": bool(
+                    getattr(self, "show_channels_cb", None)
+                    and self.show_channels_cb.isChecked()
+                ),
+                "smoothing_enabled": bool(getattr(self, "smoothing_enabled", False)),
+                "smoothing_window": int(getattr(self, "smoothing_window", 1) or 1),
+                "capture_pattern": (
+                    self.regex_input.text().strip()
+                    if hasattr(self, "regex_input")
+                    else ""
+                ),
+                "capture_to_param": {
+                    str(key): (str(value) if value not in (None, "") else None)
+                    for key, value in dict(
+                        getattr(self, "param_capture_map", {}) or {}
+                    ).items()
+                },
+                "param_to_capture": {
+                    str(key): (str(value) if value not in (None, "") else None)
+                    for key, value in dict(
+                        self._current_param_capture_map() or {}
+                    ).items()
+                },
+                "boundary_ratios": ratios if ratios is not None else [],
+            },
+            "parameters": self._serialize_fit_parameter_specs(),
+            "batch_results": self._serialize_fit_batch_rows(),
+            "batch_table_export": {
+                "columns": table_columns,
+                "rows": table_rows,
+            },
+        }
+        return payload
+
+    def _write_fit_details_file(self, file_path, *, quiet):
+        path = Path(file_path).expanduser()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = self._collect_fit_details_payload()
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, ensure_ascii=True)
+        if not quiet:
+            self.stats_text.append(f"✓ Saved fit details to {path}")
+        return True
+
+    def _autosave_fit_details(self):
+        if bool(getattr(self, "_fit_details_restore_in_progress", False)):
+            return False
+        sidecar = self._fit_details_sidecar_path()
+        if sidecar is None:
+            return False
+        try:
+            return self._write_fit_details_file(sidecar, quiet=True)
+        except Exception as exc:
+            self.stats_text.append(f"✗ Auto-save fit details failed: {exc}")
+            return False
+
+    def export_fit_details(self):
+        sidecar = self._fit_details_sidecar_path()
+        start_path = (
+            sidecar if sidecar is not None else Path.cwd() / FIT_DETAILS_FILENAME
+        )
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Fit Details",
+            str(start_path),
+            "JSON Files (*.json);;All Files (*.*)",
+        )
+        if not file_path:
+            return
+        try:
+            self._write_fit_details_file(file_path, quiet=False)
+        except Exception as exc:
+            self.stats_text.append(f"✗ Export fit details failed: {exc}")
+
+    def _resolve_import_file_ref(self, row_data):
+        file_ref = str(row_data.get("file") or "").strip()
+        if file_ref and file_ref in self.data_files:
+            return file_ref
+        stem = str(row_data.get("file_stem") or "").strip()
+        if not stem and file_ref:
+            stem = stem_for_file_ref(file_ref)
+        if not stem:
+            return None
+        matches = [
+            data_file
+            for data_file in self.data_files
+            if stem_for_file_ref(data_file) == stem
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        return None
+
+    def _apply_imported_batch_rows(self, payload):
+        imported_rows = list(payload.get("batch_results") or [])
+        if not imported_rows and isinstance(payload.get("batch"), Mapping):
+            imported_rows = list(payload.get("batch", {}).get("results") or [])
+        if not imported_rows:
+            imported_rows = self._table_export_rows_to_batch_results(payload)
+        if not imported_rows:
+            return (0, 0)
+        if not self.data_files:
+            return (0, len(imported_rows))
+
+        existing_by_file = {
+            str(row.get("file")): dict(row)
+            for row in list(getattr(self, "batch_results", []) or [])
+            if str(row.get("file") or "").strip()
+        }
+        for source_index, file_ref in enumerate(self.data_files):
+            if file_ref not in existing_by_file:
+                existing_by_file[file_ref] = make_batch_result_row(
+                    source_index=source_index,
+                    file_path=file_ref,
+                    x_channel=self.x_channel,
+                    y_channel=self.y_channel,
+                    captures={},
+                )
+
+        applied = 0
+        skipped = 0
+        expected_boundaries = max(
+            0,
+            len(self._piecewise_model.segment_exprs) - 1
+            if self._piecewise_model is not None
+            else 0,
+        )
+        expected_params = len(self.param_specs)
+
+        for raw_row in imported_rows:
+            if not isinstance(raw_row, Mapping):
+                skipped += 1
+                continue
+            file_ref = self._resolve_import_file_ref(raw_row)
+            if not file_ref:
+                skipped += 1
+                continue
+            row = dict(existing_by_file.get(file_ref) or {})
+            row["file"] = file_ref
+            row["captures"] = dict(raw_row.get("captures") or row.get("captures") or {})
+            row["x_channel"] = self.x_channel
+            row["y_channel"] = self.y_channel
+            row["error"] = (
+                str(raw_row.get("error"))
+                if raw_row.get("error") not in (None, "")
+                else None
+            )
+            row["pattern_error"] = (
+                str(raw_row.get("pattern_error"))
+                if raw_row.get("pattern_error") not in (None, "")
+                else row.get("pattern_error")
+            )
+            row["fit_sse"] = self._json_float_or_none(raw_row.get("fit_sse"))
+            row["r2"] = self._json_float_or_none(raw_row.get("r2"))
+            row["fit_diagnostics"] = dict(raw_row.get("fit_diagnostics") or {})
+            row["fit_stage"] = row["fit_diagnostics"].get("selected_stage")
+
+            params = self._as_float_array(raw_row.get("params"))
+            if params.size > 0:
+                if params.size >= expected_params:
+                    row["params"] = [
+                        float(params[idx]) for idx in range(expected_params)
+                    ]
+                else:
+                    padded = list(self.get_current_params())
+                    for idx, value in enumerate(params.tolist()):
+                        if idx < len(padded):
+                            padded[idx] = float(value)
+                    row["params"] = padded
+
+            boundary_ratios = self._as_float_array(raw_row.get("boundary_ratios"))
+            if boundary_ratios.size == expected_boundaries:
+                row["boundary_ratios"] = np.clip(boundary_ratios, 0.0, 1.0)
+
+            boundary_values = self._as_float_array(raw_row.get("boundary_values"))
+            if boundary_values.size == expected_boundaries:
+                row["boundary_values"] = boundary_values
+
+            row["plot_full"] = None
+            row["plot"] = None
+            row["plot_render_size"] = None
+            row["plot_has_fit"] = has_nonempty_values(row.get("params"))
+            existing_by_file[file_ref] = row
+            applied += 1
+
+        ordered_rows = []
+        for source_index, file_ref in enumerate(self.data_files):
+            row = dict(existing_by_file.get(file_ref) or {})
+            row["_source_index"] = int(source_index)
+            row["file"] = file_ref
+            row["x_channel"] = self.x_channel
+            row["y_channel"] = self.y_channel
+            ordered_rows.append(row)
+
+        self.batch_results = ordered_rows
+        self._rebuild_batch_capture_keys_from_rows()
+        self.update_batch_table()
+        self._refresh_batch_analysis_if_run()
+        self.queue_visible_thumbnail_render()
+        current_file = self._current_loaded_file_path()
+        if current_file and self._apply_batch_params_for_file(current_file):
+            self.update_plot(fast=False)
+        return applied, skipped
+
+    def _apply_fit_details_payload(self, payload, *, source_path=None, auto_load=False):
+        if not isinstance(payload, Mapping):
+            raise ValueError("Fit details file must contain a JSON object.")
+
+        gui = dict(payload.get("gui") or {})
+        if not gui and isinstance(payload.get("settings"), Mapping):
+            gui = dict(payload.get("settings") or {})
+        expression_text = str(
+            gui.get("equation")
+            or gui.get("expression")
+            or payload.get("equation")
+            or payload.get("expression")
+            or ""
+        ).strip()
+
+        self._fit_details_restore_in_progress = True
+        try:
+            expression_applied = False
+            if expression_text:
+                self.current_expression = expression_text
+                self._set_expression_editor_text(expression_text)
+                if not self.apply_expression_from_input():
+                    raise ValueError("Failed to apply stored equation.")
+                expression_applied = True
+
+            imported_params = list(payload.get("parameters") or [])
+            if imported_params:
+                spec_by_key = {}
+                value_by_key = {}
+                for entry in imported_params:
+                    if not isinstance(entry, Mapping):
+                        continue
+                    key = str(entry.get("key") or "").strip()
+                    if not key:
+                        continue
+                    fallback = next(
+                        (spec for spec in self.param_specs if spec.key == key), None
+                    )
+                    if fallback is None:
+                        continue
+                    min_value = self._json_float_or_none(entry.get("min_value"))
+                    max_value = self._json_float_or_none(entry.get("max_value"))
+                    if min_value is None:
+                        min_value = float(fallback.min_value)
+                    if max_value is None:
+                        max_value = float(fallback.max_value)
+                    if min_value > max_value:
+                        min_value, max_value = max_value, min_value
+                    default_value = self._json_float_or_none(entry.get("default"))
+                    if default_value is None:
+                        default_value = float(fallback.default)
+                    default_value = float(np.clip(default_value, min_value, max_value))
+                    decimals = entry.get("decimals")
+                    try:
+                        decimals = int(decimals)
+                    except Exception:
+                        decimals = int(fallback.decimals)
+                    decimals = max(0, min(12, decimals))
+                    spec_by_key[key] = ParameterSpec(
+                        key=key,
+                        symbol=str(entry.get("symbol") or fallback.symbol),
+                        description=str(
+                            entry.get("description") or fallback.description
+                        ),
+                        default=default_value,
+                        min_value=min_value,
+                        max_value=max_value,
+                        decimals=decimals,
+                    )
+                    value_by_key[key] = {
+                        "ui_min": entry.get("ui_min"),
+                        "ui_max": entry.get("ui_max"),
+                        "value": entry.get("value"),
+                    }
+
+                if spec_by_key:
+                    merged_specs = []
+                    for spec in self.param_specs:
+                        merged_specs.append(spec_by_key.get(spec.key, spec))
+                    self.param_specs = merged_specs
+                    self.defaults = self._default_param_values(self.param_specs)
+                    self.rebuild_manual_param_controls()
+
+                    for spec in self.param_specs:
+                        state = value_by_key.get(spec.key)
+                        if state is None:
+                            continue
+                        min_box = self.param_min_spinboxes.get(spec.key)
+                        max_box = self.param_max_spinboxes.get(spec.key)
+                        spinbox = self.param_spinboxes.get(spec.key)
+                        if min_box is None or max_box is None or spinbox is None:
+                            continue
+                        low = self._json_float_or_none(state.get("ui_min"))
+                        high = self._json_float_or_none(state.get("ui_max"))
+                        if low is None:
+                            low = float(spec.min_value)
+                        if high is None:
+                            high = float(spec.max_value)
+                        if low > high:
+                            low, high = high, low
+                        min_box.setValue(float(low))
+                        max_box.setValue(float(high))
+                        value = self._json_float_or_none(state.get("value"))
+                        if value is None:
+                            value = float(spec.default)
+                        spinbox.setValue(float(np.clip(value, low, high)))
+
+            x_channel = str(gui.get("x_channel") or "").strip()
+            y_channel = str(gui.get("y_channel") or "").strip()
+            channel_names = list(self._available_channel_names())
+            if x_channel in channel_names and hasattr(self, "x_channel_combo"):
+                idx = self.x_channel_combo.findData(x_channel)
+                if idx >= 0:
+                    self.x_channel_combo.setCurrentIndex(idx)
+            if (
+                (not expression_applied)
+                and y_channel in channel_names
+                and hasattr(self, "y_channel_combo")
+            ):
+                idx = self.y_channel_combo.findData(y_channel)
+                if idx >= 0:
+                    self.y_channel_combo.setCurrentIndex(idx)
+
+            if hasattr(self, "show_channels_cb"):
+                show_channels = bool(gui.get("show_channels", True))
+                self.show_channels_cb.blockSignals(True)
+                self.show_channels_cb.setChecked(show_channels)
+                self.show_channels_cb.blockSignals(False)
+
+            if hasattr(self, "smoothing_toggle_btn"):
+                self.smoothing_toggle_btn.setChecked(
+                    bool(gui.get("smoothing_enabled", self.smoothing_enabled))
+                )
+            if hasattr(self, "smoothing_window_spin"):
+                window = int(gui.get("smoothing_window", self.smoothing_window) or 1)
+                self.smoothing_window_spin.setValue(max(1, window))
+            self._on_smoothing_controls_changed()
+
+            if hasattr(self, "regex_input"):
+                pattern_text = str(gui.get("capture_pattern") or "").strip()
+                self.regex_input.blockSignals(True)
+                self.regex_input.setText(pattern_text)
+                self.regex_input.blockSignals(False)
+
+            mapping = dict(gui.get("capture_to_param") or {})
+            self.param_capture_map = {
+                str(key): (str(value) if value not in (None, "") else None)
+                for key, value in mapping.items()
+            }
+            self._refresh_param_capture_mapping_controls()
+
+            ratio_values = gui.get("boundary_ratios")
+            if ratio_values is not None:
+                ratios = self._as_float_array(ratio_values)
+                expected = max(
+                    0,
+                    len(self._piecewise_model.segment_exprs) - 1
+                    if self._piecewise_model is not None
+                    else 0,
+                )
+                if ratios.size == expected:
+                    self.current_boundary_ratios = np.clip(ratios, 0.0, 1.0)
+                    self._sync_breakpoint_sliders_from_state()
+
+            applied_rows, skipped_rows = self._apply_imported_batch_rows(payload)
+
+            if source_path is not None:
+                load_mode = "Auto-loaded" if auto_load else "Imported"
+                self.stats_text.append(
+                    f"✓ {load_mode} fit details from {Path(source_path).name}"
+                )
+            if applied_rows > 0:
+                self.stats_text.append(
+                    f"Applied fit details to {applied_rows} file(s)."
+                )
+            if skipped_rows > 0:
+                self.stats_text.append(
+                    f"Skipped {skipped_rows} saved file row(s) that did not match current files."
+                )
+            self.update_plot(fast=False)
+        finally:
+            self._fit_details_restore_in_progress = False
+
+    def _load_fit_details_file(self, file_path, *, auto_load):
+        path = Path(file_path).expanduser()
+        if not path.exists():
+            if not auto_load:
+                self.stats_text.append(f"Fit details file not found: {path}")
+            return False
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except Exception as exc:
+            self.stats_text.append(f"✗ Failed to read fit details: {exc}")
+            return False
+        try:
+            self._apply_fit_details_payload(
+                payload, source_path=path, auto_load=auto_load
+            )
+            return True
+        except Exception as exc:
+            self.stats_text.append(f"✗ Failed to apply fit details: {exc}")
+            return False
+
+    def import_fit_details(self):
+        sidecar = self._fit_details_sidecar_path()
+        start_dir = (
+            sidecar.parent if sidecar is not None else self._source_dialog_start_dir()
+        )
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Import Fit Details",
+            str(start_dir / FIT_DETAILS_FILENAME),
+            "JSON Files (*.json);;All Files (*.*)",
+        )
+        if not file_path:
+            return
+        self._load_fit_details_file(file_path, auto_load=False)
+
+    def _autoload_fit_details_from_source(self):
+        if bool(getattr(self, "_fit_details_restore_in_progress", False)):
+            return False
+        sidecar = self._fit_details_sidecar_path()
+        if sidecar is None or not sidecar.exists():
+            return False
+        return self._load_fit_details_file(sidecar, auto_load=True)
+
+    def _upsert_batch_row_from_fit(
+        self,
+        file_path,
+        ordered_keys,
+        fit_result,
+        fit_diagnostics,
+    ):
+        if not file_path:
+            return None
+        diagnostics = dict(fit_diagnostics or {})
+        params_by_key = dict((fit_result or {}).get("params_by_key") or {})
+        row_params = [float(params_by_key.get(key, 0.0)) for key in ordered_keys]
+        row_r2 = (
+            float(fit_result["r2"])
+            if fit_result is not None and fit_result.get("r2") is not None
+            else None
+        )
+        row_sse = (
+            float(fit_result["sse"])
+            if fit_result is not None and fit_result.get("sse") is not None
+            else None
+        )
+        row_stage = diagnostics.get("selected_stage")
+        boundary_vals = (
+            fit_result.get("boundary_ratios") if isinstance(fit_result, dict) else None
+        )
+        if boundary_vals is not None:
+            try:
+                boundary_vals = np.asarray(boundary_vals, dtype=float).reshape(-1)
+            except Exception:
+                boundary_vals = None
+        boundary_x_vals = None
+        if boundary_vals is not None:
+            try:
+                x_values = self._get_channel_data(self.x_channel)
+                n_boundaries = (
+                    max(0, len(self._piecewise_model.segment_exprs) - 1)
+                    if self._piecewise_model is not None
+                    else int(np.asarray(boundary_vals, dtype=float).size)
+                )
+                boundary_x_vals = boundary_ratios_to_x_values(
+                    boundary_vals,
+                    x_values,
+                    n_boundaries,
+                )
+            except Exception:
+                boundary_x_vals = None
+
+        row_idx = self._find_batch_result_index_by_file(file_path)
+        if row_idx is None:
+            captures = {}
+            pattern_error = None
+            capture_config = self._resolve_batch_capture_config(show_errors=False)
+            if capture_config is not None:
+                extracted = extract_captures(
+                    stem_for_file_ref(file_path),
+                    capture_config.regex,
+                    capture_config.defaults,
+                )
+                if extracted is None:
+                    pattern_error = _BATCH_PATTERN_MISMATCH_ERROR
+                else:
+                    captures = dict(extracted)
+            row = make_batch_result_row(
+                source_index=len(self.batch_results),
+                file_path=file_path,
+                x_channel=self.x_channel,
+                y_channel=self.y_channel,
+                captures=captures,
+                pattern_error=pattern_error,
+            )
+            self.batch_results.append(row)
+            row_idx = len(self.batch_results) - 1
+        else:
+            row = self.batch_results[row_idx]
+
+        row["params"] = list(row_params)
+        row["r2"] = row_r2
+        row["fit_stage"] = row_stage
+        row["fit_sse"] = row_sse
+        row["fit_diagnostics"] = diagnostics
+        row["boundary_ratios"] = boundary_vals
+        row["boundary_values"] = boundary_x_vals
+        row["error"] = None
+        row["x_channel"] = self.x_channel
+        row["y_channel"] = self.y_channel
+        row["plot_full"] = None
+        row["plot"] = None
+        row["plot_render_size"] = None
+        row["plot_has_fit"] = True
+        self.batch_results[row_idx] = row
+        self._rebuild_batch_capture_keys_from_rows()
+
+        if self.batch_table.rowCount() != len(self.batch_results):
+            self.update_batch_table()
+        else:
+            table_row_idx = self._find_table_row_by_file(file_path)
+            if table_row_idx is None:
+                self.update_batch_table()
+            else:
+                self.update_batch_table_row(table_row_idx, row)
+        self._start_thumbnail_render(row_indices=[row_idx])
+        return row_idx
+
     def _on_batch_row_resized_by_user(self, _logical_index, _old_size, new_size):
         if self._batch_row_height_sync:
             return
@@ -5668,7 +8389,7 @@ class ManualFitGUI(QMainWindow):
         self.batch_files = list(self.data_files)
 
         if sync_pattern and hasattr(self, "regex_input") and self.batch_files:
-            first_name = display_name_for_file_ref(self.batch_files[0])
+            first_name = stem_for_file_ref(self.batch_files[0])
             if self.regex_input.text() != first_name:
                 self.regex_input.blockSignals(True)
                 self.regex_input.setText(first_name)
@@ -5701,7 +8422,7 @@ class ManualFitGUI(QMainWindow):
         captures,
         pattern_error=None,
         existing=None,
-        preserve_fit_result=False,
+        preserve_fit_result=True,
     ):
         existing_row = existing or {}
         existing_plot_full = None
@@ -5709,7 +8430,7 @@ class ManualFitGUI(QMainWindow):
         existing_plot_render_size = None
         existing_plot_has_fit = existing_row.get("plot_has_fit")
         if existing_plot_has_fit is None:
-            existing_plot_has_fit = bool(existing_row.get("params"))
+            existing_plot_has_fit = has_nonempty_values(existing_row.get("params"))
         if preserve_fit_result:
             existing_plot_full = existing_row.get("plot_full")
             if existing_plot_full is None:
@@ -5743,21 +8464,16 @@ class ManualFitGUI(QMainWindow):
             plot_render_size=(
                 existing_plot_render_size if existing_plot_full is not None else None
             ),
-            fit_attempts=(
-                existing_row.get("fit_attempts") if preserve_fit_result else None
+            boundary_ratios=(
+                existing_row.get("boundary_ratios") if preserve_fit_result else None
             ),
-            fit_best_sse=(
-                existing_row.get("fit_best_sse") if preserve_fit_result else None
+            boundary_values=(
+                existing_row.get("boundary_values") if preserve_fit_result else None
             ),
-            fit_mode=existing_row.get("fit_mode") if preserve_fit_result else None,
-            fit_seed=existing_row.get("fit_seed") if preserve_fit_result else None,
-            fit_requested_starts=(
-                existing_row.get("fit_requested_starts")
-                if preserve_fit_result
-                else None
-            ),
-            fit_de_used=(
-                existing_row.get("fit_de_used") if preserve_fit_result else None
+            fit_stage=existing_row.get("fit_stage") if preserve_fit_result else None,
+            fit_sse=existing_row.get("fit_sse") if preserve_fit_result else None,
+            fit_diagnostics=(
+                existing_row.get("fit_diagnostics") if preserve_fit_result else None
             ),
             pattern_error=pattern_error,
         )
@@ -5800,10 +8516,11 @@ class ManualFitGUI(QMainWindow):
             self.stats_text.setText(str(empty_message))
             self._clear_main_plot("No data loaded.")
             self._sync_file_navigation_buttons()
+            self._refresh_fit_action_buttons()
             return False
 
         for file_ref in self.data_files:
-            self.file_combo.addItem(display_name_for_file_ref(file_ref), file_ref)
+            self.file_combo.addItem(stem_for_file_ref(file_ref), file_ref)
         self._sync_file_navigation_buttons()
 
         self._sync_batch_files_from_shared(sync_pattern=True)
@@ -5817,12 +8534,13 @@ class ManualFitGUI(QMainWindow):
 
         if loaded_ok:
             if loaded_idx > 0:
-                loaded_name = display_name_for_file_ref(self.data_files[loaded_idx])
+                loaded_name = stem_for_file_ref(self.data_files[loaded_idx])
                 self.stats_text.setText(
                     f"Loaded '{loaded_name}' after skipping {loaded_idx} unreadable source file(s)."
                 )
             elif self.stats_text.text().strip() == "Loading data sources...":
                 self.stats_text.clear()
+            self._autoload_fit_details_from_source()
             self._sync_file_navigation_buttons()
             return True
 
@@ -5917,8 +8635,16 @@ class ManualFitGUI(QMainWindow):
         self.ax_residual = None
         self._plot_has_residual_axis = False
         self.ax.grid(True, alpha=0.25)
-        self.ax.set_xlabel("Time (ms)")
-        self.ax.set_ylabel(self.y_channel if hasattr(self, "y_channel") else "Signal")
+        self.ax.set_xlabel(
+            self._channel_axis_label(self.x_channel)
+            if hasattr(self, "x_channel")
+            else "X"
+        )
+        self.ax.set_ylabel(
+            self._channel_axis_label(self.y_channel)
+            if hasattr(self, "y_channel")
+            else "Signal"
+        )
         if message:
             self.ax.text(
                 0.5,
@@ -5930,9 +8656,6 @@ class ManualFitGUI(QMainWindow):
                 color="#6b7280",
                 fontsize=10,
             )
-        self._fit_window_bounds_ms = (None, None)
-        self._fit_boundary_positions_ms = ()
-        self._recreate_fit_region_selector()
         self._reset_plot_home_view()
         self.canvas.draw_idle()
 
@@ -5954,10 +8677,8 @@ class ManualFitGUI(QMainWindow):
                 self.file_combo.blockSignals(False)
             self.last_popt = None
             self.last_pcov = None
-            self.last_fit_r2 = None
-            self.last_full_r2 = None
-            self._last_r2_fit = None
-            self._last_r2_full = None
+            self.last_r2 = None
+            self._last_r2 = None
 
             try:
                 file_path = self.data_files[idx]
@@ -5983,8 +8704,10 @@ class ManualFitGUI(QMainWindow):
                         continue
                 self._rebuild_channel_cache_from_raw()
                 self._refresh_channel_combos()
+                self._apply_param_spec_defaults_to_controls()
+                self._refresh_param_capture_mapping_controls()
                 self._apply_batch_params_for_file(file_path)
-                self.update_plot(fast=False)
+                self.update_plot(fast=False, preserve_view=False)
                 self._reset_plot_home_view()
                 loaded_ok = True
             except Exception as e:
@@ -5994,7 +8717,7 @@ class ManualFitGUI(QMainWindow):
                 self.channel_cache = {}
                 self._expression_channel_data_cache = None
                 file_path = self.data_files[idx]
-                file_name = display_name_for_file_ref(file_path)
+                file_name = stem_for_file_ref(file_path)
                 self._last_file_load_error = f"Error loading '{file_name}': {e}"
                 if report_errors:
                     self.stats_text.setText(self._last_file_load_error)
@@ -6002,6 +8725,7 @@ class ManualFitGUI(QMainWindow):
         finally:
             self._file_load_in_progress = False
             self._sync_file_navigation_buttons()
+            self._refresh_fit_action_buttons()
         return loaded_ok
 
     def on_file_changed(self, idx):
@@ -6038,19 +8762,33 @@ class ManualFitGUI(QMainWindow):
 
         matched_row = None
         for row in self.batch_results:
-            if row.get("file") == file_path and row.get("params"):
-                matched_row = row
-                break
+            if row.get("file") != file_path:
+                continue
+            params = row.get("params")
+            if params is None:
+                continue
+            try:
+                if len(params) <= 0:
+                    continue
+            except Exception:
+                continue
+            matched_row = row
+            break
         if matched_row is None:
             return False
 
         params = matched_row.get("params")
-        if not isinstance(params, (list, tuple)):
+        if params is None:
+            return False
+        try:
+            params = list(np.asarray(params, dtype=float).reshape(-1))
+        except Exception:
             return False
         if len(params) < len(self.param_specs):
             return False
 
         changed = False
+        boundary_changed = False
         for idx, spec in enumerate(self.param_specs):
             spinbox = self.param_spinboxes.get(spec.key)
             if spinbox is None:
@@ -6061,10 +8799,47 @@ class ManualFitGUI(QMainWindow):
                 continue
             if not np.isfinite(value):
                 continue
+            min_box = self.param_min_spinboxes.get(spec.key)
+            max_box = self.param_max_spinboxes.get(spec.key)
+            if min_box is not None and value < float(min_box.value()):
+                min_box.setValue(value)
+            if max_box is not None and value > float(max_box.value()):
+                max_box.setValue(value)
             if not np.isclose(float(spinbox.value()), value):
                 changed = True
             spinbox.setValue(value)
-        return changed
+        boundary_ratios = matched_row.get("boundary_ratios")
+        if boundary_ratios is not None:
+            try:
+                b = np.asarray(boundary_ratios, dtype=float).reshape(-1)
+            except Exception:
+                b = np.asarray([], dtype=float)
+            expected = max(
+                0,
+                len(self._piecewise_model.segment_exprs) - 1
+                if self._piecewise_model is not None
+                else 0,
+            )
+            if b.size == expected:
+                new_boundary = np.clip(b, 0.0, 1.0)
+                old_boundary = np.asarray(
+                    getattr(
+                        self,
+                        "current_boundary_ratios",
+                        default_boundary_ratios(expected),
+                    ),
+                    dtype=float,
+                ).reshape(-1)
+                if old_boundary.size != expected or not np.allclose(
+                    old_boundary,
+                    new_boundary,
+                    atol=1e-12,
+                    rtol=0.0,
+                ):
+                    boundary_changed = True
+                self.current_boundary_ratios = new_boundary
+        self._sync_breakpoint_sliders_from_state()
+        return bool(changed or boundary_changed)
 
     def reset_params(self):
         """Reset all parameter values to midpoint of their current bounds."""
@@ -6074,6 +8849,32 @@ class ManualFitGUI(QMainWindow):
                 continue
             value = float((float(spinbox.minimum()) + float(spinbox.maximum())) * 0.5)
             spinbox.setValue(value)
+
+    def reset_params_from_batch(self):
+        """Load parameter values for the current file from batch results."""
+        current_file = self._current_loaded_file_path()
+        if not current_file:
+            self.stats_text.append("No current file loaded.")
+            return
+        if self._is_file_fit_active(current_file):
+            self.stats_text.append("Cannot reset from batch while a fit is running.")
+            return
+        row_idx = self._find_batch_result_index_by_file(current_file)
+        if row_idx is None or not has_nonempty_values(
+            self.batch_results[row_idx].get("params")
+        ):
+            self.stats_text.append("No batch-fit parameters found for this file.")
+            return
+        changed = self._apply_batch_params_for_file(current_file)
+        if changed:
+            self.update_plot(fast=False)
+            self.stats_text.append(
+                "Loaded parameters from batch table for current file."
+            )
+        else:
+            self.stats_text.append(
+                "Current parameters already match batch table values."
+            )
 
     def do_full_update(self):
         """Perform a complete update including stats."""
@@ -6147,142 +8948,153 @@ class ManualFitGUI(QMainWindow):
         self._load_selected_csv_files(selected_csvs)
 
     def auto_fit(self):
+        """Start the default piecewise auto-fit in a worker thread."""
+        self._start_auto_fit(FIT_MODE_PIECEWISE)
+
+    def auto_fit_curve(self):
+        """Start standard curve_fit auto-fit in a worker thread."""
+        self._start_auto_fit(FIT_MODE_CURVE_FIT)
+
+    def _start_auto_fit(self, fit_mode: Optional[str]):
         """Start auto-fit in a worker thread to keep GUI responsive."""
         if self.current_data is None:
             self.stats_text.append("No data loaded!")
             return
 
-        if self.fit_thread is not None:
-            self.stats_text.append("Auto-fit is already running.")
+        current_file = self._current_loaded_file_path()
+        if not current_file:
+            self.stats_text.append("No current file loaded!")
             return
 
-        x_all = self._get_channel_data(self.x_channel)
-        y_all = self._get_channel_data(self.y_channel)
-        fit_slice = self.get_fit_slice(len(x_all))
-        x_data = x_all[fit_slice]
-        y_data = y_all[fit_slice]
-        fit_channels = self._slice_channel_data(
-            self._expression_channel_data(), fit_slice
-        )
+        selected_mode = normalize_fit_mode(fit_mode)
+        active_tasks = self._active_fit_tasks_for_file(current_file)
+        active_manual_modes = {
+            normalize_fit_mode(meta.get("fit_mode"))
+            for meta in active_tasks
+            if str(meta.get("kind")) == "manual"
+        }
+        if selected_mode in active_manual_modes:
+            self.cancel_auto_fit()
+            return
+        if active_tasks:
+            self.stats_text.append("Current file already has a fit in progress.")
+            return
+
+        fixed_params, mapping_error = self._current_file_fixed_params_from_mapping()
+        if mapping_error:
+            self.stats_text.append(f"Fit setup error: {mapping_error}")
+            return
 
         try:
-            fit_context = self._build_fit_context(channel_data=fit_channels)
+            # Seed from current UI controls so refits follow the slider state.
+            fit_context = self._build_fit_context(
+                fixed_params=fixed_params,
+                fit_mode=fit_mode,
+            )
         except Exception as exc:
             self.stats_text.append(f"Fit setup error: {exc}")
             return
 
-        self._active_fit_keys = list(fit_context["active_keys"])
-        self._fit_ordered_keys = list(fit_context["ordered_keys"])
-        self._fit_base_values = dict(fit_context["base_values"])
-        fit_options = self._current_fit_optimization_options()
-        self.last_fit_diagnostics = None
+        capture_config = self._resolve_batch_capture_config(show_errors=False)
+        if capture_config is None:
+            capture_config = parse_capture_pattern("")
 
-        self.fit_thread = QThread(self)
-        self.fit_worker = FitWorker(
-            x_data,
-            y_data,
-            fit_context["p0"],
-            fit_context["bounds"],
-            fit_context["fit_model"],
-            fit_options,
+        source_index = int(getattr(self, "current_file_idx", 0))
+        self._start_file_fit_task(
+            kind="manual",
+            file_path=current_file,
+            source_index=source_index,
+            fit_context=fit_context,
+            capture_regex_pattern=capture_config.regex_pattern,
+            capture_defaults=capture_config.defaults,
+            parameter_capture_map=self._current_param_capture_map(),
         )
-        self.fit_worker.moveToThread(self.fit_thread)
-
-        self.fit_thread.started.connect(self.fit_worker.run)
-        self.fit_worker.finished.connect(self.on_fit_finished)
-        self.fit_worker.failed.connect(self.on_fit_failed)
-        self.fit_worker.cancelled.connect(self.on_fit_cancelled)
-
-        self.auto_fit_btn.setEnabled(False)
-        self.cancel_fit_btn.setEnabled(True)
-        self.auto_fit_btn.setText("Fitting...")
         self.stats_text.append(
-            "\nAuto-fit started "
-            f"({fit_mode_label(fit_options)}, starts={max(2, int(fit_options.n_starts)) if fit_options.enabled else 1}, "
-            f"seed={fit_options.seed}, DE={'on' if fit_options.enabled and fit_options.use_global_init else 'off'})..."
+            f"Auto-fit started for {stem_for_file_ref(current_file)} ({fit_mode_label(selected_mode)}, full trace)."
         )
-        self.fit_thread.start()
+        self._refresh_fit_action_buttons()
 
-    def on_fit_finished(self, popt, pcov, r2, diagnostics):
+    def on_fit_finished(self, fit_result):
         """Handle successful fit completion."""
-        active_params = np.asarray(popt, dtype=float)
-        ordered_keys = (
-            list(self._fit_ordered_keys)
-            if self._fit_ordered_keys
-            else self._ordered_param_keys()
+        model_def = self._piecewise_model
+        if model_def is None:
+            self.on_fit_failed("No compiled piecewise model.")
+            return
+        ordered_keys = list(model_def.global_param_names)
+        params_by_key = dict((fit_result or {}).get("params_by_key") or {})
+        best_params = np.asarray(
+            [float(params_by_key.get(key, 0.0)) for key in ordered_keys], dtype=float
         )
-        active_keys = list(self._active_fit_keys)
-        base_values = (
-            dict(self._fit_base_values)
-            if self._fit_base_values
-            else self.get_current_param_map()
+        self.last_popt = best_params
+        self._last_fit_active_keys = list(ordered_keys)
+        self.last_pcov = None
+        self.last_r2 = (
+            float(fit_result["r2"])
+            if fit_result is not None and fit_result.get("r2") is not None
+            else None
         )
-        merged = self._merge_active_fit_result(
-            ordered_keys, active_keys, base_values, active_params
-        )
-        self.last_popt = np.asarray(merged, dtype=float)
-        self._last_fit_active_keys = list(active_keys)
-        self.last_pcov = np.asarray(pcov, dtype=float)
-        self.last_fit_r2 = float(r2)
+        self._last_r2 = self.last_r2
         self.last_fit_diagnostics = (
-            dict(diagnostics) if isinstance(diagnostics, dict) else {}
+            dict((fit_result or {}).get("diagnostics") or {})
+            if isinstance(fit_result, dict)
+            else {}
         )
-        self.last_full_r2 = None
-        if self.current_data is not None:
-            try:
-                x_all = self._get_channel_data(self.x_channel)
-                y_all = self._get_channel_data(self.y_channel)
-                fitted_all = self.evaluate_model(
-                    x_all,
-                    self.last_popt,
-                    channel_data=self._expression_channel_data(),
-                )
-                self.last_full_r2 = compute_r2(y_all, fitted_all)
-            except Exception:
-                self.last_full_r2 = None
+        if (
+            isinstance(fit_result, dict)
+            and fit_result.get("boundary_ratios") is not None
+        ):
+            self.current_boundary_ratios = np.asarray(
+                fit_result.get("boundary_ratios"),
+                dtype=float,
+            )
+        self._sync_breakpoint_sliders_from_state()
 
         for idx, key in enumerate(ordered_keys):
             if key in self.param_spinboxes and idx < len(self.last_popt):
                 self.param_spinboxes[key].setValue(self.last_popt[idx])
         self.defaults = list(self.last_popt)
 
-        full_r2_text = (
-            f"{self.last_full_r2:.6f}" if self.last_full_r2 is not None else "N/A"
+        mode_used = (
+            self.last_fit_diagnostics.get("fit_mode")
+            if isinstance(self.last_fit_diagnostics, dict)
+            else self._active_fit_mode
         )
+        r2_text = f"{self.last_r2:.6f}" if self.last_r2 is not None else "N/A"
         self.stats_text.append(
-            f"✓ Auto-fit successful! R² (full trace) = {full_r2_text}"
+            f"✓ Auto-fit successful ({fit_mode_label(mode_used)})! R² (full trace) = {r2_text}"
         )
-        diagnostics_text = build_fit_diagnostics_parts(
-            mode=self.last_fit_diagnostics.get("mode"),
-            attempts=self.last_fit_diagnostics.get("attempts"),
-            requested_starts=self.last_fit_diagnostics.get("requested_starts"),
-            seed=self.last_fit_diagnostics.get("seed"),
-            de_used=(
-                self.last_fit_diagnostics.get("de_used")
-                if "de_used" in self.last_fit_diagnostics
-                else None
-            ),
-            best_sse=self.last_fit_diagnostics.get("best_sse"),
-            include_starts_suffix=True,
-        )
-        if diagnostics_text:
-            self.stats_text.append("Fit diagnostics: " + ", ".join(diagnostics_text))
+        if isinstance(fit_result, dict):
+            stage = self.last_fit_diagnostics.get("selected_stage") or "n/a"
+            sse = fit_result.get("sse")
+            sse_text = f"{float(sse):.6g}" if sse is not None else "n/a"
+            self.stats_text.append(f"Fit diagnostics: stage={stage}, SSE={sse_text}")
         summary = ", ".join(
             f"{self._display_name_for_param_key(key)}={self.last_popt[idx]:.4f}"
             for idx, key in enumerate(ordered_keys)
             if idx < len(self.last_popt)
         )
         self.stats_text.append(summary)
+
+        current_file = self._current_loaded_file_path()
+        updated_batch_row = (
+            self._upsert_batch_row_from_fit(
+                current_file,
+                ordered_keys,
+                fit_result,
+                self.last_fit_diagnostics,
+            )
+            is not None
+        )
+
         self.update_plot()
-        self._reset_plot_home_view()
+        if updated_batch_row:
+            self._refresh_batch_analysis_if_run()
+        self._autosave_fit_details()
         self.cleanup_fit_thread()
 
     def on_fit_failed(self, error_text):
         """Handle fit failures."""
         self.stats_text.append(f"✗ Auto-fit failed: {error_text}")
-        self.stats_text.append(
-            "Try increasing Starts / Fev per start, or enable DE Init, then retry."
-        )
         self.cleanup_fit_thread()
 
     def on_fit_cancelled(self):
@@ -6292,8 +9104,21 @@ class ManualFitGUI(QMainWindow):
 
     def cancel_auto_fit(self):
         """Request cancellation of an in-flight auto-fit."""
-        if self.fit_worker is not None:
-            self._request_worker_cancel(self.fit_worker)
+        current_file = self._current_loaded_file_path()
+        if not current_file:
+            return
+        cancelled = False
+        for task_id, task in list(self.fit_tasks.items()):
+            if str(task.get("kind")) != "manual":
+                continue
+            if str(task.get("file_path")) != str(current_file):
+                continue
+            if str(task.get("status")) == "pending":
+                self._finish_fit_task(int(task_id))
+            else:
+                self._request_worker_cancel(task.get("worker"))
+            cancelled = True
+        if cancelled:
             self.stats_text.append("Auto-fit cancellation requested...")
 
     @staticmethod
@@ -6338,12 +9163,13 @@ class ManualFitGUI(QMainWindow):
             self.fit_worker.deleteLater()
         self.fit_thread = None
         self.fit_worker = None
-        self._active_fit_keys = []
-        self._fit_ordered_keys = []
-        self._fit_base_values = {}
         self.auto_fit_btn.setEnabled(True)
-        self.auto_fit_btn.setText("Auto Fit")
-        self.cancel_fit_btn.setEnabled(False)
+        self.auto_fit_btn.setText(self.auto_fit_btn_default_text)
+        self.curve_fit_btn.setEnabled(True)
+        self.curve_fit_btn.setText(self.curve_fit_btn_default_text)
+        if hasattr(self, "reset_from_batch_btn"):
+            self.reset_from_batch_btn.setEnabled(True)
+        self._active_fit_mode = FIT_MODE_PIECEWISE
 
     def cleanup_batch_thread(self, *, force=False):
         self._shutdown_thread(
@@ -6384,17 +9210,6 @@ class ManualFitGUI(QMainWindow):
         stride = max(1, int(np.ceil(n_points / float(target))))
         return np.arange(0, n_points, stride, dtype=int)
 
-    def _fit_mask(self, n_points, fit_slice):
-        mask = np.zeros(int(n_points), dtype=bool)
-        if n_points <= 0:
-            return mask
-        start = int(fit_slice.start) if fit_slice.start is not None else 0
-        stop = int(fit_slice.stop) if fit_slice.stop is not None else n_points
-        start = max(0, min(n_points, start))
-        stop = max(start, min(n_points, stop))
-        mask[start:stop] = True
-        return mask
-
     def _ensure_plot_axes(self, show_residuals):
         if show_residuals == self._plot_has_residual_axis and hasattr(self, "ax"):
             return
@@ -6408,7 +9223,6 @@ class ManualFitGUI(QMainWindow):
             self.ax = self.fig.add_subplot(111)
             self.ax_residual = None
         self._plot_has_residual_axis = bool(show_residuals)
-        self._recreate_fit_region_selector()
 
     def _finite_min_max(self, *arrays):
         y_min = None
@@ -6458,54 +9272,44 @@ class ManualFitGUI(QMainWindow):
             return None
 
         channel_data_full = self._expression_channel_data()
-        time_data = self.cached_time_data
-        if time_data is None or len(time_data) != n_points:
-            time_data = np.arange(n_points, dtype=float)
-
-        fit_slice = self.get_fit_slice(n_points)
-        fit_mask_full = self._fit_mask(n_points, fit_slice)
         display_idx = self._display_indices(n_points)
         if display_idx.size == 0:
             return None
 
-        time_display = time_data[display_idx]
         x_display = x_data[display_idx]
         y_display = y_data[display_idx]
-        fit_mask_display = fit_mask_full[display_idx]
         channel_data_display = self._slice_channel_data(channel_data_full, display_idx)
-
-        time_axis_key = None
-        if self.current_data is not None and len(self.current_data.columns) > 0:
-            if "TIME" in self.current_data.columns:
-                time_axis_key = "TIME"
-            else:
-                time_axis_key = str(self.current_data.columns[0]).strip()
+        show_channels = bool(
+            getattr(self, "show_channels_cb", None)
+            and self.show_channels_cb.isChecked()
+        )
 
         plot_channel_names = []
-        for name in [self.y_channel, self.x_channel]:
-            key = str(name).strip()
-            if not key or key == time_axis_key or key in plot_channel_names:
-                continue
-            if key in channel_data_display:
-                plot_channel_names.append(key)
-
-        if self.current_data is not None:
-            for col in self.current_data.columns:
-                key = str(col).strip()
-                if not key or key == time_axis_key or key in plot_channel_names:
+        if show_channels:
+            for name in [self.y_channel]:
+                key = str(name).strip()
+                if not key or key in plot_channel_names:
                     continue
                 if key in channel_data_display:
                     plot_channel_names.append(key)
-        else:
-            for key in channel_data_display.keys():
-                key_text = str(key).strip()
-                if (
-                    not key_text
-                    or key_text == time_axis_key
-                    or key_text in plot_channel_names
-                ):
-                    continue
-                plot_channel_names.append(key_text)
+
+            if self.current_data is not None:
+                for col in self.current_data.columns:
+                    key = str(col).strip()
+                    if not key or key == self.x_channel or key in plot_channel_names:
+                        continue
+                    if key in channel_data_display:
+                        plot_channel_names.append(key)
+            else:
+                for key in channel_data_display.keys():
+                    key_text = str(key).strip()
+                    if (
+                        not key_text
+                        or key_text == self.x_channel
+                        or key_text in plot_channel_names
+                    ):
+                        continue
+                    plot_channel_names.append(key_text)
 
         plot_channel_displays = {
             key: np.asarray(channel_data_display[key], dtype=float)
@@ -6519,35 +9323,23 @@ class ManualFitGUI(QMainWindow):
             "y_data": y_data,
             "n_points": n_points,
             "channel_data_full": channel_data_full,
-            "time_data": time_data,
-            "fit_slice": fit_slice,
-            "fit_mask_full": fit_mask_full,
             "display_idx": display_idx,
-            "time_display": time_display,
             "x_display": x_display,
             "y_display": y_display,
-            "fit_mask_display": fit_mask_display,
             "channel_data_display": channel_data_display,
             "plot_channel_displays": plot_channel_displays,
         }
 
     def _compute_display_series(self, context):
-        fitted_display_full = self.evaluate_model(
+        fitted_display = self.evaluate_model(
             context["x_display"],
             context["params"],
             channel_data=context["channel_data_display"],
         )
-        fitted_display = fitted_display_full
-
-        residuals_display_full = context["y_display"] - fitted_display_full
-        residuals_display = np.where(
-            context["fit_mask_display"], residuals_display_full, np.nan
-        )
+        residuals_display = context["y_display"] - fitted_display
 
         return {
-            "fitted_display_full": fitted_display_full,
             "fitted_display": fitted_display,
-            "residuals_display_full": residuals_display_full,
             "residuals_display": residuals_display,
         }
 
@@ -6565,55 +9357,34 @@ class ManualFitGUI(QMainWindow):
         channel_arrays = list(context.get("plot_channel_displays", {}).values())
         y_min, y_max = self._finite_min_max(*channel_arrays, series["fitted_display"])
         self.ax.set_ylim(y_min, y_max)
-        self.ax.set_xlim(context["time_data"][0], context["time_data"][-1])
+        x_vals = np.asarray(context["x_display"], dtype=float)
+        x_finite = x_vals[np.isfinite(x_vals)]
+        if x_finite.size > 0:
+            x_min = float(np.min(x_finite))
+            x_max = float(np.max(x_finite))
+            if np.isclose(x_min, x_max):
+                pad = 1.0 if np.isclose(x_min, 0.0) else max(1e-6, abs(x_min) * 0.05)
+                x_min -= pad
+                x_max += pad
+            self.ax.set_xlim(x_min, x_max)
         if show_residuals and self.ax_residual is not None:
             r_min, r_max = self._finite_min_max(series["residuals_display"])
             self.ax_residual.set_ylim(r_min, r_max)
         self.canvas.draw_idle()
         return True
 
-    def _update_param_error_labels(self):
-        sigma_by_key = {}
-        if self.last_pcov is not None:
-            try:
-                sigma = np.sqrt(np.maximum(np.diag(self.last_pcov), 0.0)).reshape(-1)
-            except Exception:
-                sigma = np.asarray([], dtype=float)
-            for idx, key in enumerate(self._last_fit_active_keys):
-                if idx < sigma.size and np.isfinite(sigma[idx]):
-                    sigma_by_key[key] = float(sigma[idx])
-
-        for spec in self.param_specs:
-            label = self.param_error_labels.get(spec.key)
-            if label is None:
-                continue
-            sigma_value = sigma_by_key.get(spec.key)
-            if sigma_value is None:
-                label.setText("")
-            else:
-                label.setText(f"{sigma_value:.6f}")
-
-    def _update_stats_panel(self, fit_r2_value, full_r2_value):
-        self._update_param_error_labels()
-        if self.last_popt is not None and self.last_pcov is not None:
-            fit_r2_text = f"{fit_r2_value:.6f}" if fit_r2_value is not None else "N/A"
-            full_r2_text = (
-                f"{full_r2_value:.6f}" if full_r2_value is not None else "N/A"
-            )
-            if hasattr(self, "fit_result_summary_label"):
-                self.fit_result_summary_label.setText(
-                    f"R² (fit/full): {fit_r2_text} / {full_r2_text}"
-                )
-        else:
-            if hasattr(self, "fit_result_summary_label"):
-                self.fit_result_summary_label.setText("R² (fit/full): N/A / N/A")
+    def _update_stats_panel(self, r2_value):
+        text = f"{r2_value:.6f}" if r2_value is not None else "N/A"
+        if hasattr(self, "tab_r2_label"):
+            self.tab_r2_label.setText(f"R²: {text}")
         self._sync_param_row_tail_spacers()
 
-    def update_plot(self, fast=False):
+    def update_plot(self, fast=False, preserve_view=True):
         """Update plot with current parameters.
 
         Args:
             fast: If True, skip expensive operations for smooth slider interaction
+            preserve_view: If True, keep current zoom/pan limits when possible
         """
         if self.current_data is None:
             return
@@ -6632,13 +9403,47 @@ class ManualFitGUI(QMainWindow):
                 return
             series = self._compute_display_series(context)
 
-            fit_start_t, fit_end_t, _, _ = self._fit_window_times(
-                context["time_data"], context["fit_slice"]
-            )
-            self._fit_window_bounds_ms = (fit_start_t, fit_end_t)
             show_residuals = self.show_residuals_cb.isChecked()
+            can_preserve_view = bool(
+                preserve_view
+                and hasattr(self, "ax")
+                and self.ax is not None
+                and show_residuals == self._plot_has_residual_axis
+            )
+            main_xlim = None
+            main_ylim = None
+            residual_ylim = None
+            if can_preserve_view:
+                try:
+                    main_xlim = tuple(self.ax.get_xlim())
+                except Exception:
+                    main_xlim = None
+                try:
+                    main_ylim = tuple(self.ax.get_ylim())
+                except Exception:
+                    main_ylim = None
+                if show_residuals and self.ax_residual is not None:
+                    try:
+                        residual_ylim = tuple(self.ax_residual.get_ylim())
+                    except Exception:
+                        residual_ylim = None
 
             if fast and self._try_fast_plot_update(context, series, show_residuals):
+                if can_preserve_view:
+                    try:
+                        if main_xlim is not None:
+                            self.ax.set_xlim(*main_xlim)
+                        if main_ylim is not None:
+                            self.ax.set_ylim(*main_ylim)
+                        if (
+                            show_residuals
+                            and self.ax_residual is not None
+                            and residual_ylim is not None
+                        ):
+                            self.ax_residual.set_ylim(*residual_ylim)
+                        self.canvas.draw_idle()
+                    except Exception:
+                        pass
                 return
 
             self._ensure_plot_axes(show_residuals)
@@ -6647,30 +9452,14 @@ class ManualFitGUI(QMainWindow):
                 self.ax_residual.clear()
 
             self._plot_lines = {}
-            self._draw_fit_window_overlay(context["time_data"], context["fit_slice"])
-            outside_alpha = 0.30
             for idx, (channel_name, values) in enumerate(
                 context.get("plot_channel_displays", {}).items()
             ):
                 color = palette_color(idx)
-                channel_inside = np.where(context["fit_mask_display"], values, np.nan)
-                channel_outside = np.where(context["fit_mask_display"], np.nan, values)
+                channel_label = self._channel_legend_label(channel_name)
                 self.ax.plot(
-                    context["time_display"],
-                    channel_outside,
-                    color=color,
-                    linewidth=1.5,
-                    alpha=outside_alpha,
-                    label="_nolegend_",
-                )
-                channel_label = self.channels.get(channel_name, "")
-                if channel_label:
-                    channel_label = f"{channel_name} ({channel_label})"
-                else:
-                    channel_label = channel_name
-                self.ax.plot(
-                    context["time_display"],
-                    channel_inside,
+                    context["x_display"],
+                    values,
                     label=channel_label,
                     color=color,
                     linewidth=2.2 if channel_name == self.y_channel else 1.6,
@@ -6678,7 +9467,7 @@ class ManualFitGUI(QMainWindow):
                 )
 
             (fitted_line,) = self.ax.plot(
-                context["time_display"],
+                context["x_display"],
                 series["fitted_display"],
                 label="Fitted",
                 color=FIT_CURVE_COLOR,
@@ -6688,7 +9477,7 @@ class ManualFitGUI(QMainWindow):
 
             if show_residuals and self.ax_residual is not None:
                 (residuals_line,) = self.ax_residual.plot(
-                    context["time_display"],
+                    context["x_display"],
                     series["residuals_display"],
                     label="Residuals",
                     color="black",
@@ -6700,30 +9489,16 @@ class ManualFitGUI(QMainWindow):
                     0.0, color="#6b7280", linewidth=1.0, alpha=0.6, linestyle="--"
                 )
 
-            # Calculate R² scores (skip during fast updates for smoothness)
             if not fast:
-                x_fit = context["x_data"][context["fit_slice"]]
-                y_fit = context["y_data"][context["fit_slice"]]
-                channel_data_fit = self._slice_channel_data(
-                    context["channel_data_full"], context["fit_slice"]
-                )
-                fitted_fit = self.evaluate_model(
-                    x_fit,
-                    params,
-                    channel_data=channel_data_fit,
-                )
                 fitted_full = self.evaluate_model(
                     context["x_data"],
                     params,
                     channel_data=context["channel_data_full"],
                 )
-                fit_r2_value = compute_r2(y_fit, fitted_fit)
-                full_r2_value = compute_r2(context["y_data"], fitted_full)
-                self._last_r2_fit = fit_r2_value
-                self._last_r2_full = full_r2_value
+                r2_value = compute_r2(context["y_data"], fitted_full)
+                self._last_r2 = r2_value
             else:
-                fit_r2_value = self._last_r2_fit
-                full_r2_value = self._last_r2_full
+                r2_value = self._last_r2
 
             channel_arrays = list(context.get("plot_channel_displays", {}).values())
             y_min, y_max = self._finite_min_max(
@@ -6731,37 +9506,417 @@ class ManualFitGUI(QMainWindow):
             )
             self.ax.set_ylim(y_min, y_max)
             self._apply_unique_legend(self.ax, loc="lower right")
-            self.ax.set_xlabel("" if show_residuals else "Time (ms)")
-            self.ax.set_ylabel("Voltage (V)")
-            self.ax.set_xlim(context["time_data"][0], context["time_data"][-1])
+            self.ax.set_xlabel(
+                "" if show_residuals else self._channel_axis_label(self.x_channel)
+            )
+            self.ax.set_ylabel(self._channel_axis_label(self.y_channel))
+            x_vals = np.asarray(context["x_display"], dtype=float)
+            x_finite = x_vals[np.isfinite(x_vals)]
+            if x_finite.size > 0:
+                x_min = float(np.min(x_finite))
+                x_max = float(np.max(x_finite))
+                if np.isclose(x_min, x_max):
+                    pad = (
+                        1.0 if np.isclose(x_min, 0.0) else max(1e-6, abs(x_min) * 0.05)
+                    )
+                    x_min -= pad
+                    x_max += pad
+                self.ax.set_xlim(x_min, x_max)
             self.ax.grid(True, alpha=0.3)
             if show_residuals and self.ax_residual is not None:
                 r_min, r_max = self._finite_min_max(series["residuals_display"])
                 self.ax_residual.set_ylim(r_min, r_max)
                 self.ax_residual.set_ylabel("Residual")
-                self.ax_residual.set_xlabel("Time (ms)")
+                self.ax_residual.set_xlabel(self._channel_axis_label(self.x_channel))
                 self.ax_residual.grid(True, alpha=0.25)
                 self._apply_unique_legend(self.ax_residual, loc="upper right")
-            self._sync_fit_region_selector()
-            self.ax.text(
-                0.01,
-                0.98,
-                "Drag to set fit window; double-click a boundary to reset",
-                transform=self.ax.transAxes,
-                va="top",
-                ha="left",
-                fontsize=8,
-                color="#7f1d1d",
+
+            home_main_xlim = None
+            home_main_ylim = None
+            home_residual_ylim = None
+            try:
+                home_main_xlim = tuple(self.ax.get_xlim())
+            except Exception:
+                home_main_xlim = None
+            try:
+                home_main_ylim = tuple(self.ax.get_ylim())
+            except Exception:
+                home_main_ylim = None
+            if show_residuals and self.ax_residual is not None:
+                try:
+                    home_residual_ylim = tuple(self.ax_residual.get_ylim())
+                except Exception:
+                    home_residual_ylim = None
+
+            if can_preserve_view:
+                if main_xlim is not None:
+                    self.ax.set_xlim(*main_xlim)
+                if main_ylim is not None:
+                    self.ax.set_ylim(*main_ylim)
+                if (
+                    show_residuals
+                    and self.ax_residual is not None
+                    and residual_ylim is not None
+                ):
+                    self.ax_residual.set_ylim(*residual_ylim)
+
+            self._set_toolbar_home_limits(
+                home_main_xlim,
+                home_main_ylim,
+                home_residual_ylim,
+                keep_current_view=can_preserve_view,
             )
 
             self.canvas.draw_idle()
-            self._update_stats_panel(fit_r2_value, full_r2_value)
+            self._update_stats_panel(r2_value)
         except Exception as e:
             self.stats_text.setText(f"Error updating stats: {e}")
+            print(f"Error updating stats: {type(e).__name__}: {e}", file=sys.stderr)
+
+    def _apply_fit_row_update(self, row):
+        row_index = row.get("_source_index")
+        if row_index is None:
+            for idx, existing_row in enumerate(self.batch_results):
+                if existing_row.get("file") == row.get("file"):
+                    row_index = idx
+                    break
+        if row_index is None or row_index < 0 or row_index >= len(self.batch_results):
+            self.batch_results.append(dict(row))
+            self._rebuild_batch_capture_keys_from_rows()
+            self.update_batch_table()
+            row_index = len(self.batch_results) - 1
+        else:
+            existing = self.batch_results[row_index]
+            row_has_fit = has_nonempty_values(row.get("params"))
+            existing_plot_has_fit = existing.get("plot_has_fit")
+            if existing_plot_has_fit is None:
+                existing_plot_has_fit = has_nonempty_values(existing.get("params"))
+            if (
+                (not row_has_fit)
+                and (not existing_plot_has_fit)
+                and existing.get("plot_full") is not None
+                and row.get("plot_full") is None
+            ):
+                row["plot_full"] = existing["plot_full"]
+                row["plot_has_fit"] = False
+                row["plot_render_size"] = existing.get("plot_render_size")
+            elif (
+                (not row_has_fit)
+                and (not existing_plot_has_fit)
+                and existing.get("plot") is not None
+                and row.get("plot") is None
+            ):
+                row["plot"] = existing["plot"]
+                row["plot_has_fit"] = False
+                row["plot_render_size"] = existing.get("plot_render_size")
+            self.batch_results[row_index] = dict(row)
+            table_row_idx = self._find_table_row_by_file(row.get("file"))
+            if table_row_idx is not None:
+                self.update_batch_table_row(table_row_idx, row)
+            else:
+                self.update_batch_table()
+
+        row_has_fit = has_nonempty_values(row.get("params"))
+        if row_has_fit and row.get("plot_full") is None:
+            self._start_thumbnail_render(row_indices=[int(row_index)])
+
+        current_file = self._current_loaded_file_path()
+        if current_file and row.get("file") == current_file and row_has_fit:
+            self._apply_batch_params_for_file(current_file)
+            self.update_plot(fast=False)
+
+    def _upsert_fit_error_row(self, file_path, source_index, error_text):
+        row_idx = self._find_batch_result_index_by_file(file_path)
+        if row_idx is None:
+            captures = {}
+            pattern_error = None
+            capture_config = self._resolve_batch_capture_config(show_errors=False)
+            if capture_config is not None:
+                extracted = extract_captures(
+                    stem_for_file_ref(file_path),
+                    capture_config.regex,
+                    capture_config.defaults,
+                )
+                if extracted is None:
+                    pattern_error = _BATCH_PATTERN_MISMATCH_ERROR
+                else:
+                    captures = dict(extracted)
+            row = make_batch_result_row(
+                source_index=source_index,
+                file_path=file_path,
+                x_channel=self.x_channel,
+                y_channel=self.y_channel,
+                captures=captures,
+                pattern_error=pattern_error,
+            )
+            row_idx = len(self.batch_results)
+            self.batch_results.append(row)
+        row = dict(self.batch_results[row_idx])
+        if not has_nonempty_values(row.get("params")):
+            row["error"] = str(error_text)
+        self.batch_results[row_idx] = row
+        table_row_idx = self._find_table_row_by_file(file_path)
+        if table_row_idx is None:
+            self._rebuild_batch_capture_keys_from_rows()
+            self.update_batch_table()
+        else:
+            self.update_batch_table_row(table_row_idx, row)
+
+    def _start_file_fit_task(
+        self,
+        *,
+        kind,
+        file_path,
+        source_index,
+        fit_context,
+        capture_regex_pattern,
+        capture_defaults,
+        parameter_capture_map,
+    ):
+        task_id = self._next_fit_task_id()
+        existing_idx = self._find_batch_result_index_by_file(file_path)
+        existing_row = (
+            self.batch_results[existing_idx] if existing_idx is not None else {}
+        )
+        existing_rows_by_file = {file_path: existing_row} if existing_row else {}
+
+        thread = QThread(self)
+        worker = BatchFitWorker(
+            [file_path],
+            [int(source_index)],
+            existing_rows_by_file,
+            capture_regex_pattern,
+            capture_defaults,
+            parameter_capture_map,
+            fit_context["model_def"],
+            fit_context["ordered_keys"],
+            fit_context["seed_map"],
+            fit_context["bounds_map"],
+            fit_context["boundary_seed"],
+            fit_context["fit_mode"],
+            self.x_channel,
+            self.y_channel,
+            smoothing_enabled=self.smoothing_enabled,
+            smoothing_window=self._effective_smoothing_window(),
+        )
+        worker.moveToThread(thread)
+        self.fit_tasks[task_id] = {
+            "id": int(task_id),
+            "kind": str(kind),
+            "file_path": str(file_path),
+            "source_index": int(source_index),
+            "fit_mode": normalize_fit_mode(fit_context.get("fit_mode")),
+            "status": "pending",
+            "thread": thread,
+            "worker": worker,
+        }
+        if str(kind) == "batch":
+            self._batch_active_task_ids.add(int(task_id))
+        else:
+            self._manual_active_task_ids.add(int(task_id))
+
+        thread.started.connect(worker.run)
+        worker.progress.connect(
+            lambda _completed, _total, row, tid=task_id: self._on_fit_task_progress(
+                tid, row
+            )
+        )
+        worker.finished.connect(
+            lambda results, tid=task_id: self._on_fit_task_finished(tid, results)
+        )
+        worker.failed.connect(
+            lambda error_text, tid=task_id: self._on_fit_task_failed(tid, error_text)
+        )
+        worker.cancelled.connect(lambda tid=task_id: self._on_fit_task_cancelled(tid))
+        self._pending_fit_task_ids.append(int(task_id))
+        self._schedule_fit_tasks()
+        self._refresh_fit_action_buttons()
+        self._refresh_batch_controls()
+        return int(task_id)
+
+    def _on_fit_task_progress(self, task_id, row):
+        if int(task_id) not in self.fit_tasks:
+            return
+        self._apply_fit_row_update(row)
+
+    def _on_fit_task_finished(self, task_id, results):
+        task = self.fit_tasks.get(int(task_id))
+        if task is None:
+            return
+
+        row = None
+        if isinstance(results, (list, tuple)) and results:
+            row = results[0]
+            if row is not None:
+                self._apply_fit_row_update(row)
+
+        if task.get("kind") == "manual":
+            file_path = str(task.get("file_path"))
+            file_name = stem_for_file_ref(file_path)
+            mode_text = fit_mode_label(task.get("fit_mode"))
+            if row is None:
+                self.stats_text.append(f"Auto-fit finished with no result: {file_name}")
+            elif has_nonempty_values(row.get("params")):
+                r2_val = _finite_float_or_none(row.get("r2"))
+                stage = str(row.get("fit_stage") or "n/a")
+                sse_val = _finite_float_or_none(row.get("fit_sse"))
+                r2_text = f"{float(r2_val):.6f}" if r2_val is not None else "N/A"
+                sse_text = f"{float(sse_val):.6g}" if sse_val is not None else "n/a"
+                self.stats_text.append(
+                    f"✓ Auto-fit successful ({mode_text}) [{file_name}] R²={r2_text}, stage={stage}, SSE={sse_text}"
+                )
+                if self._current_loaded_file_path() == file_path:
+                    params = self._as_float_array(row.get("params"))
+                    self.last_popt = params
+                    self._last_fit_active_keys = self._ordered_param_keys()
+                    self.last_pcov = None
+                    self.last_r2 = r2_val
+                    self._last_r2 = r2_val
+                    self.last_fit_diagnostics = dict(row.get("fit_diagnostics") or {})
+                    self._apply_batch_params_for_file(file_path)
+                    self.update_plot(fast=False)
+            else:
+                error_text = str(row.get("error") or "No fit result.")
+                self.stats_text.append(f"✗ Auto-fit failed [{file_name}]: {error_text}")
+
+        self._finish_fit_task(int(task_id))
+
+    def _on_fit_task_failed(self, task_id, error_text):
+        task = self.fit_tasks.get(int(task_id))
+        if task is None:
+            return
+        file_path = str(task.get("file_path"))
+        source_index = int(task.get("source_index", 0))
+        self._upsert_fit_error_row(file_path, source_index, error_text)
+        if task.get("kind") == "manual":
+            file_name = stem_for_file_ref(file_path)
+            self.stats_text.append(f"✗ Auto-fit failed [{file_name}]: {error_text}")
+        self._finish_fit_task(int(task_id))
+
+    def _on_fit_task_cancelled(self, task_id):
+        task = self.fit_tasks.get(int(task_id))
+        if task is None:
+            return
+        if task.get("kind") == "manual":
+            file_name = stem_for_file_ref(task.get("file_path"))
+            self.stats_text.append(f"Auto-fit cancelled: {file_name}")
+        self._finish_fit_task(int(task_id))
+
+    def _finish_fit_task(self, task_id, *, force_terminate=False):
+        task = self.fit_tasks.pop(int(task_id), None)
+        if task is None:
+            return
+
+        status = str(task.get("status") or "pending")
+        if status == "pending":
+            try:
+                self._pending_fit_task_ids.remove(int(task_id))
+            except ValueError:
+                pass
+
+        kind = str(task.get("kind"))
+        if kind == "batch":
+            self._batch_active_task_ids.discard(int(task_id))
+            self._batch_progress_done = min(
+                int(self._batch_total_tasks),
+                int(self._batch_progress_done) + 1,
+            )
+        else:
+            self._manual_active_task_ids.discard(int(task_id))
+
+        worker = task.get("worker")
+        thread = task.get("thread")
+        if worker is not None:
+            try:
+                worker.deleteLater()
+            except Exception:
+                pass
+        if status == "running":
+            self._shutdown_thread(
+                thread,
+                wait_ms=250,
+                force_terminate=bool(force_terminate),
+            )
+        elif thread is not None:
+            try:
+                thread.deleteLater()
+            except Exception:
+                pass
+
+        if (
+            kind == "batch"
+            and self.batch_fit_in_progress
+            and int(self._batch_progress_done) >= int(self._batch_total_tasks)
+        ):
+            self._complete_batch_fit_run()
+
+        self._schedule_fit_tasks()
+        self._refresh_fit_action_buttons()
+        self._refresh_batch_controls()
+
+    def _complete_batch_fit_run(self):
+        cancelled = bool(getattr(self, "_batch_cancel_requested", False))
+        self._refresh_batch_analysis_if_run()
+        if cancelled:
+            self.stats_text.append("Batch fit cancelled.")
+        else:
+            self.stats_text.append("✓ Batch fit completed.")
+
+        diagnostic_rows = [
+            row
+            for row in self.batch_results
+            if row.get("fit_stage") is not None or row.get("fit_sse") is not None
+        ]
+        if diagnostic_rows:
+            stages = sorted(
+                {
+                    str(row.get("fit_stage"))
+                    for row in diagnostic_rows
+                    if row.get("fit_stage") not in (None, "")
+                }
+            )
+            sse_values = np.asarray(
+                [
+                    float(row.get("fit_sse"))
+                    for row in diagnostic_rows
+                    if row.get("fit_sse") is not None
+                ],
+                dtype=float,
+            )
+            r2_values = np.asarray(
+                [
+                    float(row.get("r2"))
+                    for row in diagnostic_rows
+                    if row.get("r2") is not None
+                ],
+                dtype=float,
+            )
+            stage_text = ", ".join(stages) if stages else "n/a"
+            sse_text = (
+                f"{float(np.nanmedian(sse_values)):.6g}"
+                if sse_values.size > 0
+                else "n/a"
+            )
+            r2_text = (
+                f"{float(np.nanmean(r2_values)):.6f}" if r2_values.size > 0 else "n/a"
+            )
+            self.stats_text.append(
+                f"Batch diagnostics: stages={stage_text}, median SSE={sse_text}, mean R²={r2_text}."
+            )
+
+        self.batch_fit_in_progress = False
+        self._batch_active_task_ids = set()
+        self._batch_cancel_pending = False
+        self._batch_cancel_requested = False
+        self._batch_progress_done = 0
+        self._batch_total_tasks = 0
+        self.queue_visible_thumbnail_render()
+        self._autosave_fit_details()
+        self._refresh_batch_controls()
 
     def run_batch_fit(self):
         """Run batch fitting using the shared file list."""
-        if self.batch_thread is not None:
+        if self.batch_fit_in_progress:
             self.stats_text.append("Batch fit is already running.")
             return
         self._sync_batch_files_from_shared(sync_pattern=False)
@@ -6779,18 +9934,15 @@ class ManualFitGUI(QMainWindow):
             self.stats_text.append(f"Batch fit setup error: {exc}")
             return
 
-        base_param_values = [
-            fit_context["base_values"][key] for key in fit_context["ordered_keys"]
-        ]
-        fit_options = self._current_fit_optimization_options()
-        self._batch_fit_options = fit_options
         self._stop_thumbnail_render()
         self._batch_progress_done = 0
         self.batch_fit_in_progress = True
         self._batch_cancel_pending = False
+        self._batch_cancel_requested = False
 
         existing_by_file = {row["file"]: row for row in self.batch_results}
         self.batch_results = []
+        work_items = []
         for source_index, file_path in enumerate(self.batch_files):
             existing = existing_by_file.get(file_path, {})
             extracted = extract_captures(
@@ -6807,52 +9959,37 @@ class ManualFitGUI(QMainWindow):
                     captures=captures,
                     pattern_error=pattern_error,
                     existing=existing,
-                    preserve_fit_result=False,
+                    preserve_fit_result=True,
+                )
+            )
+            work_items.append(
+                (
+                    source_index,
+                    file_path,
+                    has_nonempty_values(existing.get("params")),
                 )
             )
         self.update_batch_table()
 
-        self.batch_thread = QThread(self)
-        self.batch_worker = BatchFitWorker(
-            self.batch_files,
-            fit_context["p0"],
-            fit_context["bounds"],
-            fit_context["ordered_keys"],
-            fit_context["active_keys"],
-            base_param_values,
-            capture_config.regex_pattern,
-            capture_config.defaults,
-            self._compiled_expression,
-            self.x_channel,
-            self.y_channel,
-            self.fit_region_start_pct,
-            self.fit_region_end_pct,
-            fit_options,
-            smoothing_enabled=self.smoothing_enabled,
-            smoothing_window=self._effective_smoothing_window(),
-        )
-        self.batch_worker.moveToThread(self.batch_thread)
-
-        self.batch_thread.started.connect(self.batch_worker.run)
-        self.batch_worker.progress.connect(self.on_batch_progress)
-        self.batch_worker.finished.connect(self.on_batch_finished)
-        self.batch_worker.failed.connect(self.on_batch_failed)
-        self.batch_worker.cancelled.connect(self.on_batch_cancelled)
-
-        self.run_batch_btn.setEnabled(False)
-        self.cancel_batch_btn.setEnabled(True)
-        self.cancel_batch_btn.setText("Cancel")
-        total = len(self.batch_files)
-        self.run_batch_btn.setText(f"Run Batch (0/{total})")
-        requested_starts = (
-            max(2, int(fit_options.n_starts)) if fit_options.enabled else 1
-        )
+        prioritized_items = sorted(work_items, key=lambda item: (item[2], item[0]))
+        self._batch_total_tasks = len(prioritized_items)
+        self._batch_active_task_ids = set()
+        self._refresh_batch_controls()
         self.stats_text.append(
-            "Batch fit started: "
-            f"{fit_mode_label(fit_options)}, starts={requested_starts}, seed={fit_options.seed}, "
-            f"DE={'on' if fit_options.enabled and fit_options.use_global_init else 'off'}."
+            f"Batch fit started ({fit_mode_label(fit_context.get('fit_mode'))}, queued, max parallel={self._fit_max_concurrent})."
         )
-        self.batch_thread.start()
+
+        parameter_capture_map = self._current_param_capture_map()
+        for source_index, file_path, _already_fitted in prioritized_items:
+            self._start_file_fit_task(
+                kind="batch",
+                file_path=file_path,
+                source_index=source_index,
+                fit_context=fit_context,
+                capture_regex_pattern=capture_config.regex_pattern,
+                capture_defaults=capture_config.defaults,
+                parameter_capture_map=parameter_capture_map,
+            )
 
     def on_batch_progress(self, completed, total, row):
         """Update progress label while batch is running."""
@@ -6867,10 +10004,10 @@ class ManualFitGUI(QMainWindow):
                     break
         if row_index is not None and 0 <= row_index < len(self.batch_results):
             existing = self.batch_results[row_index]
-            row_has_fit = bool(row.get("params"))
+            row_has_fit = has_nonempty_values(row.get("params"))
             existing_plot_has_fit = existing.get("plot_has_fit")
             if existing_plot_has_fit is None:
-                existing_plot_has_fit = bool(existing.get("params"))
+                existing_plot_has_fit = has_nonempty_values(existing.get("params"))
             if (
                 (not row_has_fit)
                 and (not existing_plot_has_fit)
@@ -6895,6 +10032,10 @@ class ManualFitGUI(QMainWindow):
                 self.update_batch_table_row(table_row_idx, row)
             if row_has_fit and row.get("plot_full") is None:
                 self._start_thumbnail_render(row_indices=[row_index])
+            current_file = self._current_loaded_file_path()
+            if current_file and row.get("file") == current_file and row_has_fit:
+                if self._apply_batch_params_for_file(current_file):
+                    self.update_plot(fast=False)
 
     def on_batch_finished(self, results):
         """Populate table and thumbnails after batch fit finishes."""
@@ -6907,10 +10048,10 @@ class ManualFitGUI(QMainWindow):
             existing = previous_by_file.get(row["file"])
             if not existing:
                 continue
-            row_has_fit = bool(row.get("params"))
+            row_has_fit = has_nonempty_values(row.get("params"))
             existing_plot_has_fit = existing.get("plot_has_fit")
             if existing_plot_has_fit is None:
-                existing_plot_has_fit = bool(existing.get("params"))
+                existing_plot_has_fit = has_nonempty_values(existing.get("params"))
             if row_has_fit or existing_plot_has_fit:
                 continue
             if existing.get("plot_full") is not None and row.get("plot_full") is None:
@@ -6922,38 +10063,55 @@ class ManualFitGUI(QMainWindow):
                 row["plot_has_fit"] = False
                 row["plot_render_size"] = existing.get("plot_render_size")
         self.update_batch_table()
+        current_file = self._current_loaded_file_path()
+        if current_file and self._apply_batch_params_for_file(current_file):
+            self.update_plot(fast=False)
         self._refresh_batch_analysis_if_run()
         self.stats_text.append("✓ Batch fit completed.")
         diagnostic_rows = [
-            row for row in self.batch_results if row.get("fit_attempts") is not None
+            row
+            for row in self.batch_results
+            if row.get("fit_stage") is not None or row.get("fit_sse") is not None
         ]
         if diagnostic_rows:
-            attempts = np.asarray(
-                [float(row.get("fit_attempts", 0)) for row in diagnostic_rows],
+            stages = sorted(
+                {
+                    str(row.get("fit_stage"))
+                    for row in diagnostic_rows
+                    if row.get("fit_stage") not in (None, "")
+                }
+            )
+            sse_values = np.asarray(
+                [
+                    float(row.get("fit_sse"))
+                    for row in diagnostic_rows
+                    if row.get("fit_sse") is not None
+                ],
                 dtype=float,
             )
-            requested = max(
+            r2_values = np.asarray(
                 [
-                    int(row.get("fit_requested_starts", 0))
+                    float(row.get("r2"))
                     for row in diagnostic_rows
-                    if row.get("fit_requested_starts") is not None
-                ]
-                or [0]
+                    if row.get("r2") is not None
+                ],
+                dtype=float,
             )
-            mode_text = diagnostic_rows[0].get(
-                "fit_mode", fit_mode_label(self._batch_fit_options)
+            stage_text = ", ".join(stages) if stages else "n/a"
+            sse_text = (
+                f"{float(np.nanmedian(sse_values)):.6g}"
+                if sse_values.size > 0
+                else "n/a"
             )
-            seed = diagnostic_rows[0].get("fit_seed")
-            de_used = any(bool(row.get("fit_de_used")) for row in diagnostic_rows)
+            r2_text = (
+                f"{float(np.nanmean(r2_values)):.6f}" if r2_values.size > 0 else "n/a"
+            )
             self.stats_text.append(
-                "Batch diagnostics: "
-                f"{mode_text}, best of ~{int(np.round(np.mean(attempts)))}"
-                f"/{requested if requested > 0 else '?'} starts, "
-                f"seed={seed if seed is not None else 'n/a'}, "
-                f"DE={'on' if de_used else 'off'}."
+                f"Batch diagnostics: stages={stage_text}, median SSE={sse_text}, mean R²={r2_text}."
             )
         self.cleanup_batch_thread()
         self.queue_visible_thumbnail_render()
+        self._autosave_fit_details()
 
     def on_batch_failed(self, error_text):
         self.stats_text.append(f"✗ Batch fit failed: {error_text}")
@@ -6964,30 +10122,46 @@ class ManualFitGUI(QMainWindow):
         self.cleanup_batch_thread()
 
     def _force_stop_batch_fit(self, reason_text):
-        if self.batch_thread is None and self.batch_worker is None:
+        if not self.batch_fit_in_progress:
             return
-        self._request_worker_cancel(self.batch_worker)
+        self._batch_cancel_requested = True
         self.stats_text.append(str(reason_text))
-        self.cleanup_batch_thread(force=True)
+        for task_id in list(self._batch_active_task_ids):
+            task = self.fit_tasks.get(int(task_id))
+            if task is None:
+                continue
+            self._request_worker_cancel(task.get("worker"))
+            self._finish_fit_task(int(task_id), force_terminate=True)
 
     def cancel_batch_fit(self):
         """Request cancellation of an in-flight batch fit."""
-        if self.batch_worker is None and self.batch_thread is None:
+        if not self.batch_fit_in_progress:
             return
         if not self._batch_cancel_pending:
             self._batch_cancel_pending = True
-            self._request_worker_cancel(self.batch_worker)
-            self.cancel_batch_btn.setText("Force Stop")
+            self._batch_cancel_requested = True
+            for task_id in list(self._batch_active_task_ids):
+                task = self.fit_tasks.get(int(task_id))
+                if task is None:
+                    continue
+                if str(task.get("status")) == "pending":
+                    self._finish_fit_task(int(task_id))
+                else:
+                    self._request_worker_cancel(task.get("worker"))
             self.stats_text.append(
                 "Batch cancellation requested... click Cancel again to force stop."
             )
+            self._refresh_batch_controls()
+            if not self._batch_active_task_ids:
+                self._complete_batch_fit_run()
+                return
             QTimer.singleShot(
                 1500,
                 lambda: (
                     self._force_stop_batch_fit(
                         "⚠ Batch fit did not stop promptly; force-stopped."
                     )
-                    if self.batch_thread is not None and self._batch_cancel_pending
+                    if self.batch_fit_in_progress and self._batch_cancel_pending
                     else None
                 ),
             )
@@ -6999,22 +10173,36 @@ class ManualFitGUI(QMainWindow):
         if not self.batch_results:
             self.batch_table.setRowCount(0)
             self.batch_table.setColumnCount(0)
+            rich_header = getattr(self, "batch_table_header", None)
+            if isinstance(rich_header, RichTextHeaderView):
+                rich_header.set_section_html_map({})
             return
 
         sorting_enabled = self.batch_table.isSortingEnabled()
         if sorting_enabled:
             self.batch_table.setSortingEnabled(False)
         try:
+            param_columns = self._batch_parameter_column_items()
+            param_column_tokens = [str(item["token"]) for item in param_columns]
             columns = (
                 ["Plot"]
                 + ["File"]
                 + self.batch_capture_keys
                 + ["R2"]
-                + [spec.column_name for spec in self.param_specs]
-                + ["Error"]
+                + param_column_tokens
+                + ["SSE", "Error"]
             )
             self.batch_table.setColumnCount(len(columns))
             self.batch_table.setHorizontalHeaderLabels(columns)
+            rich_header = getattr(self, "batch_table_header", None)
+            if isinstance(rich_header, RichTextHeaderView):
+                param_start = 3 + len(self.batch_capture_keys)
+                rich_map = {}
+                for offset, token in enumerate(param_column_tokens):
+                    rich_html = parameter_symbol_to_html(token)
+                    if rich_html:
+                        rich_map[param_start + offset] = rich_html
+                rich_header.set_section_html_map(rich_map)
             self.batch_table.setRowCount(len(self.batch_results))
             self._apply_batch_row_heights()
 
@@ -7035,7 +10223,7 @@ class ManualFitGUI(QMainWindow):
             self._update_batch_plot_cell(row_idx, row)
 
             # File name column (index 1)
-            file_name = display_name_for_file_ref(row["file"])
+            file_name = stem_for_file_ref(row["file"])
             file_item = NumericSortTableWidgetItem(file_name)
             file_item.setData(Qt.ItemDataRole.UserRole, row["file"])
             self.batch_table.setItem(row_idx, 1, file_item)
@@ -7051,6 +10239,9 @@ class ManualFitGUI(QMainWindow):
             r2_col = 2 + len(self.batch_capture_keys)
             # Parameter columns come after R2.
             param_start = r2_col + 1
+            param_columns = self._batch_parameter_column_items()
+            sse_col = param_start + len(param_columns)
+            error_col = sse_col + 1
 
             r2_val = row.get("r2")
             if r2_val is not None:
@@ -7066,21 +10257,36 @@ class ManualFitGUI(QMainWindow):
                     NumericSortTableWidgetItem(""),
                 )
 
-            params = row.get("params")
-            for offset in range(len(self.param_specs)):
-                if params and offset < len(params):
-                    cell_text = f"{params[offset]:.6f}"
+            params = self._as_float_array(row.get("params"))
+            boundary_values = self._as_float_array(row.get("boundary_values"))
+            for offset, item in enumerate(param_columns):
+                idx = int(item["index"])
+                if item["kind"] == "param":
+                    value = float(params[idx]) if params.size > idx else None
                 else:
-                    cell_text = ""
+                    value = (
+                        float(boundary_values[idx])
+                        if boundary_values.size > idx
+                        else None
+                    )
+                cell_text = f"{value:.6f}" if value is not None else ""
                 self.batch_table.setItem(
                     row_idx,
                     param_start + offset,
                     NumericSortTableWidgetItem(cell_text),
                 )
+            sse_value = row.get("fit_sse")
+            self.batch_table.setItem(
+                row_idx,
+                sse_col,
+                NumericSortTableWidgetItem(
+                    f"{float(sse_value):.6g}" if sse_value is not None else ""
+                ),
+            )
             error_text = self._batch_row_error_text(row)
             self.batch_table.setItem(
                 row_idx,
-                param_start + len(self.param_specs),
+                error_col,
                 NumericSortTableWidgetItem(error_text),
             )
             self._apply_batch_row_error_background(row_idx, bool(error_text))
@@ -7139,7 +10345,7 @@ class ManualFitGUI(QMainWindow):
 
         if file_path not in self.data_files:
             self.data_files.append(file_path)
-            self.file_combo.addItem(display_name_for_file_ref(file_path), file_path)
+            self.file_combo.addItem(stem_for_file_ref(file_path), file_path)
             self._sync_batch_files_from_shared(sync_pattern=False)
 
         file_idx = self.data_files.index(file_path)
@@ -7155,7 +10361,7 @@ class ManualFitGUI(QMainWindow):
         font_metrics = self.batch_table.fontMetrics()
         longest_width = 0
         for file_path in self.batch_files:
-            file_name = display_name_for_file_ref(file_path)
+            file_name = stem_for_file_ref(file_path)
             longest_width = max(
                 longest_width, font_metrics.horizontalAdvance(file_name)
             )
@@ -7343,80 +10549,24 @@ class ManualFitGUI(QMainWindow):
             self._pending_thumbnail_rows.clear()
             self._start_thumbnail_render(row_indices=queued)
 
-    def export_batch_table(self):
-        """Export batch table to CSV."""
-        if not self.batch_results:
-            self.stats_text.append("No batch results to export.")
-            return
-
-        filename = (
-            self.regex_input.text().strip()
-            if hasattr(self, "regex_input")
-            else "failed"
-        )
-        file_path, _ = QFileDialog.getSaveFileName(
-            self,
-            "Export Batch Table",
-            str(Path.cwd() / f"{filename}.csv"),
-            "CSV Files (*.csv);;All Files (*.*)",
-        )
-        if not file_path:
-            return
-
-        columns = (
-            ["File"]
-            + self.batch_capture_keys
-            + ["R2"]
-            + [spec.column_name for spec in self.param_specs]
-            + ["Error", "FitMode", "FitAttempts", "FitBestSSE"]
-        )
-
-        try:
-            with open(file_path, "w", newline="") as handle:
-                writer = csv.writer(handle)
-                writer.writerow(columns)
-                for row in self.batch_results:
-                    file_name = display_name_for_file_ref(row["file"])
-                    captures = row.get("captures", {})
-                    params = row.get("params") or [""] * len(self.param_specs)
-                    r2_val = row.get("r2")
-                    error_text = self._batch_row_error_text(row)
-                    fit_mode = row.get("fit_mode") or ""
-                    fit_attempts = row.get("fit_attempts")
-                    fit_best_sse = row.get("fit_best_sse")
-                    writer.writerow(
-                        [file_name]
-                        + [captures.get(key, "") for key in self.batch_capture_keys]
-                        + [f"{r2_val:.6f}" if r2_val is not None else ""]
-                        + [
-                            f"{val:.6f}" if isinstance(val, float) else val
-                            for val in params
-                        ]
-                        + [error_text]
-                        + [fit_mode]
-                        + [str(int(fit_attempts)) if fit_attempts is not None else ""]
-                        + [
-                            f"{float(fit_best_sse):.6g}"
-                            if fit_best_sse is not None
-                            else ""
-                        ]
-                    )
-            self.stats_text.append(f"✓ Exported batch table to {file_path}")
-        except Exception as exc:
-            self.stats_text.append(f"✗ Export failed: {exc}")
-
     def _set_batch_parse_feedback(self, message, is_error=False, tooltip=""):
-        self.batch_parse_feedback_label.setText(message)
-        self.batch_parse_feedback_label.setToolTip(tooltip)
         if is_error:
+            self.batch_parse_feedback_label.setText(str(message))
+            self.batch_parse_feedback_label.setToolTip(str(tooltip or message))
             self.batch_parse_feedback_label.setStyleSheet(
                 "color: #b91c1c; font-weight: 600; padding: 1px 2px;"
             )
+            self.batch_parse_feedback_label.show()
         else:
+            self.batch_parse_feedback_label.clear()
+            self.batch_parse_feedback_label.setToolTip("")
             self.batch_parse_feedback_label.setStyleSheet("")
+            self.batch_parse_feedback_label.hide()
 
     def _resolve_batch_capture_config(self, show_errors):
-        pattern_text = self.regex_input.text().strip()
+        pattern_text = (
+            self.regex_input.text().strip() if hasattr(self, "regex_input") else ""
+        )
         try:
             return parse_capture_pattern(pattern_text)
         except Exception as exc:
@@ -7427,19 +10577,12 @@ class ManualFitGUI(QMainWindow):
             return None
 
     def _update_batch_capture_feedback(self, config):
-        if config.mode == "off":
-            self._set_batch_parse_feedback(
-                "Add {field} placeholders to extract filename columns."
-            )
-            return
-
-        field_text = (
-            ", ".join(self.batch_capture_keys) if self.batch_capture_keys else "none"
-        )
-        self._set_batch_parse_feedback(f"Fields: {field_text}")
+        _ = config
+        self._set_batch_parse_feedback("", is_error=False)
 
     def _on_regex_changed(self):
         """Debounce filename pattern changes to avoid excessive updates."""
+        self._refresh_param_capture_mapping_controls()
         self.regex_timer.stop()
         self.regex_timer.start(300)  # 300ms debounce
 
@@ -7458,13 +10601,16 @@ class ManualFitGUI(QMainWindow):
             self.batch_results = []
             config = self._resolve_batch_capture_config(show_errors=True)
             if config is None:
+                self._refresh_param_capture_mapping_controls()
                 self.update_batch_table()
                 self._refresh_batch_analysis_if_run()
                 return
             self.batch_status_label.hide()
             self._update_batch_capture_feedback(config)
+            self._refresh_param_capture_mapping_controls()
             self.update_batch_table()
             self._refresh_batch_analysis_if_run()
+            self._autosave_fit_details()
             return
 
         capture_config = self._resolve_batch_capture_config(show_errors=True)
@@ -7494,9 +10640,7 @@ class ManualFitGUI(QMainWindow):
                 )
                 captures = {}
                 if extracted is None:
-                    self.batch_unmatched_files.append(
-                        display_name_for_file_ref(row["file"])
-                    )
+                    self.batch_unmatched_files.append(stem_for_file_ref(row["file"]))
                     row["pattern_error"] = _BATCH_PATTERN_MISMATCH_ERROR
                 else:
                     captures = extracted
@@ -7523,9 +10667,7 @@ class ManualFitGUI(QMainWindow):
                 )
                 pattern_error = None
                 if extracted is None:
-                    self.batch_unmatched_files.append(
-                        display_name_for_file_ref(file_path)
-                    )
+                    self.batch_unmatched_files.append(stem_for_file_ref(file_path))
                     pattern_error = _BATCH_PATTERN_MISMATCH_ERROR
                 else:
                     captures = extracted
@@ -7550,6 +10692,7 @@ class ManualFitGUI(QMainWindow):
             self.batch_results = rebuilt_results
 
         self._update_batch_capture_feedback(capture_config)
+        self._refresh_param_capture_mapping_controls()
         self.update_batch_table()
         self._refresh_batch_analysis_if_run()
         if any(
@@ -7557,20 +10700,34 @@ class ManualFitGUI(QMainWindow):
             for row in self.batch_results
         ):
             self.queue_visible_thumbnail_render()
+        self._autosave_fit_details()
 
     def _refresh_batch_analysis_if_run(self):
-        if not hasattr(self, "analysis_source_combo"):
+        if not hasattr(self, "analysis_status_label"):
             return
-        if self.analysis_source_combo.currentData() == "run":
-            self._refresh_batch_analysis_data(preserve_selection=True)
+        self._refresh_batch_analysis_data(preserve_selection=True)
 
     def closeEvent(self, event):
         """Ensure worker thread is stopped before closing."""
+        self._autosave_fit_details()
         app = QApplication.instance()
         if app is not None:
             app.removeEventFilter(self)
-        self._request_worker_cancel(self.fit_worker)
-        self._request_worker_cancel(self.batch_worker)
+        for task in list(self.fit_tasks.values()):
+            self._request_worker_cancel(task.get("worker"))
+        for task in list(self.fit_tasks.values()):
+            thread = task.get("thread")
+            worker = task.get("worker")
+            if worker is not None:
+                try:
+                    worker.deleteLater()
+                except Exception:
+                    pass
+            self._shutdown_thread(thread, wait_ms=2000, force_terminate=True)
+        self.fit_tasks = {}
+        self._pending_fit_task_ids = deque()
+        self._batch_active_task_ids = set()
+        self._manual_active_task_ids = set()
         self._request_worker_cancel(self.thumb_worker)
         self._shutdown_thread(self.fit_thread, wait_ms=2000, force_terminate=True)
         self._shutdown_thread(self.batch_thread, wait_ms=2000, force_terminate=True)
