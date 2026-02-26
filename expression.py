@@ -5,6 +5,8 @@ import html
 import math
 import re
 from typing import (
+    Any,
+    Dict,
     List,
     Mapping,
     Optional,
@@ -507,13 +509,13 @@ def compile_expression_function(
         raise ValueError(f"Invalid function expression: {exc.msg}") from exc
 
     code = compile(tree, "<fit_expression>", "eval")
-    eval_globals = {
-        "__builtins__": __builtins__,
+    eval_globals: Dict[str, Any] = {
+        "__builtins__": {},
         "np": np,
         "math": math,
-        **_EXPRESSION_ALLOWED_FUNCTIONS,
-        **_EXPRESSION_ALLOWED_CONSTANTS,
     }
+    eval_globals.update(_EXPRESSION_ALLOWED_FUNCTIONS)
+    eval_globals.update(_EXPRESSION_ALLOWED_CONSTANTS)
 
     def _prepare_channel_array(values, target_length: int):
         array = np.asarray(values, dtype=float).reshape(-1)

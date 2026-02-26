@@ -367,13 +367,13 @@ def compile_segment_expression(
         raise ValueError(f"Invalid segment expression: {exc.msg}") from exc
 
     code = compile(tree, "<piecewise_segment>", "eval")
-    eval_globals = {
-        "__builtins__": __builtins__,
+    eval_globals: Dict[str, Any] = {
+        "__builtins__": {},
         "np": np,
         "math": math,
-        **_EXPRESSION_ALLOWED_FUNCTIONS,
-        **_EXPRESSION_ALLOWED_CONSTANTS,
     }
+    eval_globals.update(_EXPRESSION_ALLOWED_FUNCTIONS)
+    eval_globals.update(_EXPRESSION_ALLOWED_CONSTANTS)
 
     def _evaluate(x_data: np.ndarray, param_values: Mapping[str, float]) -> np.ndarray:
         x_arr = np.asarray(x_data, dtype=float).reshape(-1)
