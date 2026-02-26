@@ -30,6 +30,8 @@ from solver import (
     SegmentSpec,
     predict_ordered_piecewise,
     refit_ordered_piecewise_from_seed,
+    pcts_to_boundary_ratios,
+    _boundary_ratio_diff_step_from_x,
 )
 
 
@@ -265,13 +267,7 @@ def default_boundary_ratios(n_boundaries: int) -> np.ndarray:
     if n <= 0:
         return np.asarray([], dtype=float)
     pcts = np.linspace(1.0 / (n + 1), n / (n + 1), n)
-    ratios = np.empty(n, dtype=float)
-    prev = 0.0
-    for i, pct in enumerate(pcts):
-        denom = max(1.0 - prev, 1e-12)
-        ratios[i] = (float(pct) - prev) / denom
-        prev = float(pct)
-    return np.clip(ratios, 0.0, 1.0)
+    return pcts_to_boundary_ratios(pcts)
 
 
 def boundary_ratios_to_positions(
@@ -312,21 +308,6 @@ def boundary_ratios_to_x_values(
     positions = boundary_ratios_to_positions(ratios, n)
     span = float(x_max - x_min)
     return np.asarray(x_min + span * positions, dtype=float)
-
-
-def _boundary_ratio_diff_step_from_x(x_values: np.ndarray) -> float:
-    x_arr = np.asarray(x_values, dtype=float).reshape(-1)
-    finite = np.sort(x_arr[np.isfinite(x_arr)])
-    if finite.size < 2:
-        return 0.02
-    span = max(float(finite[-1] - finite[0]), 1e-12)
-    deltas = np.diff(finite)
-    deltas = deltas[deltas > 0.0]
-    if deltas.size > 0:
-        base = float(np.median(deltas)) / span
-    else:
-        base = 1.0 / max(2, int(finite.size) - 1)
-    return float(np.clip(2.0 * base, 1e-4, 0.25))
 
 
 def extract_segment_parameter_names(

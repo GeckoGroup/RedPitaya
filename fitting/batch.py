@@ -43,9 +43,6 @@ class CapturePatternConfig:
     defaults: Dict[str, str]
 
 
-_FIELD_NAME_RE = _PARAMETER_NAME_RE
-
-
 def _is_optional_delimiter(char: str) -> bool:
     """Return True for punctuation delimiters that may wrap optional fields."""
     return (
@@ -121,7 +118,7 @@ def _template_to_regex(template_text: str) -> Tuple[str, Dict[str, str]]:
                 default_value = None
                 optional = False
 
-            if not _FIELD_NAME_RE.fullmatch(field_name):
+            if not _PARAMETER_NAME_RE.fullmatch(field_name):
                 raise ValueError(
                     f"Invalid field name '{field_name}'. Use letters, numbers, underscore."
                 )

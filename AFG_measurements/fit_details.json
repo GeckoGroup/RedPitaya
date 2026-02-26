@@ -1,7 +1,7 @@
 {
   "format": "manual_fit_gui_details",
   "version": 1,
-  "saved_at_utc": "2026-02-26T20:35:09.091509+00:00",
+  "saved_at_utc": "2026-02-26T22:05:17.437652+00:00",
   "gui": {
     "equation": "CH2 = m*x+c ; abs(A_MI*sin(A_mod*sin(2*pi*f_mod*x+pi*phi_mod)+pi*phi_MI))**2+V_0 ; m*x+c",
     "x_channel": "TIME",
@@ -112,7 +112,7 @@
   ],
   "batch_results": [
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::100.0Hz_SINE_AFG.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::100.0Hz_SINE_AFG.csv",
       "file_stem": "100.0Hz_SINE_AFG",
       "captures": {
         "freq": "100.0",
@@ -143,7 +143,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::100.0Hz_SINE_AFG_v6.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::100.0Hz_SINE_AFG_v6.csv",
       "file_stem": "100.0Hz_SINE_AFG_v6",
       "captures": {
         "freq": "100.0",
@@ -174,7 +174,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::102400.0Hz_SINE_AFG.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::102400.0Hz_SINE_AFG.csv",
       "file_stem": "102400.0Hz_SINE_AFG",
       "captures": {
         "freq": "102400.0",
@@ -205,7 +205,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::102400.0Hz_SINE_AFG_v1.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::102400.0Hz_SINE_AFG_v1.csv",
       "file_stem": "102400.0Hz_SINE_AFG_v1",
       "captures": {
         "freq": "102400.0",
@@ -236,7 +236,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::102400.0Hz_SINE_AFG_v2.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::102400.0Hz_SINE_AFG_v2.csv",
       "file_stem": "102400.0Hz_SINE_AFG_v2",
       "captures": {
         "freq": "102400.0",
@@ -267,7 +267,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::102400.0Hz_SINE_AFG_v3.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::102400.0Hz_SINE_AFG_v3.csv",
       "file_stem": "102400.0Hz_SINE_AFG_v3",
       "captures": {
         "freq": "102400.0",
@@ -298,7 +298,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::102400.0Hz_SINE_AFG_v4.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::102400.0Hz_SINE_AFG_v4.csv",
       "file_stem": "102400.0Hz_SINE_AFG_v4",
       "captures": {
         "freq": "102400.0",
@@ -329,7 +329,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::102400.0Hz_SINE_AFG_v5.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::102400.0Hz_SINE_AFG_v5.csv",
       "file_stem": "102400.0Hz_SINE_AFG_v5",
       "captures": {
         "freq": "102400.0",
@@ -360,7 +360,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::102400.0Hz_SINE_AFG_v6.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::102400.0Hz_SINE_AFG_v6.csv",
       "file_stem": "102400.0Hz_SINE_AFG_v6",
       "captures": {
         "freq": "102400.0",
@@ -391,7 +391,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::12800.0Hz_SINE_AFG.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::12800.0Hz_SINE_AFG.csv",
       "file_stem": "12800.0Hz_SINE_AFG",
       "captures": {
         "freq": "12800.0",
@@ -422,7 +422,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::12800.0Hz_SINE_AFG_v1.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::12800.0Hz_SINE_AFG_v1.csv",
       "file_stem": "12800.0Hz_SINE_AFG_v1",
       "captures": {
         "freq": "12800.0",
@@ -453,7 +453,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::12800.0Hz_SINE_AFG_v2.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::12800.0Hz_SINE_AFG_v2.csv",
       "file_stem": "12800.0Hz_SINE_AFG_v2",
       "captures": {
         "freq": "12800.0",
@@ -484,7 +484,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::12800.0Hz_SINE_AFG_v3.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::12800.0Hz_SINE_AFG_v3.csv",
       "file_stem": "12800.0Hz_SINE_AFG_v3",
       "captures": {
         "freq": "12800.0",
@@ -515,7 +515,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::12800.0Hz_SINE_AFG_v4.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::12800.0Hz_SINE_AFG_v4.csv",
       "file_stem": "12800.0Hz_SINE_AFG_v4",
       "captures": {
         "freq": "12800.0",
@@ -546,7 +546,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::12800.0Hz_SINE_AFG_v5.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::12800.0Hz_SINE_AFG_v5.csv",
       "file_stem": "12800.0Hz_SINE_AFG_v5",
       "captures": {
         "freq": "12800.0",
@@ -577,7 +577,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::12800.0Hz_SINE_AFG_v6.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::12800.0Hz_SINE_AFG_v6.csv",
       "file_stem": "12800.0Hz_SINE_AFG_v6",
       "captures": {
         "freq": "12800.0",
@@ -608,7 +608,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::12800.0Hz_SINE_AFG_v7.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::12800.0Hz_SINE_AFG_v7.csv",
       "file_stem": "12800.0Hz_SINE_AFG_v7",
       "captures": {
         "freq": "12800.0",
@@ -639,7 +639,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::1600.0Hz_SINE_AFG.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::1600.0Hz_SINE_AFG.csv",
       "file_stem": "1600.0Hz_SINE_AFG",
       "captures": {
         "freq": "1600.0",
@@ -670,7 +670,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::1600.0Hz_SINE_AFG_v1.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::1600.0Hz_SINE_AFG_v1.csv",
       "file_stem": "1600.0Hz_SINE_AFG_v1",
       "captures": {
         "freq": "1600.0",
@@ -701,7 +701,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::1600.0Hz_SINE_AFG_v2.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::1600.0Hz_SINE_AFG_v2.csv",
       "file_stem": "1600.0Hz_SINE_AFG_v2",
       "captures": {
         "freq": "1600.0",
@@ -732,7 +732,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::1600.0Hz_SINE_AFG_v3.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::1600.0Hz_SINE_AFG_v3.csv",
       "file_stem": "1600.0Hz_SINE_AFG_v3",
       "captures": {
         "freq": "1600.0",
@@ -763,7 +763,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::1600.0Hz_SINE_AFG_v4.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::1600.0Hz_SINE_AFG_v4.csv",
       "file_stem": "1600.0Hz_SINE_AFG_v4",
       "captures": {
         "freq": "1600.0",
@@ -794,7 +794,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::1600.0Hz_SINE_AFG_v5.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::1600.0Hz_SINE_AFG_v5.csv",
       "file_stem": "1600.0Hz_SINE_AFG_v5",
       "captures": {
         "freq": "1600.0",
@@ -825,7 +825,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::1600.0Hz_SINE_AFG_v6.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::1600.0Hz_SINE_AFG_v6.csv",
       "file_stem": "1600.0Hz_SINE_AFG_v6",
       "captures": {
         "freq": "1600.0",
@@ -856,7 +856,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::200.0Hz_SINE_AFG.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::200.0Hz_SINE_AFG.csv",
       "file_stem": "200.0Hz_SINE_AFG",
       "captures": {
         "freq": "200.0",
@@ -887,7 +887,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::200.0Hz_SINE_AFG_v1.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::200.0Hz_SINE_AFG_v1.csv",
       "file_stem": "200.0Hz_SINE_AFG_v1",
       "captures": {
         "freq": "200.0",
@@ -918,7 +918,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::200.0Hz_SINE_AFG_v2.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::200.0Hz_SINE_AFG_v2.csv",
       "file_stem": "200.0Hz_SINE_AFG_v2",
       "captures": {
         "freq": "200.0",
@@ -949,7 +949,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::200.0Hz_SINE_AFG_v3.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::200.0Hz_SINE_AFG_v3.csv",
       "file_stem": "200.0Hz_SINE_AFG_v3",
       "captures": {
         "freq": "200.0",
@@ -980,7 +980,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::200.0Hz_SINE_AFG_v4.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::200.0Hz_SINE_AFG_v4.csv",
       "file_stem": "200.0Hz_SINE_AFG_v4",
       "captures": {
         "freq": "200.0",
@@ -1011,7 +1011,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::200.0Hz_SINE_AFG_v5.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::200.0Hz_SINE_AFG_v5.csv",
       "file_stem": "200.0Hz_SINE_AFG_v5",
       "captures": {
         "freq": "200.0",
@@ -1042,7 +1042,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::200.0Hz_SINE_AFG_v6.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::200.0Hz_SINE_AFG_v6.csv",
       "file_stem": "200.0Hz_SINE_AFG_v6",
       "captures": {
         "freq": "200.0",
@@ -1073,7 +1073,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::200.0Hz_SINE_AFG_v7.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::200.0Hz_SINE_AFG_v7.csv",
       "file_stem": "200.0Hz_SINE_AFG_v7",
       "captures": {
         "freq": "200.0",
@@ -1104,7 +1104,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::204800.0Hz_SINE_AFG.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::204800.0Hz_SINE_AFG.csv",
       "file_stem": "204800.0Hz_SINE_AFG",
       "captures": {
         "freq": "204800.0",
@@ -1135,7 +1135,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::204800.0Hz_SINE_AFG_v1.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::204800.0Hz_SINE_AFG_v1.csv",
       "file_stem": "204800.0Hz_SINE_AFG_v1",
       "captures": {
         "freq": "204800.0",
@@ -1166,7 +1166,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::204800.0Hz_SINE_AFG_v2.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::204800.0Hz_SINE_AFG_v2.csv",
       "file_stem": "204800.0Hz_SINE_AFG_v2",
       "captures": {
         "freq": "204800.0",
@@ -1197,7 +1197,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::204800.0Hz_SINE_AFG_v3.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::204800.0Hz_SINE_AFG_v3.csv",
       "file_stem": "204800.0Hz_SINE_AFG_v3",
       "captures": {
         "freq": "204800.0",
@@ -1228,7 +1228,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::204800.0Hz_SINE_AFG_v4.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::204800.0Hz_SINE_AFG_v4.csv",
       "file_stem": "204800.0Hz_SINE_AFG_v4",
       "captures": {
         "freq": "204800.0",
@@ -1259,7 +1259,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::204800.0Hz_SINE_AFG_v5.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::204800.0Hz_SINE_AFG_v5.csv",
       "file_stem": "204800.0Hz_SINE_AFG_v5",
       "captures": {
         "freq": "204800.0",
@@ -1290,7 +1290,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::204800.0Hz_SINE_AFG_v6.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::204800.0Hz_SINE_AFG_v6.csv",
       "file_stem": "204800.0Hz_SINE_AFG_v6",
       "captures": {
         "freq": "204800.0",
@@ -1321,7 +1321,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::25600.0Hz_SINE_AFG.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::25600.0Hz_SINE_AFG.csv",
       "file_stem": "25600.0Hz_SINE_AFG",
       "captures": {
         "freq": "25600.0",
@@ -1352,7 +1352,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::25600.0Hz_SINE_AFG_v1.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::25600.0Hz_SINE_AFG_v1.csv",
       "file_stem": "25600.0Hz_SINE_AFG_v1",
       "captures": {
         "freq": "25600.0",
@@ -1383,7 +1383,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::25600.0Hz_SINE_AFG_v2.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::25600.0Hz_SINE_AFG_v2.csv",
       "file_stem": "25600.0Hz_SINE_AFG_v2",
       "captures": {
         "freq": "25600.0",
@@ -1414,7 +1414,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::25600.0Hz_SINE_AFG_v3.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::25600.0Hz_SINE_AFG_v3.csv",
       "file_stem": "25600.0Hz_SINE_AFG_v3",
       "captures": {
         "freq": "25600.0",
@@ -1445,7 +1445,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::25600.0Hz_SINE_AFG_v4.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::25600.0Hz_SINE_AFG_v4.csv",
       "file_stem": "25600.0Hz_SINE_AFG_v4",
       "captures": {
         "freq": "25600.0",
@@ -1476,7 +1476,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::25600.0Hz_SINE_AFG_v5.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::25600.0Hz_SINE_AFG_v5.csv",
       "file_stem": "25600.0Hz_SINE_AFG_v5",
       "captures": {
         "freq": "25600.0",
@@ -1507,7 +1507,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::25600.0Hz_SINE_AFG_v6.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::25600.0Hz_SINE_AFG_v6.csv",
       "file_stem": "25600.0Hz_SINE_AFG_v6",
       "captures": {
         "freq": "25600.0",
@@ -1538,7 +1538,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::3200.0Hz_SINE_AFG.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::3200.0Hz_SINE_AFG.csv",
       "file_stem": "3200.0Hz_SINE_AFG",
       "captures": {
         "freq": "3200.0",
@@ -1569,7 +1569,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::3200.0Hz_SINE_AFG_v1.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::3200.0Hz_SINE_AFG_v1.csv",
       "file_stem": "3200.0Hz_SINE_AFG_v1",
       "captures": {
         "freq": "3200.0",
@@ -1600,7 +1600,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::3200.0Hz_SINE_AFG_v2.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::3200.0Hz_SINE_AFG_v2.csv",
       "file_stem": "3200.0Hz_SINE_AFG_v2",
       "captures": {
         "freq": "3200.0",
@@ -1631,7 +1631,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::3200.0Hz_SINE_AFG_v3.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::3200.0Hz_SINE_AFG_v3.csv",
       "file_stem": "3200.0Hz_SINE_AFG_v3",
       "captures": {
         "freq": "3200.0",
@@ -1662,7 +1662,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::3200.0Hz_SINE_AFG_v4.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::3200.0Hz_SINE_AFG_v4.csv",
       "file_stem": "3200.0Hz_SINE_AFG_v4",
       "captures": {
         "freq": "3200.0",
@@ -1693,7 +1693,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::3200.0Hz_SINE_AFG_v5.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::3200.0Hz_SINE_AFG_v5.csv",
       "file_stem": "3200.0Hz_SINE_AFG_v5",
       "captures": {
         "freq": "3200.0",
@@ -1724,7 +1724,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::3200.0Hz_SINE_AFG_v6.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::3200.0Hz_SINE_AFG_v6.csv",
       "file_stem": "3200.0Hz_SINE_AFG_v6",
       "captures": {
         "freq": "3200.0",
@@ -1755,7 +1755,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::400.0Hz_SINE_AFG.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::400.0Hz_SINE_AFG.csv",
       "file_stem": "400.0Hz_SINE_AFG",
       "captures": {
         "freq": "400.0",
@@ -1786,7 +1786,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::400.0Hz_SINE_AFG_v1.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::400.0Hz_SINE_AFG_v1.csv",
       "file_stem": "400.0Hz_SINE_AFG_v1",
       "captures": {
         "freq": "400.0",
@@ -1817,7 +1817,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::400.0Hz_SINE_AFG_v2.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::400.0Hz_SINE_AFG_v2.csv",
       "file_stem": "400.0Hz_SINE_AFG_v2",
       "captures": {
         "freq": "400.0",
@@ -1848,7 +1848,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::400.0Hz_SINE_AFG_v3.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::400.0Hz_SINE_AFG_v3.csv",
       "file_stem": "400.0Hz_SINE_AFG_v3",
       "captures": {
         "freq": "400.0",
@@ -1879,7 +1879,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::400.0Hz_SINE_AFG_v4.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::400.0Hz_SINE_AFG_v4.csv",
       "file_stem": "400.0Hz_SINE_AFG_v4",
       "captures": {
         "freq": "400.0",
@@ -1910,7 +1910,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::400.0Hz_SINE_AFG_v5.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::400.0Hz_SINE_AFG_v5.csv",
       "file_stem": "400.0Hz_SINE_AFG_v5",
       "captures": {
         "freq": "400.0",
@@ -1941,7 +1941,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::400.0Hz_SINE_AFG_v6.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::400.0Hz_SINE_AFG_v6.csv",
       "file_stem": "400.0Hz_SINE_AFG_v6",
       "captures": {
         "freq": "400.0",
@@ -1972,7 +1972,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::400.0Hz_SINE_AFG_v7.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::400.0Hz_SINE_AFG_v7.csv",
       "file_stem": "400.0Hz_SINE_AFG_v7",
       "captures": {
         "freq": "400.0",
@@ -2003,7 +2003,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::409600.0Hz_SINE_AFG.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::409600.0Hz_SINE_AFG.csv",
       "file_stem": "409600.0Hz_SINE_AFG",
       "captures": {
         "freq": "409600.0",
@@ -2034,7 +2034,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::409600.0Hz_SINE_AFG_v1.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::409600.0Hz_SINE_AFG_v1.csv",
       "file_stem": "409600.0Hz_SINE_AFG_v1",
       "captures": {
         "freq": "409600.0",
@@ -2065,7 +2065,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::409600.0Hz_SINE_AFG_v2.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::409600.0Hz_SINE_AFG_v2.csv",
       "file_stem": "409600.0Hz_SINE_AFG_v2",
       "captures": {
         "freq": "409600.0",
@@ -2096,7 +2096,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::409600.0Hz_SINE_AFG_v3.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::409600.0Hz_SINE_AFG_v3.csv",
       "file_stem": "409600.0Hz_SINE_AFG_v3",
       "captures": {
         "freq": "409600.0",
@@ -2127,7 +2127,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::409600.0Hz_SINE_AFG_v4.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::409600.0Hz_SINE_AFG_v4.csv",
       "file_stem": "409600.0Hz_SINE_AFG_v4",
       "captures": {
         "freq": "409600.0",
@@ -2158,7 +2158,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::409600.0Hz_SINE_AFG_v5.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::409600.0Hz_SINE_AFG_v5.csv",
       "file_stem": "409600.0Hz_SINE_AFG_v5",
       "captures": {
         "freq": "409600.0",
@@ -2189,7 +2189,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::409600.0Hz_SINE_AFG_v6.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::409600.0Hz_SINE_AFG_v6.csv",
       "file_stem": "409600.0Hz_SINE_AFG_v6",
       "captures": {
         "freq": "409600.0",
@@ -2220,7 +2220,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::51200.0Hz_SINE_AFG.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::51200.0Hz_SINE_AFG.csv",
       "file_stem": "51200.0Hz_SINE_AFG",
       "captures": {
         "freq": "51200.0",
@@ -2251,7 +2251,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::51200.0Hz_SINE_AFG_v1.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::51200.0Hz_SINE_AFG_v1.csv",
       "file_stem": "51200.0Hz_SINE_AFG_v1",
       "captures": {
         "freq": "51200.0",
@@ -2282,7 +2282,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::51200.0Hz_SINE_AFG_v2.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::51200.0Hz_SINE_AFG_v2.csv",
       "file_stem": "51200.0Hz_SINE_AFG_v2",
       "captures": {
         "freq": "51200.0",
@@ -2313,7 +2313,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::51200.0Hz_SINE_AFG_v3.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::51200.0Hz_SINE_AFG_v3.csv",
       "file_stem": "51200.0Hz_SINE_AFG_v3",
       "captures": {
         "freq": "51200.0",
@@ -2344,7 +2344,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::51200.0Hz_SINE_AFG_v4.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::51200.0Hz_SINE_AFG_v4.csv",
       "file_stem": "51200.0Hz_SINE_AFG_v4",
       "captures": {
         "freq": "51200.0",
@@ -2375,7 +2375,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::51200.0Hz_SINE_AFG_v5.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::51200.0Hz_SINE_AFG_v5.csv",
       "file_stem": "51200.0Hz_SINE_AFG_v5",
       "captures": {
         "freq": "51200.0",
@@ -2406,7 +2406,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::51200.0Hz_SINE_AFG_v6.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::51200.0Hz_SINE_AFG_v6.csv",
       "file_stem": "51200.0Hz_SINE_AFG_v6",
       "captures": {
         "freq": "51200.0",
@@ -2437,7 +2437,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::51200.0Hz_SINE_AFG_v7.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::51200.0Hz_SINE_AFG_v7.csv",
       "file_stem": "51200.0Hz_SINE_AFG_v7",
       "captures": {
         "freq": "51200.0",
@@ -2468,7 +2468,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::6400.0Hz_SINE_AFG.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::6400.0Hz_SINE_AFG.csv",
       "file_stem": "6400.0Hz_SINE_AFG",
       "captures": {
         "freq": "6400.0",
@@ -2499,7 +2499,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::6400.0Hz_SINE_AFG_v1.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::6400.0Hz_SINE_AFG_v1.csv",
       "file_stem": "6400.0Hz_SINE_AFG_v1",
       "captures": {
         "freq": "6400.0",
@@ -2530,7 +2530,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::6400.0Hz_SINE_AFG_v2.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::6400.0Hz_SINE_AFG_v2.csv",
       "file_stem": "6400.0Hz_SINE_AFG_v2",
       "captures": {
         "freq": "6400.0",
@@ -2561,7 +2561,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::6400.0Hz_SINE_AFG_v3.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::6400.0Hz_SINE_AFG_v3.csv",
       "file_stem": "6400.0Hz_SINE_AFG_v3",
       "captures": {
         "freq": "6400.0",
@@ -2592,7 +2592,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::6400.0Hz_SINE_AFG_v4.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::6400.0Hz_SINE_AFG_v4.csv",
       "file_stem": "6400.0Hz_SINE_AFG_v4",
       "captures": {
         "freq": "6400.0",
@@ -2623,7 +2623,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::6400.0Hz_SINE_AFG_v5.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::6400.0Hz_SINE_AFG_v5.csv",
       "file_stem": "6400.0Hz_SINE_AFG_v5",
       "captures": {
         "freq": "6400.0",
@@ -2654,7 +2654,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::6400.0Hz_SINE_AFG_v6.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::6400.0Hz_SINE_AFG_v6.csv",
       "file_stem": "6400.0Hz_SINE_AFG_v6",
       "captures": {
         "freq": "6400.0",
@@ -2685,7 +2685,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::6400.0Hz_SINE_AFG_v7.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::6400.0Hz_SINE_AFG_v7.csv",
       "file_stem": "6400.0Hz_SINE_AFG_v7",
       "captures": {
         "freq": "6400.0",
@@ -2716,7 +2716,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::800.0Hz_SINE_AFG.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::800.0Hz_SINE_AFG.csv",
       "file_stem": "800.0Hz_SINE_AFG",
       "captures": {
         "freq": "800.0",
@@ -2747,7 +2747,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::800.0Hz_SINE_AFG_v1.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::800.0Hz_SINE_AFG_v1.csv",
       "file_stem": "800.0Hz_SINE_AFG_v1",
       "captures": {
         "freq": "800.0",
@@ -2778,7 +2778,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::800.0Hz_SINE_AFG_v2.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::800.0Hz_SINE_AFG_v2.csv",
       "file_stem": "800.0Hz_SINE_AFG_v2",
       "captures": {
         "freq": "800.0",
@@ -2809,7 +2809,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::800.0Hz_SINE_AFG_v3.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::800.0Hz_SINE_AFG_v3.csv",
       "file_stem": "800.0Hz_SINE_AFG_v3",
       "captures": {
         "freq": "800.0",
@@ -2840,7 +2840,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::800.0Hz_SINE_AFG_v4.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::800.0Hz_SINE_AFG_v4.csv",
       "file_stem": "800.0Hz_SINE_AFG_v4",
       "captures": {
         "freq": "800.0",
@@ -2871,7 +2871,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::800.0Hz_SINE_AFG_v5.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::800.0Hz_SINE_AFG_v5.csv",
       "file_stem": "800.0Hz_SINE_AFG_v5",
       "captures": {
         "freq": "800.0",
@@ -2902,7 +2902,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::800.0Hz_SINE_AFG_v6.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::800.0Hz_SINE_AFG_v6.csv",
       "file_stem": "800.0Hz_SINE_AFG_v6",
       "captures": {
         "freq": "800.0",
@@ -2933,7 +2933,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::819200.0Hz_SINE_AFG.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::819200.0Hz_SINE_AFG.csv",
       "file_stem": "819200.0Hz_SINE_AFG",
       "captures": {
         "freq": "819200.0",
@@ -2964,7 +2964,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::819200.0Hz_SINE_AFG_v1.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::819200.0Hz_SINE_AFG_v1.csv",
       "file_stem": "819200.0Hz_SINE_AFG_v1",
       "captures": {
         "freq": "819200.0",
@@ -2995,7 +2995,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::819200.0Hz_SINE_AFG_v2.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::819200.0Hz_SINE_AFG_v2.csv",
       "file_stem": "819200.0Hz_SINE_AFG_v2",
       "captures": {
         "freq": "819200.0",
@@ -3026,7 +3026,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::819200.0Hz_SINE_AFG_v3.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::819200.0Hz_SINE_AFG_v3.csv",
       "file_stem": "819200.0Hz_SINE_AFG_v3",
       "captures": {
         "freq": "819200.0",
@@ -3057,7 +3057,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::819200.0Hz_SINE_AFG_v4.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::819200.0Hz_SINE_AFG_v4.csv",
       "file_stem": "819200.0Hz_SINE_AFG_v4",
       "captures": {
         "freq": "819200.0",
@@ -3088,7 +3088,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::819200.0Hz_SINE_AFG_v5.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::819200.0Hz_SINE_AFG_v5.csv",
       "file_stem": "819200.0Hz_SINE_AFG_v5",
       "captures": {
         "freq": "819200.0",
@@ -3119,7 +3119,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::819200.0Hz_SINE_AFG_v6.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::819200.0Hz_SINE_AFG_v6.csv",
       "file_stem": "819200.0Hz_SINE_AFG_v6",
       "captures": {
         "freq": "819200.0",
@@ -3150,7 +3150,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_x2.zip::819200.0Hz_SINE_AFG_v7.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_x2.zip::819200.0Hz_SINE_AFG_v7.csv",
       "file_stem": "819200.0Hz_SINE_AFG_v7",
       "captures": {
         "freq": "819200.0",
@@ -3181,7 +3181,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::100.0Hz_SINE_AFG.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::100.0Hz_SINE_AFG.csv",
       "file_stem": "100.0Hz_SINE_AFG",
       "captures": {
         "freq": "100.0",
@@ -3212,7 +3212,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::100.0Hz_SINE_AFG_v1.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::100.0Hz_SINE_AFG_v1.csv",
       "file_stem": "100.0Hz_SINE_AFG_v1",
       "captures": {
         "freq": "100.0",
@@ -3243,7 +3243,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::100.0Hz_SINE_AFG_v2.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::100.0Hz_SINE_AFG_v2.csv",
       "file_stem": "100.0Hz_SINE_AFG_v2",
       "captures": {
         "freq": "100.0",
@@ -3274,7 +3274,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::100.0Hz_SINE_AFG_v3.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::100.0Hz_SINE_AFG_v3.csv",
       "file_stem": "100.0Hz_SINE_AFG_v3",
       "captures": {
         "freq": "100.0",
@@ -3305,7 +3305,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::100.0Hz_SINE_AFG_v4.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::100.0Hz_SINE_AFG_v4.csv",
       "file_stem": "100.0Hz_SINE_AFG_v4",
       "captures": {
         "freq": "100.0",
@@ -3336,7 +3336,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::1000000.0Hz_SINE_AFG.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::1000000.0Hz_SINE_AFG.csv",
       "file_stem": "1000000.0Hz_SINE_AFG",
       "captures": {
         "freq": "1000000.0",
@@ -3367,7 +3367,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::1000000.0Hz_SINE_AFG_v1.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::1000000.0Hz_SINE_AFG_v1.csv",
       "file_stem": "1000000.0Hz_SINE_AFG_v1",
       "captures": {
         "freq": "1000000.0",
@@ -3398,7 +3398,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::1000000.0Hz_SINE_AFG_v2.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::1000000.0Hz_SINE_AFG_v2.csv",
       "file_stem": "1000000.0Hz_SINE_AFG_v2",
       "captures": {
         "freq": "1000000.0",
@@ -3429,7 +3429,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::1000000.0Hz_SINE_AFG_v3.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::1000000.0Hz_SINE_AFG_v3.csv",
       "file_stem": "1000000.0Hz_SINE_AFG_v3",
       "captures": {
         "freq": "1000000.0",
@@ -3460,7 +3460,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::1000000.0Hz_SINE_AFG_v4.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::1000000.0Hz_SINE_AFG_v4.csv",
       "file_stem": "1000000.0Hz_SINE_AFG_v4",
       "captures": {
         "freq": "1000000.0",
@@ -3491,7 +3491,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::1128.84Hz_SINE_AFG.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::1128.84Hz_SINE_AFG.csv",
       "file_stem": "1128.84Hz_SINE_AFG",
       "captures": {
         "freq": "1128.84",
@@ -3522,7 +3522,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::1128.84Hz_SINE_AFG_v1.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::1128.84Hz_SINE_AFG_v1.csv",
       "file_stem": "1128.84Hz_SINE_AFG_v1",
       "captures": {
         "freq": "1128.84",
@@ -3553,7 +3553,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::1128.84Hz_SINE_AFG_v2.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::1128.84Hz_SINE_AFG_v2.csv",
       "file_stem": "1128.84Hz_SINE_AFG_v2",
       "captures": {
         "freq": "1128.84",
@@ -3584,7 +3584,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::1128.84Hz_SINE_AFG_v3.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::1128.84Hz_SINE_AFG_v3.csv",
       "file_stem": "1128.84Hz_SINE_AFG_v3",
       "captures": {
         "freq": "1128.84",
@@ -3615,7 +3615,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::1128.84Hz_SINE_AFG_v4.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::1128.84Hz_SINE_AFG_v4.csv",
       "file_stem": "1128.84Hz_SINE_AFG_v4",
       "captures": {
         "freq": "1128.84",
@@ -3646,7 +3646,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::12742.75Hz_SINE_AFG.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::12742.75Hz_SINE_AFG.csv",
       "file_stem": "12742.75Hz_SINE_AFG",
       "captures": {
         "freq": "12742.75",
@@ -3677,7 +3677,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::12742.75Hz_SINE_AFG_v1.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::12742.75Hz_SINE_AFG_v1.csv",
       "file_stem": "12742.75Hz_SINE_AFG_v1",
       "captures": {
         "freq": "12742.75",
@@ -3708,7 +3708,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::12742.75Hz_SINE_AFG_v2.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::12742.75Hz_SINE_AFG_v2.csv",
       "file_stem": "12742.75Hz_SINE_AFG_v2",
       "captures": {
         "freq": "12742.75",
@@ -3739,7 +3739,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::12742.75Hz_SINE_AFG_v3.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::12742.75Hz_SINE_AFG_v3.csv",
       "file_stem": "12742.75Hz_SINE_AFG_v3",
       "captures": {
         "freq": "12742.75",
@@ -3770,7 +3770,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::12742.75Hz_SINE_AFG_v4.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::12742.75Hz_SINE_AFG_v4.csv",
       "file_stem": "12742.75Hz_SINE_AFG_v4",
       "captures": {
         "freq": "12742.75",
@@ -3801,7 +3801,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::143844.99Hz_SINE_AFG.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::143844.99Hz_SINE_AFG.csv",
       "file_stem": "143844.99Hz_SINE_AFG",
       "captures": {
         "freq": "143844.99",
@@ -3832,7 +3832,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::143844.99Hz_SINE_AFG_v1.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::143844.99Hz_SINE_AFG_v1.csv",
       "file_stem": "143844.99Hz_SINE_AFG_v1",
       "captures": {
         "freq": "143844.99",
@@ -3863,7 +3863,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::143844.99Hz_SINE_AFG_v2.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::143844.99Hz_SINE_AFG_v2.csv",
       "file_stem": "143844.99Hz_SINE_AFG_v2",
       "captures": {
         "freq": "143844.99",
@@ -3894,7 +3894,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::143844.99Hz_SINE_AFG_v3.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::143844.99Hz_SINE_AFG_v3.csv",
       "file_stem": "143844.99Hz_SINE_AFG_v3",
       "captures": {
         "freq": "143844.99",
@@ -3925,7 +3925,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::143844.99Hz_SINE_AFG_v4.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::143844.99Hz_SINE_AFG_v4.csv",
       "file_stem": "143844.99Hz_SINE_AFG_v4",
       "captures": {
         "freq": "143844.99",
@@ -3956,7 +3956,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::162.38Hz_SINE_AFG.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::162.38Hz_SINE_AFG.csv",
       "file_stem": "162.38Hz_SINE_AFG",
       "captures": {
         "freq": "162.38",
@@ -3987,7 +3987,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::162.38Hz_SINE_AFG_v1.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::162.38Hz_SINE_AFG_v1.csv",
       "file_stem": "162.38Hz_SINE_AFG_v1",
       "captures": {
         "freq": "162.38",
@@ -4018,7 +4018,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::162.38Hz_SINE_AFG_v2.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::162.38Hz_SINE_AFG_v2.csv",
       "file_stem": "162.38Hz_SINE_AFG_v2",
       "captures": {
         "freq": "162.38",
@@ -4049,7 +4049,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::162.38Hz_SINE_AFG_v3.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::162.38Hz_SINE_AFG_v3.csv",
       "file_stem": "162.38Hz_SINE_AFG_v3",
       "captures": {
         "freq": "162.38",
@@ -4080,7 +4080,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::162.38Hz_SINE_AFG_v4.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::162.38Hz_SINE_AFG_v4.csv",
       "file_stem": "162.38Hz_SINE_AFG_v4",
       "captures": {
         "freq": "162.38",
@@ -4111,7 +4111,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::1832.98Hz_SINE_AFG.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::1832.98Hz_SINE_AFG.csv",
       "file_stem": "1832.98Hz_SINE_AFG",
       "captures": {
         "freq": "1832.98",
@@ -4142,7 +4142,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::1832.98Hz_SINE_AFG_v1.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::1832.98Hz_SINE_AFG_v1.csv",
       "file_stem": "1832.98Hz_SINE_AFG_v1",
       "captures": {
         "freq": "1832.98",
@@ -4173,7 +4173,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::1832.98Hz_SINE_AFG_v2.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::1832.98Hz_SINE_AFG_v2.csv",
       "file_stem": "1832.98Hz_SINE_AFG_v2",
       "captures": {
         "freq": "1832.98",
@@ -4204,7 +4204,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::1832.98Hz_SINE_AFG_v3.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::1832.98Hz_SINE_AFG_v3.csv",
       "file_stem": "1832.98Hz_SINE_AFG_v3",
       "captures": {
         "freq": "1832.98",
@@ -4235,7 +4235,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::1832.98Hz_SINE_AFG_v4.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::1832.98Hz_SINE_AFG_v4.csv",
       "file_stem": "1832.98Hz_SINE_AFG_v4",
       "captures": {
         "freq": "1832.98",
@@ -4266,7 +4266,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::20691.38Hz_SINE_AFG.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::20691.38Hz_SINE_AFG.csv",
       "file_stem": "20691.38Hz_SINE_AFG",
       "captures": {
         "freq": "20691.38",
@@ -4297,7 +4297,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::20691.38Hz_SINE_AFG_v1.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::20691.38Hz_SINE_AFG_v1.csv",
       "file_stem": "20691.38Hz_SINE_AFG_v1",
       "captures": {
         "freq": "20691.38",
@@ -4328,7 +4328,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::20691.38Hz_SINE_AFG_v2.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::20691.38Hz_SINE_AFG_v2.csv",
       "file_stem": "20691.38Hz_SINE_AFG_v2",
       "captures": {
         "freq": "20691.38",
@@ -4359,7 +4359,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::20691.38Hz_SINE_AFG_v3.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::20691.38Hz_SINE_AFG_v3.csv",
       "file_stem": "20691.38Hz_SINE_AFG_v3",
       "captures": {
         "freq": "20691.38",
@@ -4390,7 +4390,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::20691.38Hz_SINE_AFG_v4.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::20691.38Hz_SINE_AFG_v4.csv",
       "file_stem": "20691.38Hz_SINE_AFG_v4",
       "captures": {
         "freq": "20691.38",
@@ -4421,7 +4421,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::233572.15Hz_SINE_AFG.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::233572.15Hz_SINE_AFG.csv",
       "file_stem": "233572.15Hz_SINE_AFG",
       "captures": {
         "freq": "233572.15",
@@ -4452,7 +4452,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::233572.15Hz_SINE_AFG_v1.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::233572.15Hz_SINE_AFG_v1.csv",
       "file_stem": "233572.15Hz_SINE_AFG_v1",
       "captures": {
         "freq": "233572.15",
@@ -4483,7 +4483,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::233572.15Hz_SINE_AFG_v2.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::233572.15Hz_SINE_AFG_v2.csv",
       "file_stem": "233572.15Hz_SINE_AFG_v2",
       "captures": {
         "freq": "233572.15",
@@ -4514,7 +4514,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::233572.15Hz_SINE_AFG_v3.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::233572.15Hz_SINE_AFG_v3.csv",
       "file_stem": "233572.15Hz_SINE_AFG_v3",
       "captures": {
         "freq": "233572.15",
@@ -4545,7 +4545,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::233572.15Hz_SINE_AFG_v4.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::233572.15Hz_SINE_AFG_v4.csv",
       "file_stem": "233572.15Hz_SINE_AFG_v4",
       "captures": {
         "freq": "233572.15",
@@ -4576,7 +4576,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::263.67Hz_SINE_AFG.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::263.67Hz_SINE_AFG.csv",
       "file_stem": "263.67Hz_SINE_AFG",
       "captures": {
         "freq": "263.67",
@@ -4607,7 +4607,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::263.67Hz_SINE_AFG_v1.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::263.67Hz_SINE_AFG_v1.csv",
       "file_stem": "263.67Hz_SINE_AFG_v1",
       "captures": {
         "freq": "263.67",
@@ -4638,7 +4638,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::263.67Hz_SINE_AFG_v2.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::263.67Hz_SINE_AFG_v2.csv",
       "file_stem": "263.67Hz_SINE_AFG_v2",
       "captures": {
         "freq": "263.67",
@@ -4669,7 +4669,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::263.67Hz_SINE_AFG_v3.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::263.67Hz_SINE_AFG_v3.csv",
       "file_stem": "263.67Hz_SINE_AFG_v3",
       "captures": {
         "freq": "263.67",
@@ -4700,7 +4700,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::263.67Hz_SINE_AFG_v4.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::263.67Hz_SINE_AFG_v4.csv",
       "file_stem": "263.67Hz_SINE_AFG_v4",
       "captures": {
         "freq": "263.67",
@@ -4731,7 +4731,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::2976.35Hz_SINE_AFG.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::2976.35Hz_SINE_AFG.csv",
       "file_stem": "2976.35Hz_SINE_AFG",
       "captures": {
         "freq": "2976.35",
@@ -4762,7 +4762,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::2976.35Hz_SINE_AFG_v1.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::2976.35Hz_SINE_AFG_v1.csv",
       "file_stem": "2976.35Hz_SINE_AFG_v1",
       "captures": {
         "freq": "2976.35",
@@ -4793,7 +4793,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::2976.35Hz_SINE_AFG_v2.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::2976.35Hz_SINE_AFG_v2.csv",
       "file_stem": "2976.35Hz_SINE_AFG_v2",
       "captures": {
         "freq": "2976.35",
@@ -4824,7 +4824,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::2976.35Hz_SINE_AFG_v3.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::2976.35Hz_SINE_AFG_v3.csv",
       "file_stem": "2976.35Hz_SINE_AFG_v3",
       "captures": {
         "freq": "2976.35",
@@ -4855,7 +4855,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::2976.35Hz_SINE_AFG_v4.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::2976.35Hz_SINE_AFG_v4.csv",
       "file_stem": "2976.35Hz_SINE_AFG_v4",
       "captures": {
         "freq": "2976.35",
@@ -4886,7 +4886,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::33598.18Hz_SINE_AFG.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::33598.18Hz_SINE_AFG.csv",
       "file_stem": "33598.18Hz_SINE_AFG",
       "captures": {
         "freq": "33598.18",
@@ -4917,7 +4917,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::33598.18Hz_SINE_AFG_v1.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::33598.18Hz_SINE_AFG_v1.csv",
       "file_stem": "33598.18Hz_SINE_AFG_v1",
       "captures": {
         "freq": "33598.18",
@@ -4948,7 +4948,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::33598.18Hz_SINE_AFG_v2.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::33598.18Hz_SINE_AFG_v2.csv",
       "file_stem": "33598.18Hz_SINE_AFG_v2",
       "captures": {
         "freq": "33598.18",
@@ -4979,7 +4979,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::33598.18Hz_SINE_AFG_v3.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::33598.18Hz_SINE_AFG_v3.csv",
       "file_stem": "33598.18Hz_SINE_AFG_v3",
       "captures": {
         "freq": "33598.18",
@@ -5010,7 +5010,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::33598.18Hz_SINE_AFG_v4.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::33598.18Hz_SINE_AFG_v4.csv",
       "file_stem": "33598.18Hz_SINE_AFG_v4",
       "captures": {
         "freq": "33598.18",
@@ -5041,7 +5041,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::379269.02Hz_SINE_AFG.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::379269.02Hz_SINE_AFG.csv",
       "file_stem": "379269.02Hz_SINE_AFG",
       "captures": {
         "freq": "379269.02",
@@ -5072,7 +5072,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::379269.02Hz_SINE_AFG_v1.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::379269.02Hz_SINE_AFG_v1.csv",
       "file_stem": "379269.02Hz_SINE_AFG_v1",
       "captures": {
         "freq": "379269.02",
@@ -5103,7 +5103,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::379269.02Hz_SINE_AFG_v2.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::379269.02Hz_SINE_AFG_v2.csv",
       "file_stem": "379269.02Hz_SINE_AFG_v2",
       "captures": {
         "freq": "379269.02",
@@ -5134,7 +5134,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::379269.02Hz_SINE_AFG_v3.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::379269.02Hz_SINE_AFG_v3.csv",
       "file_stem": "379269.02Hz_SINE_AFG_v3",
       "captures": {
         "freq": "379269.02",
@@ -5165,7 +5165,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::379269.02Hz_SINE_AFG_v4.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::379269.02Hz_SINE_AFG_v4.csv",
       "file_stem": "379269.02Hz_SINE_AFG_v4",
       "captures": {
         "freq": "379269.02",
@@ -5196,7 +5196,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::428.13Hz_SINE_AFG.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::428.13Hz_SINE_AFG.csv",
       "file_stem": "428.13Hz_SINE_AFG",
       "captures": {
         "freq": "428.13",
@@ -5227,7 +5227,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::428.13Hz_SINE_AFG_v1.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::428.13Hz_SINE_AFG_v1.csv",
       "file_stem": "428.13Hz_SINE_AFG_v1",
       "captures": {
         "freq": "428.13",
@@ -5258,7 +5258,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::428.13Hz_SINE_AFG_v2.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::428.13Hz_SINE_AFG_v2.csv",
       "file_stem": "428.13Hz_SINE_AFG_v2",
       "captures": {
         "freq": "428.13",
@@ -5289,7 +5289,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::428.13Hz_SINE_AFG_v3.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::428.13Hz_SINE_AFG_v3.csv",
       "file_stem": "428.13Hz_SINE_AFG_v3",
       "captures": {
         "freq": "428.13",
@@ -5320,7 +5320,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::428.13Hz_SINE_AFG_v4.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::428.13Hz_SINE_AFG_v4.csv",
       "file_stem": "428.13Hz_SINE_AFG_v4",
       "captures": {
         "freq": "428.13",
@@ -5351,7 +5351,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::4832.93Hz_SINE_AFG.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::4832.93Hz_SINE_AFG.csv",
       "file_stem": "4832.93Hz_SINE_AFG",
       "captures": {
         "freq": "4832.93",
@@ -5382,7 +5382,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::4832.93Hz_SINE_AFG_v1.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::4832.93Hz_SINE_AFG_v1.csv",
       "file_stem": "4832.93Hz_SINE_AFG_v1",
       "captures": {
         "freq": "4832.93",
@@ -5413,7 +5413,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::4832.93Hz_SINE_AFG_v2.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::4832.93Hz_SINE_AFG_v2.csv",
       "file_stem": "4832.93Hz_SINE_AFG_v2",
       "captures": {
         "freq": "4832.93",
@@ -5444,7 +5444,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::4832.93Hz_SINE_AFG_v3.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::4832.93Hz_SINE_AFG_v3.csv",
       "file_stem": "4832.93Hz_SINE_AFG_v3",
       "captures": {
         "freq": "4832.93",
@@ -5475,7 +5475,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::4832.93Hz_SINE_AFG_v4.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::4832.93Hz_SINE_AFG_v4.csv",
       "file_stem": "4832.93Hz_SINE_AFG_v4",
       "captures": {
         "freq": "4832.93",
@@ -5506,7 +5506,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::54555.95Hz_SINE_AFG.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::54555.95Hz_SINE_AFG.csv",
       "file_stem": "54555.95Hz_SINE_AFG",
       "captures": {
         "freq": "54555.95",
@@ -5537,7 +5537,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::54555.95Hz_SINE_AFG_v1.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::54555.95Hz_SINE_AFG_v1.csv",
       "file_stem": "54555.95Hz_SINE_AFG_v1",
       "captures": {
         "freq": "54555.95",
@@ -5568,7 +5568,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::54555.95Hz_SINE_AFG_v2.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::54555.95Hz_SINE_AFG_v2.csv",
       "file_stem": "54555.95Hz_SINE_AFG_v2",
       "captures": {
         "freq": "54555.95",
@@ -5599,7 +5599,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::54555.95Hz_SINE_AFG_v3.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::54555.95Hz_SINE_AFG_v3.csv",
       "file_stem": "54555.95Hz_SINE_AFG_v3",
       "captures": {
         "freq": "54555.95",
@@ -5630,7 +5630,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::54555.95Hz_SINE_AFG_v4.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::54555.95Hz_SINE_AFG_v4.csv",
       "file_stem": "54555.95Hz_SINE_AFG_v4",
       "captures": {
         "freq": "54555.95",
@@ -5661,7 +5661,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::615848.21Hz_SINE_AFG.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::615848.21Hz_SINE_AFG.csv",
       "file_stem": "615848.21Hz_SINE_AFG",
       "captures": {
         "freq": "615848.21",
@@ -5692,7 +5692,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::615848.21Hz_SINE_AFG_v1.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::615848.21Hz_SINE_AFG_v1.csv",
       "file_stem": "615848.21Hz_SINE_AFG_v1",
       "captures": {
         "freq": "615848.21",
@@ -5723,7 +5723,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::615848.21Hz_SINE_AFG_v2.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::615848.21Hz_SINE_AFG_v2.csv",
       "file_stem": "615848.21Hz_SINE_AFG_v2",
       "captures": {
         "freq": "615848.21",
@@ -5754,7 +5754,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::615848.21Hz_SINE_AFG_v3.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::615848.21Hz_SINE_AFG_v3.csv",
       "file_stem": "615848.21Hz_SINE_AFG_v3",
       "captures": {
         "freq": "615848.21",
@@ -5785,7 +5785,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::615848.21Hz_SINE_AFG_v4.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::615848.21Hz_SINE_AFG_v4.csv",
       "file_stem": "615848.21Hz_SINE_AFG_v4",
       "captures": {
         "freq": "615848.21",
@@ -5816,7 +5816,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::695.19Hz_SINE_AFG.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::695.19Hz_SINE_AFG.csv",
       "file_stem": "695.19Hz_SINE_AFG",
       "captures": {
         "freq": "695.19",
@@ -5847,7 +5847,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::695.19Hz_SINE_AFG_v1.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::695.19Hz_SINE_AFG_v1.csv",
       "file_stem": "695.19Hz_SINE_AFG_v1",
       "captures": {
         "freq": "695.19",
@@ -5878,7 +5878,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::695.19Hz_SINE_AFG_v2.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::695.19Hz_SINE_AFG_v2.csv",
       "file_stem": "695.19Hz_SINE_AFG_v2",
       "captures": {
         "freq": "695.19",
@@ -5909,7 +5909,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::695.19Hz_SINE_AFG_v3.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::695.19Hz_SINE_AFG_v3.csv",
       "file_stem": "695.19Hz_SINE_AFG_v3",
       "captures": {
         "freq": "695.19",
@@ -5940,7 +5940,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::695.19Hz_SINE_AFG_v4.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::695.19Hz_SINE_AFG_v4.csv",
       "file_stem": "695.19Hz_SINE_AFG_v4",
       "captures": {
         "freq": "695.19",
@@ -5971,7 +5971,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::7847.6Hz_SINE_AFG.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::7847.6Hz_SINE_AFG.csv",
       "file_stem": "7847.6Hz_SINE_AFG",
       "captures": {
         "freq": "7847.6",
@@ -6002,7 +6002,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::7847.6Hz_SINE_AFG_v1.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::7847.6Hz_SINE_AFG_v1.csv",
       "file_stem": "7847.6Hz_SINE_AFG_v1",
       "captures": {
         "freq": "7847.6",
@@ -6033,7 +6033,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::7847.6Hz_SINE_AFG_v2.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::7847.6Hz_SINE_AFG_v2.csv",
       "file_stem": "7847.6Hz_SINE_AFG_v2",
       "captures": {
         "freq": "7847.6",
@@ -6064,7 +6064,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::7847.6Hz_SINE_AFG_v3.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::7847.6Hz_SINE_AFG_v3.csv",
       "file_stem": "7847.6Hz_SINE_AFG_v3",
       "captures": {
         "freq": "7847.6",
@@ -6095,7 +6095,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::7847.6Hz_SINE_AFG_v4.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::7847.6Hz_SINE_AFG_v4.csv",
       "file_stem": "7847.6Hz_SINE_AFG_v4",
       "captures": {
         "freq": "7847.6",
@@ -6126,7 +6126,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::88586.68Hz_SINE_AFG.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::88586.68Hz_SINE_AFG.csv",
       "file_stem": "88586.68Hz_SINE_AFG",
       "captures": {
         "freq": "88586.68",
@@ -6157,7 +6157,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::88586.68Hz_SINE_AFG_v1.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::88586.68Hz_SINE_AFG_v1.csv",
       "file_stem": "88586.68Hz_SINE_AFG_v1",
       "captures": {
         "freq": "88586.68",
@@ -6188,7 +6188,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::88586.68Hz_SINE_AFG_v2.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::88586.68Hz_SINE_AFG_v2.csv",
       "file_stem": "88586.68Hz_SINE_AFG_v2",
       "captures": {
         "freq": "88586.68",
@@ -6219,7 +6219,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::88586.68Hz_SINE_AFG_v3.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::88586.68Hz_SINE_AFG_v3.csv",
       "file_stem": "88586.68Hz_SINE_AFG_v3",
       "captures": {
         "freq": "88586.68",
@@ -6250,7 +6250,7 @@
       "pattern_error": null
     },
     {
-      "file": "AFG_measurements/Hz_SINE_AFG_xe.zip::88586.68Hz_SINE_AFG_v4.csv",
+      "file": "../AFG_measurements/Hz_SINE_AFG_xe.zip::88586.68Hz_SINE_AFG_v4.csv",
       "file_stem": "88586.68Hz_SINE_AFG_v4",
       "captures": {
         "freq": "88586.68",

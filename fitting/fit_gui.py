@@ -96,6 +96,7 @@ from model import (
     default_boundary_ratios,
     boundary_ratios_to_positions,
     boundary_ratios_to_x_values,
+    pcts_to_boundary_ratios,
     extract_segment_parameter_names,
     build_piecewise_model_definition,
     make_segment_specs,
@@ -189,8 +190,6 @@ class ManualFitGUI(QMainWindow):
         self.x_channel = "TIME"
         self.y_channel = "CH2"
         self.last_popt = None
-        self.last_pcov = None
-        self.last_r2 = None
         self.auto_fit_btn_default_text = "Auto Fit"
         self.current_boundary_ratios = default_boundary_ratios(
             max(0, len(self._piecewise_model.segment_exprs) - 1)
@@ -202,8 +201,6 @@ class ManualFitGUI(QMainWindow):
         self.param_capture_combos = {}
         self.fit_thread = None
         self.fit_worker = None
-        self.batch_thread = None
-        self.batch_worker = None
         self.fit_tasks = {}
         self._fit_task_counter = 0
         self._fit_max_concurrent = max(1, int((os.cpu_count() or 2) - 1))
@@ -226,8 +223,6 @@ class ManualFitGUI(QMainWindow):
         self.analysis_param_columns = []
         self._analysis_point_pick_cid = None
         self._analysis_scatter_files = {}
-        self.max_thumbnails = 8
-        self.thumb_cols = 1
         self.batch_row_height = 64
         self.batch_row_height_min = 40
         self.batch_row_height_max = 320
@@ -268,7 +263,7 @@ class ManualFitGUI(QMainWindow):
         self.smoothing_window = 101
 
         # Current directory
-        self.current_dir = "./AFG_measurements/"
+        self.current_dir = "../AFG_measurements/"
         self._source_display_override = None
         self._source_selected_paths = []
         self._fit_details_restore_in_progress = False
@@ -991,16 +986,6 @@ class ManualFitGUI(QMainWindow):
             else "Cancel"
         )
 
-    def _default_param_midpoints(self, specs):
-        midpoints = []
-        for spec in specs:
-            low = float(spec.min_value)
-            high = float(spec.max_value)
-            if low > high:
-                low, high = high, low
-            midpoints.append((low + high) * 0.5)
-        return midpoints
-
     def _default_param_values(self, specs):
         defaults = []
         for spec in specs:
@@ -1415,9 +1400,6 @@ class ManualFitGUI(QMainWindow):
             return 0
         return max(0, len(model_def.segment_exprs) - 1)
 
-    def _boundary_ratios_to_positions(self, ratios, n_boundaries):
-        return boundary_ratios_to_positions(ratios, n_boundaries)
-
     def _boundary_positions_to_ratios(self, positions, n_boundaries):
         n = int(max(0, n_boundaries))
         if n <= 0:
@@ -1425,15 +1407,7 @@ class ManualFitGUI(QMainWindow):
         pos_arr = np.asarray(positions, dtype=float).reshape(-1)
         if pos_arr.size != n:
             return default_boundary_ratios(n)
-        pos_arr = np.clip(pos_arr, 0.0, 1.0)
-        pos_arr = np.maximum.accumulate(pos_arr)
-        ratios = np.empty(n, dtype=float)
-        prev = 0.0
-        for idx, position in enumerate(pos_arr):
-            denom = max(1.0 - prev, 1e-12)
-            ratios[idx] = float(np.clip((float(position) - prev) / denom, 0.0, 1.0))
-            prev = float(position)
-        return ratios
+        return pcts_to_boundary_ratios(pos_arr)
 
     def _x_axis_range_for_boundary_controls(self):
         if self.current_data is None:
@@ -1490,7 +1464,7 @@ class ManualFitGUI(QMainWindow):
             ratios = default_boundary_ratios(n_boundaries)
         ratios = np.clip(ratios, 0.0, 1.0)
         self.current_boundary_ratios = ratios
-        positions = self._boundary_ratios_to_positions(ratios, n_boundaries)
+        positions = boundary_ratios_to_positions(ratios, n_boundaries)
         x_min, x_max = self._x_axis_range_for_boundary_controls()
         axis_label = self._channel_axis_label(self.x_channel)
         if slider is not None:
@@ -1514,7 +1488,7 @@ class ManualFitGUI(QMainWindow):
 
         pos_arr = np.asarray(positions, dtype=float).reshape(-1)
         if pos_arr.size != n_boundaries:
-            pos_arr = self._boundary_ratios_to_positions(
+            pos_arr = boundary_ratios_to_positions(
                 getattr(
                     self,
                     "current_boundary_ratios",
@@ -1944,9 +1918,6 @@ class ManualFitGUI(QMainWindow):
             upper.append(high)
         return lower, upper
 
-    def get_fit_parameter_keys(self):
-        return [spec.key for spec in self.param_specs]
-
     def _value_to_slider_position(self, key, value):
         min_box = self.param_min_spinboxes.get(key)
         max_box = self.param_max_spinboxes.get(key)
@@ -2247,7 +2218,7 @@ class ManualFitGUI(QMainWindow):
         if ratios.size != n:
             ratios = default_boundary_ratios(n)
         ratios = np.clip(ratios, 0.0, 1.0)
-        positions = self._boundary_ratios_to_positions(ratios, n)
+        positions = boundary_ratios_to_positions(ratios, n)
         x_min, x_max = self._x_axis_range_for_boundary_controls()
         span = float(x_max - x_min)
         values = x_min + span * positions
@@ -3178,8 +3149,6 @@ class ManualFitGUI(QMainWindow):
                 max(0, len(model_def.segment_exprs) - 1)
             )
             self.last_popt = None
-            self.last_pcov = None
-            self.last_r2 = None
             self._last_r2 = None
             self._last_fit_active_keys = []
             self.rebuild_manual_param_controls()
@@ -4630,18 +4599,6 @@ class ManualFitGUI(QMainWindow):
             return np.asarray([], dtype=float)
 
     @staticmethod
-    def _json_float_or_none(value):
-        if value is None:
-            return None
-        try:
-            numeric = float(value)
-        except Exception:
-            return None
-        if not np.isfinite(numeric):
-            return None
-        return float(numeric)
-
-    @staticmethod
     def _float_list_or_none(values):
         if values is None:
             return None
@@ -4718,7 +4675,7 @@ class ManualFitGUI(QMainWindow):
                     "file_stem": stem_for_file_ref(file_ref),
                     "captures": dict(row.get("captures") or {}),
                     "params": self._float_list_or_none(row.get("params")),
-                    "r2": self._json_float_or_none(row.get("r2")),
+                    "r2": finite_float_or_none(row.get("r2")),
                     "error": (
                         str(row.get("error"))
                         if row.get("error") not in (None, "")
@@ -4824,7 +4781,7 @@ class ManualFitGUI(QMainWindow):
                 item = param_key_to_item.get(str(col_name))
                 if item is None:
                     continue
-                numeric = self._json_float_or_none(values[idx])
+                numeric = finite_float_or_none(values[idx])
                 if numeric is None:
                     continue
                 if item.get("kind") == "param":
@@ -4859,7 +4816,7 @@ class ManualFitGUI(QMainWindow):
                     "file_stem": file_stem,
                     "captures": captures,
                     "params": param_values,
-                    "r2": self._json_float_or_none(values[r2_idx]),
+                    "r2": finite_float_or_none(values[r2_idx]),
                     "error": error_text if error_text else None,
                     "boundary_values": (
                         boundary_values
@@ -5028,7 +4985,7 @@ class ManualFitGUI(QMainWindow):
                 if raw_row.get("pattern_error") not in (None, "")
                 else row.get("pattern_error")
             )
-            row["r2"] = self._json_float_or_none(raw_row.get("r2"))
+            row["r2"] = finite_float_or_none(raw_row.get("r2"))
 
             params = self._as_float_array(raw_row.get("params"))
             if params.size > 0:
@@ -5120,15 +5077,15 @@ class ManualFitGUI(QMainWindow):
                     )
                     if fallback is None:
                         continue
-                    min_value = self._json_float_or_none(entry.get("min_value"))
-                    max_value = self._json_float_or_none(entry.get("max_value"))
+                    min_value = finite_float_or_none(entry.get("min_value"))
+                    max_value = finite_float_or_none(entry.get("max_value"))
                     if min_value is None:
                         min_value = float(fallback.min_value)
                     if max_value is None:
                         max_value = float(fallback.max_value)
                     if min_value > max_value:
                         min_value, max_value = max_value, min_value
-                    default_value = self._json_float_or_none(entry.get("default"))
+                    default_value = finite_float_or_none(entry.get("default"))
                     if default_value is None:
                         default_value = float(fallback.default)
                     default_value = float(np.clip(default_value, min_value, max_value))
@@ -5174,7 +5131,7 @@ class ManualFitGUI(QMainWindow):
                         high = float(max(spec.min_value, spec.max_value))
                         min_box.setValue(float(low))
                         max_box.setValue(float(high))
-                        value = self._json_float_or_none(state.get("value"))
+                        value = finite_float_or_none(state.get("value"))
                         if value is None:
                             value = float(spec.default)
                         spinbox.setValue(float(np.clip(value, low, high)))
@@ -5780,8 +5737,6 @@ class ManualFitGUI(QMainWindow):
                 self.file_combo.setCurrentIndex(idx)
                 self.file_combo.blockSignals(False)
             self.last_popt = None
-            self.last_pcov = None
-            self.last_r2 = None
             self._last_r2 = None
 
             try:
@@ -5854,10 +5809,6 @@ class ManualFitGUI(QMainWindow):
         return [
             float(self.param_spinboxes[spec.key].value()) for spec in self.param_specs
         ]
-
-    def get_batch_params(self):
-        """Get batch fit initial parameters from shared controls."""
-        return self.get_current_params()
 
     def _apply_batch_params_for_file(self, file_path):
         """Apply batch-fitted parameters for this file if available."""
@@ -6047,10 +5998,6 @@ class ManualFitGUI(QMainWindow):
         self._load_selected_csv_files(selected_csvs)
 
     def auto_fit(self):
-        """Start the default piecewise auto-fit in a worker thread."""
-        self._start_auto_fit()
-
-    def _start_auto_fit(self):
         """Start auto-fit in a worker thread to keep GUI responsive."""
         if self.current_data is None:
             self.stats_text.append("No data loaded!")
@@ -6118,13 +6065,11 @@ class ManualFitGUI(QMainWindow):
         )
         self.last_popt = best_params
         self._last_fit_active_keys = list(ordered_keys)
-        self.last_pcov = None
-        self.last_r2 = (
+        self._last_r2 = (
             float(fit_result["r2"])
             if fit_result is not None and fit_result.get("r2") is not None
             else None
         )
-        self._last_r2 = self.last_r2
         if (
             isinstance(fit_result, dict)
             and fit_result.get("boundary_ratios") is not None
@@ -6140,7 +6085,7 @@ class ManualFitGUI(QMainWindow):
                 self.param_spinboxes[key].setValue(self.last_popt[idx])
         self.defaults = list(self.last_popt)
 
-        r2_text = f"{self.last_r2:.6f}" if self.last_r2 is not None else "N/A"
+        r2_text = f"{self._last_r2:.6f}" if self._last_r2 is not None else "N/A"
         violations = self._fit_param_range_violations(best_params)
         range_error = self._fit_param_range_error_text(violations)
         if range_error:
@@ -6251,25 +6196,6 @@ class ManualFitGUI(QMainWindow):
         self.auto_fit_btn.setText(self.auto_fit_btn_default_text)
         if hasattr(self, "reset_from_batch_btn"):
             self.reset_from_batch_btn.setEnabled(True)
-
-    def cleanup_batch_thread(self, *, force=False):
-        self._shutdown_thread(
-            self.batch_thread,
-            wait_ms=250,
-            force_terminate=True,
-        )
-        if self.batch_worker is not None:
-            self.batch_worker.deleteLater()
-        self.batch_thread = None
-        self.batch_worker = None
-        self.batch_fit_in_progress = False
-        self._batch_cancel_pending = False
-        self._batch_progress_done = 0
-        self.run_batch_btn.setEnabled(True)
-        self.run_batch_btn.setText(self.run_batch_btn_default_text)
-        self.cancel_batch_btn.setEnabled(False)
-        self.cancel_batch_btn.setText("Cancel")
-        self.batch_status_label.hide()
 
     def _get_channel_data(self, channel_name):
         if channel_name in self.channel_cache:
@@ -6941,8 +6867,6 @@ class ManualFitGUI(QMainWindow):
                     params = self._as_float_array(row.get("params"))
                     self.last_popt = params
                     self._last_fit_active_keys = self._ordered_param_keys()
-                    self.last_pcov = None
-                    self.last_r2 = r2_val
                     self._last_r2 = r2_val
                     self._apply_batch_params_for_file(file_path)
                     self.update_plot(fast=False)
@@ -7206,95 +7130,6 @@ class ManualFitGUI(QMainWindow):
                 parameter_capture_map=parameter_capture_map,
                 queue_position=queue_position,
             )
-
-    def on_batch_progress(self, completed, total, row):
-        """Update progress label while batch is running."""
-        self._batch_progress_done = int(completed)
-        self.run_batch_btn.setText(f"Run Batch ({self._batch_progress_done}/{total})")
-
-        row_index = row.get("_source_index")
-        if row_index is None:
-            for idx, existing_row in enumerate(self.batch_results):
-                if existing_row.get("file") == row.get("file"):
-                    row_index = idx
-                    break
-        if row_index is not None and 0 <= row_index < len(self.batch_results):
-            existing = self.batch_results[row_index]
-            row_has_fit = has_nonempty_values(row.get("params"))
-            existing_plot_has_fit = existing.get("plot_has_fit")
-            if existing_plot_has_fit is None:
-                existing_plot_has_fit = has_nonempty_values(existing.get("params"))
-            if (
-                (not row_has_fit)
-                and (not existing_plot_has_fit)
-                and existing.get("plot_full") is not None
-                and row.get("plot_full") is None
-            ):
-                row["plot_full"] = existing["plot_full"]
-                row["plot_has_fit"] = False
-                row["plot_render_size"] = existing.get("plot_render_size")
-            elif (
-                (not row_has_fit)
-                and (not existing_plot_has_fit)
-                and existing.get("plot") is not None
-                and row.get("plot") is None
-            ):
-                row["plot"] = existing["plot"]
-                row["plot_has_fit"] = False
-                row["plot_render_size"] = existing.get("plot_render_size")
-            self.batch_results[row_index] = row
-            table_row_idx = self._find_table_row_by_file(row["file"])
-            if table_row_idx is not None:
-                self.update_batch_table_row(table_row_idx, row)
-            if row_has_fit and row.get("plot_full") is None:
-                self._start_thumbnail_render(row_indices=[row_index])
-            current_file = self._current_loaded_file_path()
-            if current_file and row.get("file") == current_file and row_has_fit:
-                if self._apply_batch_params_for_file(current_file):
-                    self.update_plot(fast=False)
-
-    def on_batch_finished(self, results):
-        """Populate table and thumbnails after batch fit finishes."""
-        previous_by_file = {row["file"]: row for row in self.batch_results}
-        ordered_results = sorted(
-            list(results), key=lambda row: int(row.get("_source_index", 0))
-        )
-        self.batch_results = ordered_results
-        for row in self.batch_results:
-            existing = previous_by_file.get(row["file"])
-            if not existing:
-                continue
-            row_has_fit = has_nonempty_values(row.get("params"))
-            existing_plot_has_fit = existing.get("plot_has_fit")
-            if existing_plot_has_fit is None:
-                existing_plot_has_fit = has_nonempty_values(existing.get("params"))
-            if row_has_fit or existing_plot_has_fit:
-                continue
-            if existing.get("plot_full") is not None and row.get("plot_full") is None:
-                row["plot_full"] = existing["plot_full"]
-                row["plot_has_fit"] = False
-                row["plot_render_size"] = existing.get("plot_render_size")
-            elif existing.get("plot") is not None and row.get("plot") is None:
-                row["plot"] = existing["plot"]
-                row["plot_has_fit"] = False
-                row["plot_render_size"] = existing.get("plot_render_size")
-        self.update_batch_table()
-        current_file = self._current_loaded_file_path()
-        if current_file and self._apply_batch_params_for_file(current_file):
-            self.update_plot(fast=False)
-        self._refresh_batch_analysis_if_run()
-        self.stats_text.append("✓ Batch fit completed.")
-        self.cleanup_batch_thread()
-        self.queue_visible_thumbnail_render()
-        self._autosave_fit_details()
-
-    def on_batch_failed(self, error_text):
-        self.stats_text.append(f"✗ Batch fit failed: {error_text}")
-        self.cleanup_batch_thread()
-
-    def on_batch_cancelled(self):
-        self.stats_text.append("Batch fit cancelled.")
-        self.cleanup_batch_thread()
 
     def _force_stop_batch_fit(self, reason_text):
         if not self.batch_fit_in_progress:
@@ -7944,7 +7779,6 @@ class ManualFitGUI(QMainWindow):
         self._manual_active_task_ids = set()
         self._request_worker_cancel(self.thumb_worker)
         self._shutdown_thread(self.fit_thread, wait_ms=2000, force_terminate=True)
-        self._shutdown_thread(self.batch_thread, wait_ms=2000, force_terminate=True)
         self._shutdown_thread(self.thumb_thread, wait_ms=2000, force_terminate=True)
         super().closeEvent(event)
 

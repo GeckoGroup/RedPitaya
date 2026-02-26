@@ -311,7 +311,7 @@ def _render_expression_pretty(
 
     if isinstance(node, ast.Name):
         if node.id == "pi":
-            return "pi"
+            return "π"
         if node.id == "e":
             return "e"
         if name_map:
@@ -344,7 +344,8 @@ def format_expression_pretty(
         return _render_expression_pretty(tree.body, name_map=name_map)
     except Exception:
         fallback = text
-        fallback = re.sub(r"\b(?:np|math)\.pi\b", "pi", fallback)
+        fallback = re.sub(r"\b(?:np|math)\.pi\b", "π", fallback)
+        fallback = re.sub(r"\bpi\b", "π", fallback)
         fallback = re.sub(r"\b(?:np|math)\.e\b", "e", fallback)
         fallback = re.sub(
             r"\b(?:np|math)\.(sin|cos|tan|arcsin|arccos|arctan|sinh|cosh|tanh|exp|log10|log|sqrt|abs|power|minimum|maximum|clip)\b",
@@ -644,7 +645,7 @@ def colorize_expression_html(
     _constant_set: Set[str] = (
         {str(t) for t in constant_tokens}
         if constant_tokens is not None
-        else {"pi", "e"}
+        else {"pi", "π", "e"}
     )
     _symbol_map: Mapping[str, str] = symbol_map or {}
 

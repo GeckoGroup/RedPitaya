@@ -812,4 +812,6 @@ __all__ = [
     "fit_ordered_piecewise",
     "refit_ordered_piecewise_from_seed",
     "predict_ordered_piecewise",
+    "pcts_to_boundary_ratios",
+    "boundary_ratios_to_pcts",
 ]
