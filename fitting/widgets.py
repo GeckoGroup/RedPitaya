@@ -64,6 +64,14 @@ class NumericSortTableWidgetItem(QTableWidgetItem):
 
     def __lt__(self, other):
         if isinstance(other, QTableWidgetItem):
+            left_sort = self.data(TABLE_SORT_ROLE)
+            right_sort = other.data(TABLE_SORT_ROLE)
+            if left_sort is not None and right_sort is not None:
+                left_rank = self._to_number(left_sort)
+                right_rank = self._to_number(right_sort)
+                if left_rank is not None and right_rank is not None:
+                    return left_rank < right_rank
+                return str(left_sort) < str(right_sort)
             left_num = self._to_number(self.text())
             right_num = self._to_number(other.text())
             if left_num is not None and right_num is not None:
@@ -194,6 +202,7 @@ def format_boundary_display_name(index: int) -> str:
 
 
 _RICH_TEXT_ROLE = int(Qt.ItemDataRole.UserRole) + 11
+TABLE_SORT_ROLE = int(Qt.ItemDataRole.UserRole) + 12
 
 
 class RichTextItemDelegate(QStyledItemDelegate):
@@ -361,6 +370,7 @@ class MultiHandleSlider(QWidget):
         super().__init__(parent)
         self._values = []
         self._labels = []
+        self._linked_indices = set()  # indices that are part of a link group
         self._active_index = -1
         self._handle_radius = 7
         self._track_margin = 10
@@ -389,6 +399,14 @@ class MultiHandleSlider(QWidget):
             self.update()
             return
         self._labels = [str(item) for item in list(labels)]
+        self.update()
+
+    def set_linked_indices(self, indices):
+        """Mark handle indices that are part of a boundary link group."""
+        if indices is None:
+            self._linked_indices = set()
+        else:
+            self._linked_indices = {int(i) for i in indices}
         self.update()
 
     def _track_geometry(self):
@@ -454,12 +472,18 @@ class MultiHandleSlider(QWidget):
         for idx, value in enumerate(self._values):
             x_pos = int(round(self._value_to_x(value)))
             is_active = idx == self._active_index
-            painter.setPen(
-                QPen(QColor("#4b5563") if not is_active else QColor("#1d4ed8"), 1.2)
-            )
-            painter.setBrush(
-                QBrush(QColor("#6b7280") if not is_active else QColor("#2563eb"))
-            )
+            is_linked = idx in self._linked_indices
+            if is_active:
+                pen_color = QColor("#1d4ed8")
+                brush_color = QColor("#2563eb")
+            elif is_linked:
+                pen_color = QColor("#7c3aed")
+                brush_color = QColor("#8b5cf6")
+            else:
+                pen_color = QColor("#4b5563")
+                brush_color = QColor("#6b7280")
+            painter.setPen(QPen(pen_color, 1.2))
+            painter.setBrush(QBrush(brush_color))
             diameter = int(self._handle_radius * 2)
             painter.drawEllipse(
                 int(x_pos - self._handle_radius),

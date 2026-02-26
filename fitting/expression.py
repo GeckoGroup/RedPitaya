@@ -2,11 +2,8 @@
 
 import ast
 import html
-import math
 import re
 from typing import (
-    Any,
-    Dict,
     List,
     Mapping,
     Optional,
@@ -49,7 +46,7 @@ _EXPRESSION_ALLOWED_FUNCTIONS = {
     "clip": np.clip,
 }
 _EXPRESSION_ALLOWED_CONSTANTS = {"pi": float(np.pi), "e": float(np.e)}
-_EXPRESSION_HELPER_NAMES = {"col", "columns", "C", "math"}
+_EXPRESSION_HELPER_NAMES = {"math"}
 _LATEX_HTML_COMMANDS = {
     "alpha": "α",
     "beta": "β",
@@ -159,6 +156,26 @@ def _latex_fragment_to_html(text: str) -> str:
     return html.escape(token)
 
 
+def _auto_greek_prefix(symbol: str) -> str:
+    """Add ``\\`` prefix when the base of *symbol* is a known Greek letter name.
+
+    For example ``phi_{mod}`` → ``\\phi_{mod}`` so that the HTML renderer
+    produces ``φ<sub>mod</sub>`` instead of ``phi<sub>mod</sub>``.  Symbols
+    that already carry a ``\\`` prefix are returned unchanged.
+    """
+    s = str(symbol).strip()
+    if not s or s.startswith("\\"):
+        return s
+    # Extract the base name (everything before the first ``_`` or ``^``).
+    base_match = re.match(r"^([A-Za-z]+)", s)
+    if not base_match:
+        return s
+    base = base_match.group(1)
+    if base in _LATEX_HTML_COMMANDS:
+        return f"\\{s}"
+    return s
+
+
 def latex_symbol_to_plain(symbol_text: str) -> Optional[str]:
     token = _normalize_latex_symbol_token(symbol_text)
     if not token:
@@ -206,9 +223,11 @@ def resolve_parameter_symbol(param_key: str, symbol_hint: Optional[str] = None) 
         raw_symbol = str(symbol_hint).strip()
         if raw_symbol:
             mapped_symbol = latex_symbol_to_plain(raw_symbol)
-            return mapped_symbol if mapped_symbol else raw_symbol
+            result = mapped_symbol if mapped_symbol else raw_symbol
+            return _auto_greek_prefix(result)
     mapped_from_key = latex_symbol_to_plain(key_text)
-    return mapped_from_key if mapped_from_key else key_text
+    result = mapped_from_key if mapped_from_key else key_text
+    return _auto_greek_prefix(result)
 
 
 def _format_number_literal(value) -> str:
@@ -311,7 +330,7 @@ def _render_expression_pretty(
 
     if isinstance(node, ast.Name):
         if node.id == "pi":
-            return "pi"
+            return "π"
         if node.id == "e":
             return "e"
         if name_map:
@@ -344,7 +363,8 @@ def format_expression_pretty(
         return _render_expression_pretty(tree.body, name_map=name_map)
     except Exception:
         fallback = text
-        fallback = re.sub(r"\b(?:np|math)\.pi\b", "pi", fallback)
+        fallback = re.sub(r"\b(?:np|math)\.pi\b", "π", fallback)
+        fallback = re.sub(r"\bpi\b", "π", fallback)
         fallback = re.sub(r"\b(?:np|math)\.e\b", "e", fallback)
         fallback = re.sub(
             r"\b(?:np|math)\.(sin|cos|tan|arcsin|arccos|arctan|sinh|cosh|tanh|exp|log10|log|sqrt|abs|power|minimum|maximum|clip)\b",
@@ -363,7 +383,9 @@ def format_expression_pretty(
                 if not raw_name or not rendered_symbol or raw_name == rendered_symbol:
                     continue
                 fallback = re.sub(
-                    rf"\b{re.escape(raw_name)}\b", rendered_symbol, fallback
+                    rf"\b{re.escape(raw_name)}\b",
+                    lambda _, sym=rendered_symbol: sym,
+                    fallback,
                 )
         return re.sub(r"\s+", " ", fallback).strip()
 
@@ -460,131 +482,6 @@ class _ExpressionParameterCollector(ast.NodeVisitor):
             self.names.append(name)
 
 
-def extract_expression_parameter_names(
-    expression_text: str,
-    reserved_names: Optional[Sequence[str]] = None,
-) -> List[str]:
-    text = str(expression_text).strip()
-    if not text:
-        raise ValueError("Function expression is empty.")
-
-    try:
-        tree = ast.parse(text, mode="eval")
-    except SyntaxError as exc:
-        raise ValueError(f"Invalid function expression: {exc.msg}") from exc
-
-    reserved = set(reserved_names or ())
-    reserved |= {"np"} | _EXPRESSION_HELPER_NAMES
-    collector = _ExpressionParameterCollector(reserved_names=reserved)
-    collector.visit(tree)
-
-    if not collector.names:
-        raise ValueError("Function must reference at least one fit parameter.")
-
-    for name in collector.names:
-        if name == "x":
-            raise ValueError(
-                "Bare 'x' is not supported. Use explicit CSV columns (for example CH3 or TIME)."
-            )
-        if not _PARAMETER_NAME_RE.fullmatch(name):
-            raise ValueError(f"Invalid parameter name '{name}' in expression.")
-    return collector.names
-
-
-def compile_expression_function(
-    expression_text: str,
-    parameter_names: Sequence[str],
-):
-    text = str(expression_text).strip()
-    if not text:
-        raise ValueError("Function expression is empty.")
-
-    ordered_names = list(parameter_names)
-    if not ordered_names:
-        raise ValueError("No parameters are defined for this function.")
-
-    try:
-        tree = ast.parse(text, mode="eval")
-    except SyntaxError as exc:
-        raise ValueError(f"Invalid function expression: {exc.msg}") from exc
-
-    code = compile(tree, "<fit_expression>", "eval")
-    eval_globals: Dict[str, Any] = {
-        "__builtins__": {},
-        "np": np,
-        "math": math,
-    }
-    eval_globals.update(_EXPRESSION_ALLOWED_FUNCTIONS)
-    eval_globals.update(_EXPRESSION_ALLOWED_CONSTANTS)
-
-    def _prepare_channel_array(values, target_length: int):
-        array = np.asarray(values, dtype=float).reshape(-1)
-        if array.size == target_length:
-            return array
-        if array.size == 1:
-            return np.full(target_length, float(array[0]), dtype=float)
-        raise ValueError(
-            f"Column length {array.size} does not match input length {target_length}."
-        )
-
-    def _evaluate(
-        x_data,
-        param_values,
-        column_data=None,
-    ):
-        input_array = np.asarray(x_data, dtype=float).reshape(-1)
-        n_points = input_array.size
-        columns = {}
-        if column_data:
-            for name, values in column_data.items():
-                try:
-                    columns[str(name)] = _prepare_channel_array(values, n_points)
-                except Exception:
-                    continue
-
-        def col(name):
-            key = str(name)
-            if key in columns:
-                return columns[key]
-            if key.upper() in columns:
-                return columns[key.upper()]
-            if key.lower() in columns:
-                return columns[key.lower()]
-            raise KeyError(f"Column '{key}' not found.")
-
-        eval_locals = {
-            "col": col,
-            "columns": columns,
-            "C": columns,
-        }
-        if "TIME" in columns:
-            eval_locals["TIME"] = columns["TIME"]
-
-        for key, values in columns.items():
-            if _PARAMETER_NAME_RE.fullmatch(key):
-                eval_locals[key] = values
-
-        for name in ordered_names:
-            if name not in param_values:
-                raise ValueError(f"Missing parameter '{name}' for expression.")
-            eval_locals[name] = float(param_values[name])
-
-        try:
-            result = eval(code, eval_globals, eval_locals)
-        except Exception as exc:
-            raise ValueError(f"Function evaluation failed: {exc}") from exc
-
-        result_array = np.asarray(result, dtype=float)
-        if result_array.shape == ():
-            return np.full_like(input_array, float(result_array), dtype=float)
-        result_array = result_array.reshape(-1)
-        if result_array.size != n_points:
-            raise ValueError("Function output length does not match input length.")
-        return result_array
-
-    return _evaluate
-
-
 # ---------------------------------------------------------------------------
 # Public convenience helpers
 # ---------------------------------------------------------------------------
@@ -600,8 +497,8 @@ def get_expression_reserved_names(
 ) -> Set[str]:
     """Return the set of names that cannot be used as parameter names.
 
-    Includes standard helpers (``col``, ``columns``, ``C``, ``math``, ``np``)
-    plus any *channel_names* that are valid identifiers.
+    Includes standard helpers (``math``, ``np``) plus any *channel_names*
+    that are valid identifiers.
     """
     reserved: Set[str] = set(_EXPRESSION_HELPER_NAMES) | {"np"}
     if channel_names:
@@ -644,7 +541,7 @@ def colorize_expression_html(
     _constant_set: Set[str] = (
         {str(t) for t in constant_tokens}
         if constant_tokens is not None
-        else {"pi", "e"}
+        else {"pi", "π", "e"}
     )
     _symbol_map: Mapping[str, str] = symbol_map or {}
 

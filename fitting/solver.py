@@ -75,6 +75,7 @@ class OrderedPiecewiseConfig:
     local_maxfev: int = 700
     robust_max_nfev: int = 45000
     prefer_jit: bool = True
+    use_jax: bool = False
 
 
 @dataclass
@@ -169,33 +170,57 @@ def _pcts_to_ratios_kernel(pcts: np.ndarray) -> np.ndarray:
 
 
 @njit_or_noop(cache=True, fastmath=True)
-def _pcts_to_boundary_values_kernel(
-    pcts: np.ndarray, x_min: float, x_span: float
+def _blend_sequence_kernel(
+    x: np.ndarray,
+    boundaries: np.ndarray,
+    bw: float,
+    seg_outputs: np.ndarray,
+    n_seg: int,
+    n_points: int,
 ) -> np.ndarray:
-    out = np.empty(pcts.size, dtype=np.float64)
-    for i in range(pcts.size):
-        pct = pcts[i]
-        if pct < 0.0:
-            pct = 0.0
-        elif pct > 1.0:
-            pct = 1.0
-        out[i] = x_min + pct * x_span
-    return out
+    """Compute blended piecewise prediction in a single compiled pass.
 
-
-@njit_or_noop(cache=True, fastmath=True)
-def _boundary_values_to_pcts_kernel(
-    boundaries: np.ndarray, x_min: float, inv_span: float
-) -> np.ndarray:
-    out = np.empty(boundaries.size, dtype=np.float64)
-    for i in range(boundaries.size):
-        pct = (boundaries[i] - x_min) * inv_span
-        if pct < 0.0:
-            pct = 0.0
-        elif pct > 1.0:
-            pct = 1.0
-        out[i] = pct
-    return out
+    *seg_outputs* is a contiguous (n_seg * n_points,) flat buffer where
+    segment *s* occupies indices ``s * n_points`` through ``(s+1) * n_points``.
+    """
+    inv_bw = 1.0 / bw if bw > 0.0 else 0.0
+    y_hat = np.empty(n_points, dtype=np.float64)
+    n_boundaries = n_seg - 1
+    for i in range(n_points):
+        xi = x[i]
+        acc = 0.0
+        for s in range(n_seg):
+            if n_seg == 1:
+                w = 1.0
+            elif s == 0:
+                t = (xi - boundaries[0]) * inv_bw + 0.5
+                if t < 0.0:
+                    t = 0.0
+                elif t > 1.0:
+                    t = 1.0
+                w = 1.0 - t
+            elif s == n_boundaries:
+                t = (xi - boundaries[s - 1]) * inv_bw + 0.5
+                if t < 0.0:
+                    t = 0.0
+                elif t > 1.0:
+                    t = 1.0
+                w = t
+            else:
+                t_prev = (xi - boundaries[s - 1]) * inv_bw + 0.5
+                if t_prev < 0.0:
+                    t_prev = 0.0
+                elif t_prev > 1.0:
+                    t_prev = 1.0
+                t_curr = (xi - boundaries[s]) * inv_bw + 0.5
+                if t_curr < 0.0:
+                    t_curr = 0.0
+                elif t_curr > 1.0:
+                    t_curr = 1.0
+                w = t_prev * (1.0 - t_curr)
+            acc += w * seg_outputs[s * n_points + i]
+        y_hat[i] = acc
+    return y_hat
 
 
 @njit_or_noop(cache=True, fastmath=True)
@@ -280,35 +305,6 @@ def pcts_to_boundary_ratios(pcts: ArrayLike) -> np.ndarray:
     prev = np.concatenate([np.asarray([0.0], dtype=float), monotone[:-1]])
     denom = np.maximum(1.0 - prev, 1e-12)
     return np.asarray((monotone - prev) / denom, dtype=float)
-
-
-def pcts_to_boundary_values(x: ArrayLike, pcts: ArrayLike) -> np.ndarray:
-    x_arr = np.asarray(x, dtype=np.float64).reshape(-1)
-    pcts_arr = np.asarray(pcts, dtype=np.float64).reshape(-1)
-    if pcts_arr.size == 0:
-        return np.asarray([], dtype=float)
-    x_min = float(np.min(x_arr))
-    x_span = float(np.max(x_arr) - x_min)
-    if NUMBA_AVAILABLE:
-        return np.asarray(
-            _pcts_to_boundary_values_kernel(pcts_arr, x_min, x_span), dtype=float
-        )
-    return np.asarray(x_min + np.clip(pcts_arr, 0.0, 1.0) * x_span, dtype=float)
-
-
-def boundary_values_to_pcts(x: ArrayLike, boundaries: ArrayLike) -> np.ndarray:
-    x_arr = np.asarray(x, dtype=np.float64).reshape(-1)
-    b_arr = np.asarray(boundaries, dtype=np.float64).reshape(-1)
-    if b_arr.size == 0:
-        return np.asarray([], dtype=float)
-    x_min = float(np.min(x_arr))
-    x_span = max(float(np.max(x_arr) - x_min), 1e-12)
-    inv_span = 1.0 / x_span
-    if NUMBA_AVAILABLE:
-        return np.asarray(
-            _boundary_values_to_pcts_kernel(b_arr, x_min, inv_span), dtype=float
-        )
-    return np.asarray(np.clip((b_arr - x_min) * inv_span, 0.0, 1.0), dtype=float)
 
 
 def _ratios_to_boundary_values_from_stats(
@@ -429,15 +425,43 @@ def _piecewise_bounds_and_p0(
     )
 
 
+def _auto_blend_width(x_sorted: np.ndarray) -> float:
+    """Compute a blend half-width for lerp transitions.
+
+    The width is large enough to span several data-point spacings so that
+    the optimizer sees a smooth gradient when moving a boundary, but small
+    enough not to distort the overall fit shape.
+    """
+    if x_sorted.size < 2:
+        return 0.0
+    span = float(x_sorted[-1] - x_sorted[0])
+    if span <= 0:
+        return 0.0
+    deltas = np.diff(x_sorted)
+    deltas = deltas[deltas > 0.0]
+    if deltas.size > 0:
+        median_dx = float(np.median(deltas))
+    else:
+        median_dx = span / max(1, x_sorted.size - 1)
+    # Use ~2% of range, but at least 4 data-point spacings
+    return float(max(0.02 * span, 4.0 * median_dx))
+
+
 def _predict_piecewise(
     segments: Sequence[SegmentSpec],
     x: ArrayLike,
     flat_params: ArrayLike,
     use_jit: bool = True,
+    blend_width: float = 0.0,
+    _x_min: Optional[float] = None,
+    _x_span: Optional[float] = None,
 ) -> Dict[str, np.ndarray]:
     x_arr = np.asarray(x, dtype=np.float64).reshape(-1)
     seg_params, ratios = _unpack_flat_params(segments, flat_params)
-    if x_arr.size > 0:
+    if _x_min is not None and _x_span is not None:
+        x_min = float(_x_min)
+        x_span = float(_x_span)
+    elif x_arr.size > 0:
         x_min = float(np.min(x_arr))
         x_span = float(np.max(x_arr) - x_min)
     else:
@@ -447,6 +471,64 @@ def _predict_piecewise(
         ratios, x_min, x_span, use_jit=bool(use_jit)
     )
 
+    n_seg = len(segments)
+    bw = float(blend_width)
+
+    if bw > 0.0 and boundaries.size > 0 and n_seg > 1:
+        # --- Lerp-blended prediction (smooth boundary transitions) ---
+        # Evaluate every segment over the full x range.  If any segment
+        # function cannot handle the full range we fall back to the hard
+        # boundary path.
+        seg_outputs: List[np.ndarray] = []
+        blend_ok = True
+        for seg_idx, (seg, p) in enumerate(zip(segments, seg_params)):
+            try:
+                y_seg = np.asarray(seg.model_func(x_arr, *p), dtype=float).reshape(-1)
+                if y_seg.size != x_arr.size:
+                    blend_ok = False
+                    break
+            except Exception:
+                blend_ok = False
+                break
+            seg_outputs.append(y_seg)
+
+        if blend_ok:
+            if use_jit and NUMBA_AVAILABLE and n_seg > 1:
+                # JIT-compiled blend: pack outputs into a flat buffer and
+                # compute weights + weighted sum in a single compiled pass.
+                seg_flat = np.empty(n_seg * x_arr.size, dtype=np.float64)
+                for si in range(n_seg):
+                    seg_flat[si * x_arr.size : (si + 1) * x_arr.size] = seg_outputs[si]
+                y_hat = _blend_sequence_kernel(
+                    x_arr,
+                    boundaries,
+                    bw,
+                    seg_flat,
+                    n_seg,
+                    x_arr.size,
+                )
+            else:
+                # NumPy fallback: build per-boundary smooth step functions.
+                steps: List[np.ndarray] = []
+                for b in boundaries:
+                    t = np.clip((x_arr - b) / bw + 0.5, 0.0, 1.0)
+                    steps.append(t)
+                y_hat = np.zeros_like(x_arr, dtype=float)
+                for seg_idx in range(n_seg):
+                    if seg_idx == 0:
+                        w = 1.0 - steps[0]
+                    elif seg_idx == n_seg - 1:
+                        w = steps[seg_idx - 1]
+                    else:
+                        w = steps[seg_idx - 1] * (1.0 - steps[seg_idx])
+                    y_hat += w * seg_outputs[seg_idx]
+
+            return {
+                "y_hat": np.asarray(y_hat, dtype=float),
+                "boundaries": np.asarray(boundaries, dtype=float),
+            }
+
+    # --- Hard boundary prediction (original behaviour) ---
     idx = np.searchsorted(boundaries, x_arr, side="right")
     y_hat = np.empty_like(x_arr, dtype=float)
     for seg_idx, (seg, p) in enumerate(zip(segments, seg_params)):
@@ -472,6 +554,7 @@ def _fit_segment_local(
     seg_index: int = -1,
     n_starts: Optional[int] = None,
     maxfev: Optional[int] = None,
+    use_jax: bool = False,
 ) -> Tuple[np.ndarray, float]:
     lo = np.asarray(seg.bounds[0], dtype=float).reshape(-1)
     hi = np.asarray(seg.bounds[1], dtype=float).reshape(-1)
@@ -489,19 +572,45 @@ def _fit_segment_local(
         for _ in range(n_try - 1):
             starts.append(rng.uniform(lo, hi))
 
+    # When JAX backend is active, use jaxfit's GPU-accelerated CurveFit
+    # with cached flength instances (avoids JIT re-tracing).
+    _jax_mgr = None
+    if use_jax:
+        try:
+            from jax_backend import get_jax_fit_manager
+
+            _jax_mgr = get_jax_fit_manager()
+        except Exception as _jax_err:
+            try:
+                import fit_log as _fl
+
+                _fl.detail(f"jax fallback (seg {seg_index}): {_jax_err}")
+            except Exception:
+                pass
+            _jax_mgr = None
+
     best_params: Optional[np.ndarray] = None
     best_sse = float("inf")
     for start in starts:
         try:
-            popt, _pcov = curve_fit(
-                seg.model_func,
-                x_seg,
-                y_seg,
-                p0=np.asarray(start, dtype=float),
-                bounds=(lo, hi),
-                method="trf",
-                maxfev=use_maxfev,
-            )
+            if _jax_mgr is not None:
+                popt, _pcov = _jax_mgr.curve_fit(
+                    seg.model_func,
+                    x_seg,
+                    y_seg,
+                    p0=np.asarray(start, dtype=float),
+                    bounds=(lo, hi),
+                )
+            else:
+                popt, _pcov = curve_fit(
+                    seg.model_func,
+                    x_seg,
+                    y_seg,
+                    p0=np.asarray(start, dtype=float),
+                    bounds=(lo, hi),
+                    method="trf",
+                    maxfev=use_maxfev,
+                )
             y_hat = np.asarray(seg.model_func(x_seg, *popt), dtype=float).reshape(-1)
             sse = _sse_score(y_seg, y_hat)
             if sse < best_sse:
@@ -581,12 +690,28 @@ class _OrderedPiecewiseSolver:
             else OrderedPiecewiseConfig()
         )
         self._use_jit = bool(self.config.prefer_jit)
+        self._use_jax = bool(self.config.use_jax)
         self._base_p0, (self._lower, self._upper) = _piecewise_bounds_and_p0(
             self.segments
         )
 
-    def _predict(self, x: ArrayLike, params: ArrayLike) -> Dict[str, np.ndarray]:
-        return _predict_piecewise(self.segments, x, params, use_jit=self._use_jit)
+    def _predict(
+        self,
+        x: ArrayLike,
+        params: ArrayLike,
+        blend_width: float = 0.0,
+        _x_min: Optional[float] = None,
+        _x_span: Optional[float] = None,
+    ) -> Dict[str, np.ndarray]:
+        return _predict_piecewise(
+            self.segments,
+            x,
+            params,
+            use_jit=self._use_jit,
+            blend_width=blend_width,
+            _x_min=_x_min,
+            _x_span=_x_span,
+        )
 
     def _fit_global_seed(
         self, x_sorted: np.ndarray, y_sorted: np.ndarray, seed: int = 0
@@ -640,6 +765,7 @@ class _OrderedPiecewiseSolver:
                         seg_index=seg_idx,
                         n_starts=local_n_starts,
                         maxfev=local_maxfev,
+                        use_jax=self._use_jax,
                     )
                 except Exception:
                     failed = True
@@ -662,7 +788,7 @@ class _OrderedPiecewiseSolver:
                 use_jit=self._use_jit,
             )
             flat = _pack_flat_params(self.segments, seg_params, ratios)
-            pred = self._predict(x_sorted, flat)
+            pred = self._predict(x_sorted, flat, _x_min=x_min, _x_span=x_span)
             best = {
                 "params": np.asarray(flat, dtype=float),
                 "y_hat": np.asarray(pred["y_hat"], dtype=float),
@@ -687,8 +813,18 @@ class _OrderedPiecewiseSolver:
             p0 = np.asarray(self._base_p0, dtype=float)
         p0 = np.clip(p0, self._lower, self._upper)
 
+        bw = _auto_blend_width(x_sorted)
+        _xmin = float(x_sorted[0]) if x_sorted.size > 0 else 0.0
+        _xspan = float(x_sorted[-1] - x_sorted[0]) if x_sorted.size > 1 else 0.0
+
         def residuals(flat: np.ndarray) -> np.ndarray:
-            y_hat = self._predict(x_sorted, flat)["y_hat"]
+            y_hat = self._predict(
+                x_sorted,
+                flat,
+                blend_width=bw,
+                _x_min=_xmin,
+                _x_span=_xspan,
+            )["y_hat"]
             return np.asarray(y_hat - y_sorted, dtype=float)
 
         diff_step = None
@@ -708,7 +844,7 @@ class _OrderedPiecewiseSolver:
             diff_step=diff_step,
         )
         popt = np.asarray(ls.x, dtype=float)
-        pred = self._predict(x_sorted, popt)
+        pred = self._predict(x_sorted, popt, _x_min=_xmin, _x_span=_xspan)
         return {
             "params": popt,
             "y_hat": np.asarray(pred["y_hat"], dtype=float),
@@ -730,6 +866,7 @@ class _OrderedPiecewiseSolver:
             "evaluated_grid_candidates": int(global_seed.get("evaluated", 0)),
             "numba_available": bool(NUMBA_AVAILABLE),
             "jit_enabled": bool(self._use_jit),
+            "jax_enabled": bool(self._use_jax),
         }
 
         return OrderedPiecewiseResult(
@@ -739,17 +876,6 @@ class _OrderedPiecewiseSolver:
             sse=float(best["sse"]),
             diagnostics=diagnostics,
         )
-
-
-def fit_ordered_piecewise(
-    x: ArrayLike,
-    y: ArrayLike,
-    segments: Sequence[SegmentSpec],
-    config: Optional[OrderedPiecewiseConfig] = None,
-    seed: int = 0,
-) -> OrderedPiecewiseResult:
-    solver = _OrderedPiecewiseSolver(segments=segments, config=config)
-    return solver.fit(x, y, seed=seed)
 
 
 def refit_ordered_piecewise_from_seed(
@@ -773,20 +899,34 @@ def refit_ordered_piecewise_from_seed(
     seed_sse = float(_sse_score(y_sorted, seed_pred["y_hat"]))
     robust = solver._fit_robust_refine(x_sorted, y_sorted, seed_flat)
 
+    # Guard: keep the seed if robust refinement produced worse SSE.
+    if float(robust["sse"]) <= seed_sse:
+        best = robust
+        selected_stage = "robust_from_seed"
+    else:
+        best = {
+            "params": seed_flat,
+            "y_hat": seed_pred["y_hat"],
+            "boundaries": seed_pred["boundaries"],
+            "sse": seed_sse,
+        }
+        selected_stage = "seed_kept (robust worse)"
+
     diagnostics: Dict[str, Any] = {
         "seed_sse": float(seed_sse),
         "robust_sse": float(robust["sse"]),
-        "final_sse": float(robust["sse"]),
-        "selected_stage": "robust_only_from_seed",
+        "final_sse": float(best["sse"]),
+        "selected_stage": selected_stage,
         "numba_available": bool(NUMBA_AVAILABLE),
         "jit_enabled": bool(solver._use_jit),
+        "jax_enabled": bool(solver._use_jax),
     }
 
     return OrderedPiecewiseResult(
-        params=np.asarray(robust["params"], dtype=float),
-        y_hat=np.asarray(robust["y_hat"], dtype=float),
-        boundaries=np.asarray(robust["boundaries"], dtype=float),
-        sse=float(robust["sse"]),
+        params=np.asarray(best["params"], dtype=float),
+        y_hat=np.asarray(best["y_hat"], dtype=float),
+        boundaries=np.asarray(best["boundaries"], dtype=float),
+        sse=float(best["sse"]),
         diagnostics=diagnostics,
     )
 
@@ -796,12 +936,18 @@ def predict_ordered_piecewise(
     segments: Sequence[SegmentSpec],
     params: ArrayLike,
     prefer_jit: bool = True,
+    blend_width: float = 0.0,
+    _x_min: Optional[float] = None,
+    _x_span: Optional[float] = None,
 ) -> Dict[str, np.ndarray]:
     return _predict_piecewise(
         segments=segments,
         x=x,
         flat_params=params,
         use_jit=bool(prefer_jit),
+        blend_width=float(blend_width),
+        _x_min=_x_min,
+        _x_span=_x_span,
     )
 
 
@@ -809,7 +955,8 @@ __all__ = [
     "SegmentSpec",
     "OrderedPiecewiseConfig",
     "OrderedPiecewiseResult",
-    "fit_ordered_piecewise",
     "refit_ordered_piecewise_from_seed",
     "predict_ordered_piecewise",
+    "pcts_to_boundary_ratios",
+    "boundary_ratios_to_pcts",
 ]

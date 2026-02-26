@@ -1,6 +1,7 @@
 """Batch processing workers and utilities for fit_gui."""
 
 import re
+from collections import deque
 from dataclasses import dataclass
 from io import BytesIO
 from typing import (
@@ -10,13 +11,21 @@ from typing import (
     Mapping,
     Optional,
     Pattern,
-    Set,
+    Sequence,
     Tuple,
 )
 
 import numpy as np
 from matplotlib.figure import Figure
-from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot, Qt
+from PyQt6.QtCore import (
+    QMutex,
+    QObject,
+    QThread,
+    QWaitCondition,
+    pyqtSignal,
+    pyqtSlot,
+    Qt,
+)
 from PyQt6.QtGui import QPixmap
 
 from expression import _PARAMETER_NAME_RE
@@ -24,15 +33,20 @@ from model import (
     FitCancelledError,
     boundary_ratios_to_x_values,
     has_nonempty_values,
-    is_fit_row_improved,
-    run_piecewise_fit_pipeline,
     smooth_channel_array,
     finite_float_or_none,
     _row_has_error,
     FIT_CURVE_COLOR,
     palette_color,
 )
+from procedure import (
+    run_procedure_pipeline,
+    _capture_seed_signature,
+    _capture_distance,
+)
+import fit_log as _fit_log
 from data_io import read_measurement_csv, stem_for_file_ref
+from fit_results import fit_get, fit_set
 
 
 @dataclass(frozen=True)
@@ -41,9 +55,6 @@ class CapturePatternConfig:
     regex_pattern: str
     regex: Optional[Pattern[str]]
     defaults: Dict[str, str]
-
-
-_FIELD_NAME_RE = _PARAMETER_NAME_RE
 
 
 def _is_optional_delimiter(char: str) -> bool:
@@ -121,7 +132,7 @@ def _template_to_regex(template_text: str) -> Tuple[str, Dict[str, str]]:
                 default_value = None
                 optional = False
 
-            if not _FIELD_NAME_RE.fullmatch(field_name):
+            if not _PARAMETER_NAME_RE.fullmatch(field_name):
                 raise ValueError(
                     f"Invalid field name '{field_name}'. Use letters, numbers, underscore."
                 )
@@ -290,21 +301,16 @@ def make_batch_result_row(
     r2_old=None,
     fit_task_id=None,
 ):
-    return {
+    row = {
         "_source_index": int(source_index),
         "file": file_path,
         "captures": dict(captures or {}),
-        "params": params,
-        "r2": r2,
-        "error": error,
         "x_channel": x_channel,
         "y_channel": y_channel,
         "plot_full": plot_full,
         "plot": plot,
         "plot_has_fit": plot_has_fit,
         "plot_render_size": plot_render_size,
-        "boundary_ratios": boundary_ratios,
-        "boundary_values": boundary_values,
         "pattern_error": pattern_error,
         "_equation_stale": bool(equation_stale),
         "_fit_status": (str(fit_status) if fit_status not in (None, "") else None),
@@ -314,6 +320,13 @@ def make_batch_result_row(
         "_r2_old": r2_old,
         "_fit_task_id": (int(fit_task_id) if fit_task_id not in (None, "") else None),
     }
+    fit_set(row, "params", params)
+    fit_set(row, "r2", r2)
+    fit_set(row, "error", error)
+    fit_set(row, "boundary_ratios", boundary_ratios)
+    fit_set(row, "boundary_values", boundary_values)
+    fit_set(row, "channel_results", None)
+    return row
 
 
 def render_batch_thumbnail(
@@ -326,12 +339,9 @@ def render_batch_thumbnail(
     """Render a row thumbnail pixmap, including all channels and fitted curve."""
     try:
         data = read_measurement_csv(row["file"])
-        x_col = row.get("x_channel") or (
-            "CH3" if "CH3" in data.columns else data.columns[0]
-        )
-        y_col = row.get("y_channel") or (
-            "CH2" if "CH2" in data.columns else data.columns[0]
-        )
+        x_col = row.get("x_channel") or data.columns[0]
+        y_col = row.get("y_channel") or data.columns[1]
+
         x_data = data[x_col].to_numpy(dtype=float, copy=True)
         y_data = data[y_col].to_numpy(dtype=float, copy=True)
         if smoothing_enabled:
@@ -398,7 +408,7 @@ def render_batch_thumbnail(
                 color=palette_color(idx),
             )
 
-        params = row.get("params")
+        params = fit_get(row, "params")
         if params is not None:
             try:
                 params_arr = np.asarray(params, dtype=float).reshape(-1)
@@ -411,7 +421,7 @@ def render_batch_thumbnail(
                 x_data,
                 *params_arr.tolist(),
                 column_data=column_data,
-                boundary_ratios=row.get("boundary_ratios"),
+                boundary_ratios=fit_get(row, "boundary_ratios"),
             )
             ax.plot(x_data, fitted_y, linewidth=1.25, color=FIT_CURVE_COLOR)
 
@@ -434,590 +444,303 @@ def render_batch_thumbnail(
         return pixmap
 
 
-class FitWorker(QObject):
-    finished = pyqtSignal(object)
-    failed = pyqtSignal(str)
-    cancelled = pyqtSignal()
+# ---------------------------------------------------------------------------
+# Cross-file sibling seeding utilities
+# ---------------------------------------------------------------------------
 
-    def __init__(self, x_data, y_data, fit_context):
-        super().__init__()
-        self.x_data = np.asarray(x_data, dtype=float)
-        self.y_data = np.asarray(y_data, dtype=float)
-        self.fit_context = dict(fit_context or {})
-        self.cancel_requested = False
 
-    def request_cancel(self):
-        self.cancel_requested = True
+def _row_to_sibling_result(
+    row: Mapping[str, Any],
+    ordered_param_keys: Sequence[str],
+) -> Optional[Dict[str, Any]]:
+    """Convert a canonical fit row to the normalised sibling-result dict.
 
-    @pyqtSlot()
-    def run(self):
+    Returns ``None`` if the row has no usable fit result.  The returned dict
+    has keys ``captures``, ``params_by_key``, ``boundary_ratios_by_channel``,
+    ``r2`` — the format expected by ``ProcedureContext.sibling_results``.
+    """
+    if _row_has_error(row):
+        return None
+    params_raw = fit_get(row, "params")
+    if not has_nonempty_values(params_raw):
+        return None
+    try:
+        params_arr = np.asarray(params_raw, dtype=float).reshape(-1)
+    except Exception:
+        return None
+
+    params_by_key: Dict[str, float] = {}
+    for idx, key in enumerate(ordered_param_keys):
+        if idx >= params_arr.size:
+            break
+        val = float(params_arr[idx])
+        if np.isfinite(val):
+            params_by_key[str(key)] = val
+
+    r2: Optional[float] = None
+    r2_raw = fit_get(row, "r2")
+    if r2_raw is not None:
         try:
-            if self.cancel_requested:
-                self.cancelled.emit()
-                return
-
-            result = run_piecewise_fit_pipeline(
-                self.x_data,
-                self.y_data,
-                self.fit_context["model_def"],
-                self.fit_context["seed_map"],
-                self.fit_context["bounds_map"],
-                boundary_seed=self.fit_context.get("boundary_seed"),
-                cancel_check=lambda: self.cancel_requested,
-                fixed_params=self.fit_context.get("fixed_params"),
-            )
-            if self.cancel_requested:
-                self.cancelled.emit()
-                return
-            self.finished.emit(result)
-        except FitCancelledError:
-            self.cancelled.emit()
-        except Exception as exc:
-            if self.cancel_requested:
-                self.cancelled.emit()
-            else:
-                self.failed.emit(str(exc))
-
-
-class BatchFitWorker(QObject):
-    progress = pyqtSignal(int, int, object)
-    finished = pyqtSignal(list)
-    failed = pyqtSignal(str)
-    cancelled = pyqtSignal()
-
-    def __init__(
-        self,
-        file_paths,
-        source_indices,
-        existing_rows_by_file,
-        regex_pattern,
-        capture_defaults,
-        parameter_capture_map,
-        model_def,
-        ordered_param_keys,
-        seed_map,
-        bounds_map,
-        boundary_seed,
-        x_channel,
-        y_channel,
-        use_existing_fit_seed=True,
-        random_restarts=0,
-        smoothing_enabled=False,
-        smoothing_window=1,
-    ):
-        super().__init__()
-        self.file_paths = list(file_paths)
-        self.source_indices = [int(idx) for idx in list(source_indices or ())]
-        if len(self.source_indices) != len(self.file_paths):
-            self.source_indices = list(range(len(self.file_paths)))
-        self.existing_rows_by_file = {
-            str(key): dict(value or {})
-            for key, value in dict(existing_rows_by_file or {}).items()
-        }
-        self.regex = re.compile(regex_pattern) if regex_pattern else None
-        self.capture_defaults = dict(capture_defaults or {})
-        self.parameter_capture_map = {
-            str(key): (str(value) if value not in (None, "") else None)
-            for key, value in dict(parameter_capture_map or {}).items()
-        }
-        self._capture_seed_keys = tuple(
-            sorted(
-                {
-                    str(field)
-                    for field in self.parameter_capture_map.values()
-                    if field not in (None, "")
-                }
-            )
-        )
-        self.model_def = model_def
-        self.ordered_param_keys = list(ordered_param_keys or ())
-        self.seed_map = {
-            str(key): float(val) for key, val in dict(seed_map or {}).items()
-        }
-        self.bounds_map = {
-            str(key): (float(v[0]), float(v[1]))
-            for key, v in dict(bounds_map or {}).items()
-        }
-        self.boundary_seed = np.asarray(boundary_seed, dtype=float)
-        self.x_channel = str(x_channel)
-        self.y_channel = str(y_channel)
-        self.use_existing_fit_seed = bool(use_existing_fit_seed)
-        self.random_restarts = max(0, int(random_restarts))
-        self._rng = np.random.default_rng()
-        self.smoothing_enabled = bool(smoothing_enabled)
-        self.smoothing_window = int(smoothing_window)
-        self.cancel_requested = False
-
-    def request_cancel(self):
-        self.cancel_requested = True
-
-    def _mapping_fixed_params(
-        self, captures: Mapping[str, Any]
-    ) -> Tuple[Optional[Dict[str, float]], Optional[str]]:
-        return resolve_fixed_params_from_captures(self.parameter_capture_map, captures)
-
-    @staticmethod
-    def _copy_fit_fields_from_existing(
-        row: Dict[str, Any], existing_row: Mapping[str, Any]
-    ) -> Dict[str, Any]:
-        preserved = dict(row)
-        existing_params = existing_row.get("params")
-        if existing_params is not None:
-            try:
-                existing_params = (
-                    np.asarray(existing_params, dtype=float).reshape(-1).tolist()
-                )
-            except Exception:
-                pass
-        preserved["params"] = existing_params
-        preserved["r2"] = existing_row.get("r2")
-        preserved["error"] = (
-            None if has_nonempty_values(existing_params) else existing_row.get("error")
-        )
-        boundary_ratios = existing_row.get("boundary_ratios")
-        if boundary_ratios is not None:
-            try:
-                boundary_ratios = (
-                    np.asarray(boundary_ratios, dtype=float).reshape(-1).copy()
-                )
-            except Exception:
-                pass
-        boundary_values = existing_row.get("boundary_values")
-        if boundary_values is not None:
-            try:
-                boundary_values = (
-                    np.asarray(boundary_values, dtype=float).reshape(-1).copy()
-                )
-            except Exception:
-                pass
-        preserved["boundary_ratios"] = boundary_ratios
-        preserved["boundary_values"] = boundary_values
-        return preserved
-
-    def _seed_map_with_existing_fit(
-        self, seed_map: Dict[str, float], existing_row: Mapping[str, Any]
-    ) -> Dict[str, float]:
-        updated_seed = dict(seed_map)
-        if not has_nonempty_values(existing_row.get("params")):
-            return updated_seed
-        try:
-            existing_params = np.asarray(
-                existing_row.get("params"), dtype=float
-            ).reshape(-1)
+            r2 = float(r2_raw)
+            if not np.isfinite(r2):
+                r2 = None
         except Exception:
-            return updated_seed
-        for idx, key in enumerate(self.ordered_param_keys):
-            if idx >= existing_params.size:
-                break
-            value = float(existing_params[idx])
-            if (not np.isfinite(value)) or key not in updated_seed:
-                continue
-            updated_seed[key] = value
-        return updated_seed
+            pass
 
-    def _capture_seed_signature(
-        self, captures: Mapping[str, Any]
-    ) -> Optional[Tuple[Tuple[str, str], ...]]:
-        if not self._capture_seed_keys:
-            return None
-        signature: List[Tuple[str, str]] = []
-        for key in self._capture_seed_keys:
-            value = captures.get(key)
-            if value in (None, ""):
-                return None
-            signature.append((key, str(value)))
-        return tuple(signature)
+    captures = dict(row.get("captures") or {})
 
-    @staticmethod
-    def _capture_value_distance(left: Any, right: Any) -> float:
-        left_num = finite_float_or_none(left)
-        right_num = finite_float_or_none(right)
-        if left_num is not None and right_num is not None:
-            denom = abs(left_num) + abs(right_num) + 1.0
-            return float(abs(left_num - right_num) / denom)
-        return 0.0 if str(left) == str(right) else 1.0
-
-    @staticmethod
-    def _is_seed_candidate_good(row: Mapping[str, Any]) -> bool:
-        if not has_nonempty_values(row.get("params")):
-            return False
-        return not _row_has_error(row)
-
-    def _capture_distance(
-        self,
-        left_captures: Mapping[str, Any],
-        right_captures: Mapping[str, Any],
-    ) -> Optional[float]:
-        if not self._capture_seed_keys:
-            return None
-        total = 0.0
-        count = 0
-        for key in self._capture_seed_keys:
-            left_value = left_captures.get(key)
-            right_value = right_captures.get(key)
-            if left_value in (None, "") or right_value in (None, ""):
-                total += 1.0
-                count += 1
-                continue
-            total += self._capture_value_distance(left_value, right_value)
-            count += 1
-        if count <= 0:
-            return None
-        return float(total / float(count))
-
-    def _best_matching_capture_seed_row(
-        self, *, captures: Mapping[str, Any], exclude_file_path: str
-    ) -> Tuple[Optional[Mapping[str, Any]], Optional[str], Optional[str]]:
-        target_signature = self._capture_seed_signature(captures)
-        best_row: Optional[Mapping[str, Any]] = None
-        best_file: Optional[str] = None
-        closest_row: Optional[Mapping[str, Any]] = None
-        closest_file: Optional[str] = None
-        closest_distance: Optional[float] = None
-        exclude_key = str(exclude_file_path)
-        for file_key, candidate_row in self.existing_rows_by_file.items():
-            if str(file_key) == exclude_key:
-                continue
-            if not self._is_seed_candidate_good(candidate_row):
-                continue
-            candidate_captures = candidate_row.get("captures")
-            if not isinstance(candidate_captures, Mapping):
-                continue
-            candidate_signature = self._capture_seed_signature(candidate_captures)
-            if (
-                target_signature is not None
-                and candidate_signature is not None
-                and candidate_signature == target_signature
-            ):
-                if best_row is None or is_fit_row_improved(candidate_row, best_row):
-                    best_row = candidate_row
-                    best_file = str(file_key)
-                continue
-            distance = self._capture_distance(captures, candidate_captures)
-            if distance is None:
-                continue
-            if closest_row is None:
-                closest_row = candidate_row
-                closest_file = str(file_key)
-                closest_distance = float(distance)
-                continue
-            if float(distance) < float(closest_distance):
-                closest_row = candidate_row
-                closest_file = str(file_key)
-                closest_distance = float(distance)
-                continue
-            if np.isclose(
-                float(distance), float(closest_distance)
-            ) and is_fit_row_improved(candidate_row, closest_row):
-                closest_row = candidate_row
-                closest_file = str(file_key)
-                closest_distance = float(distance)
-
-        if best_row is not None:
-            return best_row, "matching-captures", best_file
-        if closest_row is not None:
-            return closest_row, "closest-captures", closest_file
-        return None, None, None
-
-    def _boundary_seed_for_file(self, existing_row: Mapping[str, Any]) -> np.ndarray:
-        candidate = np.asarray(self.boundary_seed, dtype=float).reshape(-1)
-        if candidate.size <= 0:
-            return candidate
-        if not has_nonempty_values(existing_row.get("params")):
-            return candidate
-        existing_ratios = existing_row.get("boundary_ratios")
-        if existing_ratios is None:
-            return candidate
-        try:
-            existing_arr = np.asarray(existing_ratios, dtype=float).reshape(-1)
-        except Exception:
-            return candidate
-        if existing_arr.size != candidate.size:
-            return candidate
-        if np.any(~np.isfinite(existing_arr)):
-            return candidate
-        return np.clip(existing_arr, 0.0, 1.0)
-
-    def _randomized_seed_map(self, seed_map: Mapping[str, float]) -> Dict[str, float]:
-        randomized = {str(key): float(val) for key, val in dict(seed_map or {}).items()}
-        for key, bounds in self.bounds_map.items():
-            try:
-                low_raw, high_raw = bounds
-                low = float(min(low_raw, high_raw))
-                high = float(max(low_raw, high_raw))
-            except Exception:
-                continue
-            if not np.isfinite(low) or not np.isfinite(high):
-                continue
-            if np.isclose(low, high):
-                randomized[str(key)] = float(low)
-                continue
-            randomized[str(key)] = float(self._rng.uniform(low, high))
-        return randomized
-
-    def _randomized_boundary_seed(self, boundary_seed: np.ndarray) -> np.ndarray:
-        base = np.asarray(boundary_seed, dtype=float).reshape(-1)
-        if base.size <= 0:
-            return base
-        return np.asarray(self._rng.uniform(0.0, 1.0, size=base.size), dtype=float)
-
-    def _seed_signature(
-        self, seed_map: Mapping[str, float], boundary_seed: np.ndarray
-    ) -> Tuple[float, ...]:
-        values: List[float] = []
-        for key in self.ordered_param_keys:
-            try:
-                values.append(float(seed_map.get(key, 0.0)))
-            except Exception:
-                values.append(0.0)
-        boundary = np.asarray(boundary_seed, dtype=float).reshape(-1)
-        if boundary.size > 0:
-            values.extend(boundary.tolist())
-        return tuple(round(float(v), 12) for v in values)
-
-    def _fit_single_file(self, source_index, file_path):
-        if self.cancel_requested:
-            return None
-
-        existing_row = self.existing_rows_by_file.get(str(file_path), {})
-        existing_has_fit = has_nonempty_values(existing_row.get("params"))
-        extracted = extract_captures(
-            stem_for_file_ref(file_path),
-            self.regex,
-            self.capture_defaults,
-        )
-        captures = extracted if extracted is not None else {}
-        pattern_error = _BATCH_PATTERN_MISMATCH_ERROR if extracted is None else None
-        row = make_batch_result_row(
-            source_index=source_index,
-            file_path=file_path,
-            x_channel=self.x_channel,
-            y_channel=self.y_channel,
-            captures=captures,
-            pattern_error=pattern_error,
-        )
-
-        def _copy_existing_no_change_row():
-            copied = self._copy_fit_fields_from_existing(row, existing_row)
-            copied["_fit_no_change"] = True
-            return copied
-
-        try:
-            data = read_measurement_csv(file_path)
-            if self.x_channel not in data.columns:
-                raise KeyError(f"Missing x channel '{self.x_channel}'.")
-            if self.y_channel not in data.columns:
-                raise KeyError(f"Missing y channel '{self.y_channel}'.")
-            x_data = data[self.x_channel].to_numpy(dtype=float, copy=True)
-            y_data = data[self.y_channel].to_numpy(dtype=float, copy=True)
-            if self.smoothing_enabled:
-                x_data = smooth_channel_array(x_data, self.smoothing_window)
-                y_data = smooth_channel_array(y_data, self.smoothing_window)
-
-            fixed_params, mapping_error = self._mapping_fixed_params(captures)
-            if mapping_error:
-                if existing_has_fit:
-                    return _copy_existing_no_change_row()
-                row["error"] = mapping_error
-                return row
-
-            if self.cancel_requested:
-                return None
-
-            attempt_inputs: List[
-                Tuple[Dict[str, float], np.ndarray, str, Optional[str]]
-            ] = []
-            if self.use_existing_fit_seed:
-                matching_seed_row, matching_seed_kind, matching_seed_file = (
-                    self._best_matching_capture_seed_row(
-                        captures=captures,
-                        exclude_file_path=str(file_path),
-                    )
-                )
-
-                derived_row = matching_seed_row
-                derived_kind = str(matching_seed_kind or "")
-                derived_file: Optional[str] = (
-                    str(matching_seed_file)
-                    if matching_seed_file not in (None, "")
-                    else None
-                )
-                if derived_row is None and self._is_seed_candidate_good(existing_row):
-                    derived_row = existing_row
-                    derived_kind = "existing-row"
-                    derived_file = str(file_path)
-
-                if derived_row is not None:
-                    derived_seed = self._seed_map_with_existing_fit(
-                        self.seed_map, derived_row
-                    )
-                    derived_boundary = self._boundary_seed_for_file(derived_row)
-                    attempt_inputs.append(
-                        (
-                            dict(derived_seed),
-                            np.asarray(derived_boundary, dtype=float).reshape(-1),
-                            (derived_kind or "matching-captures"),
-                            derived_file,
-                        )
-                    )
-                else:
-                    attempt_inputs.append(
-                        (
-                            dict(self.seed_map),
-                            np.asarray(self.boundary_seed, dtype=float).reshape(-1),
-                            "default",
-                            None,
-                        )
-                    )
-
-                attempt_inputs.append(
-                    (
-                        self._randomized_seed_map(self.seed_map),
-                        self._randomized_boundary_seed(self.boundary_seed),
-                        "random-restart",
-                        None,
-                    )
-                )
-            else:
-                attempt_inputs.append(
-                    (
-                        dict(self.seed_map),
-                        np.asarray(self.boundary_seed, dtype=float).reshape(-1),
-                        "default",
-                        None,
-                    )
-                )
-
-            deduped_attempts: List[
-                Tuple[Dict[str, float], np.ndarray, str, Optional[str]]
-            ] = []
-            seen_signatures: Set[Tuple[float, ...]] = set()
-            for (
-                seed_candidate,
-                boundary_candidate,
-                seed_source,
-                seed_source_file,
-            ) in attempt_inputs:
-                sig = self._seed_signature(seed_candidate, boundary_candidate)
-                if sig in seen_signatures:
-                    continue
-                seen_signatures.add(sig)
-                deduped_attempts.append(
-                    (seed_candidate, boundary_candidate, seed_source, seed_source_file)
-                )
-
-            best_row = None
-            last_error = None
-            for (
-                seed_candidate,
-                boundary_candidate,
-                seed_source,
-                seed_source_file,
-            ) in deduped_attempts:
-                if self.cancel_requested:
-                    return None
-                seed_map = dict(seed_candidate)
-                if fixed_params:
-                    for key, value in fixed_params.items():
-                        if key in seed_map:
-                            seed_map[key] = float(value)
-
+    boundary_ratios_by_channel: Dict[str, np.ndarray] = {}
+    ch_results = fit_get(row, "channel_results")
+    if isinstance(ch_results, dict):
+        for ch, cr in ch_results.items():
+            if isinstance(cr, dict):
+                br = cr.get("boundary_ratios")
+                if br is not None:
+                    try:
+                        boundary_ratios_by_channel[str(ch)] = np.asarray(
+                            br, dtype=float
+                        ).reshape(-1)
+                    except Exception:
+                        pass
+    if not boundary_ratios_by_channel:
+        br = fit_get(row, "boundary_ratios")
+        if br is not None:
+            y_ch = str(row.get("y_channel") or "").strip()
+            if y_ch:
                 try:
-                    result = run_piecewise_fit_pipeline(
-                        x_data,
-                        y_data,
-                        self.model_def,
-                        seed_map,
-                        self.bounds_map,
-                        boundary_seed=boundary_candidate,
-                        cancel_check=lambda: self.cancel_requested,
-                        fixed_params=fixed_params,
-                    )
-                except FitCancelledError:
-                    return None
-                except Exception as exc:
-                    last_error = str(exc)
-                    continue
+                    boundary_ratios_by_channel[y_ch] = np.asarray(
+                        br, dtype=float
+                    ).reshape(-1)
+                except Exception:
+                    pass
 
-                candidate_row = dict(row)
-                params_by_key = dict(result.get("params_by_key") or {})
-                candidate_row["params"] = [
-                    float(params_by_key.get(key, seed_map.get(key, 0.0)))
-                    for key in self.ordered_param_keys
-                ]
-                candidate_row["r2"] = (
-                    float(result["r2"]) if result.get("r2") is not None else None
-                )
-                boundary_values = result.get("boundary_ratios")
-                if boundary_values is None:
-                    boundary_values = []
-                candidate_row["boundary_ratios"] = np.asarray(
-                    boundary_values, dtype=float
-                )
-                n_boundaries = max(0, len(self.model_def.segment_exprs) - 1)
-                candidate_row["boundary_values"] = boundary_ratios_to_x_values(
-                    candidate_row["boundary_ratios"],
-                    x_data,
-                    n_boundaries,
-                )
-                candidate_row["error"] = None
-                candidate_row["_seed_source"] = str(seed_source)
-                candidate_row["_seed_source_file"] = seed_source_file
-                if best_row is None or is_fit_row_improved(candidate_row, best_row):
-                    best_row = candidate_row
+    return {
+        "captures": captures,
+        "params_by_key": params_by_key,
+        "boundary_ratios_by_channel": boundary_ratios_by_channel,
+        "r2": r2,
+    }
 
-            if best_row is None:
-                if existing_has_fit:
-                    return _copy_existing_no_change_row()
-                row["error"] = str(last_error or "No fit result.")
-                return row
-            if existing_has_fit and not is_fit_row_improved(best_row, existing_row):
-                return _copy_existing_no_change_row()
-            return best_row
-        except FitCancelledError:
-            return None
-        except Exception as exc:
-            if existing_has_fit:
-                return _copy_existing_no_change_row()
-            row["error"] = str(exc)
-            return row
 
-    @pyqtSlot()
-    def run(self):
-        results = []
-        try:
-            total = len(self.file_paths)
-            if total == 0:
-                self.finished.emit([])
+def _result_to_sibling(
+    captures: Mapping[str, Any],
+    result: Mapping[str, Any],
+    multi_channel_model: Any,
+) -> Dict[str, Any]:
+    """Convert a procedure pipeline result to the normalised sibling-result dict."""
+    params_by_key = dict(result.get("params_by_key") or {})
+    r2 = finite_float_or_none(result.get("r2"))
+
+    boundary_ratios_by_channel: Dict[str, np.ndarray] = {}
+    ch_results = result.get("channel_results") or {}
+    if isinstance(ch_results, Mapping):
+        for ch, cr in ch_results.items():
+            if not isinstance(cr, Mapping):
+                continue
+            br = cr.get("boundary_ratios")
+            if br is not None:
+                try:
+                    boundary_ratios_by_channel[str(ch)] = np.asarray(
+                        br, dtype=float
+                    ).reshape(-1)
+                except Exception:
+                    pass
+
+    return {
+        "captures": dict(captures or {}),
+        "params_by_key": params_by_key,
+        "boundary_ratios_by_channel": boundary_ratios_by_channel,
+        "r2": float(r2) if r2 is not None else None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Single persistent worker thread for all fit tasks
+# ---------------------------------------------------------------------------
+
+
+class FitWorkerThread(QThread):
+    """Persistent single worker thread that processes fit jobs sequentially.
+
+    Jobs are submitted via ``submit()`` / ``preempt()``
+    and results are delivered through Qt signals back to the GUI thread.
+    """
+
+    task_progress = pyqtSignal(int, int, int, object)  # task_id, done, total, row
+    task_step_completed = pyqtSignal(int, int, object)  # task_id, step_idx, result
+    task_attempt_completed = pyqtSignal(
+        int, int, int, object
+    )  # task_id, step_idx, attempt, info
+    task_finished = pyqtSignal(int, list)  # task_id, results
+    task_failed = pyqtSignal(int, str)  # task_id, error_text
+    task_cancelled = pyqtSignal(int)  # task_id
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._mutex = QMutex()
+        self._condition = QWaitCondition()
+        self._queue: deque[Tuple[int, dict]] = deque()
+        self._cancel_ids: set[int] = set()
+        self._current_task_id: Optional[int] = None
+        self._current_worker: Any = None
+        self._shutdown = False
+
+    # -- Public API (called from GUI thread) --------------------------------
+
+    def submit(self, task_id: int, descriptor: dict) -> None:
+        """Append a job to the back of the queue."""
+        self._mutex.lock()
+        self._queue.append((int(task_id), dict(descriptor)))
+        self._mutex.unlock()
+        self._condition.wakeOne()
+
+    def preempt(self, task_id: int, descriptor: dict) -> None:
+        """Cancel current task, push new job to front, re-queue interrupted task."""
+        self._mutex.lock()
+        if self._current_task_id is not None:
+            self._cancel_ids.add(self._current_task_id)
+            worker = self._current_worker
+            if worker is not None:
+                try:
+                    worker.cancel_requested = True
+                except Exception:
+                    pass
+        self._queue.appendleft((int(task_id), dict(descriptor)))
+        self._mutex.unlock()
+        self._condition.wakeOne()
+
+    def cancel_tasks(self, task_ids: set[int]) -> None:
+        """Cancel pending and/or running tasks by id."""
+        self._mutex.lock()
+        self._cancel_ids.update(int(tid) for tid in task_ids)
+        if (
+            self._current_task_id is not None
+            and self._current_task_id in self._cancel_ids
+        ):
+            worker = self._current_worker
+            if worker is not None:
+                try:
+                    worker.cancel_requested = True
+                except Exception:
+                    pass
+        self._mutex.unlock()
+
+    def cancel_all(self) -> None:
+        """Cancel everything — current task and all pending."""
+        self._mutex.lock()
+        for tid, _ in self._queue:
+            self._cancel_ids.add(tid)
+        if self._current_task_id is not None:
+            self._cancel_ids.add(self._current_task_id)
+            worker = self._current_worker
+            if worker is not None:
+                try:
+                    worker.cancel_requested = True
+                except Exception:
+                    pass
+        self._mutex.unlock()
+
+    def shutdown(self) -> None:
+        """Signal the thread to exit after current job completes."""
+        self._mutex.lock()
+        self._shutdown = True
+        self._mutex.unlock()
+        self._condition.wakeOne()
+
+    # -- Thread loop --------------------------------------------------------
+
+    def run(self) -> None:
+        while True:
+            self._mutex.lock()
+            while not self._shutdown and len(self._queue) == 0:
+                self._condition.wait(self._mutex)
+            if self._shutdown and len(self._queue) == 0:
+                self._mutex.unlock()
                 return
+            task_id, descriptor = self._queue.popleft()
+            if task_id in self._cancel_ids:
+                self._cancel_ids.discard(task_id)
+                self._mutex.unlock()
+                self.task_cancelled.emit(task_id)
+                continue
+            self._current_task_id = task_id
+            self._current_worker = None
+            self._mutex.unlock()
 
-            completed = 0
-            for idx, file_path in enumerate(self.file_paths):
-                if self.cancel_requested:
-                    self.cancelled.emit()
-                    return
-                source_index = (
-                    self.source_indices[idx] if idx < len(self.source_indices) else idx
+            try:
+                self._execute_job(task_id, descriptor)
+            except Exception as exc:
+                self.task_failed.emit(task_id, str(exc))
+            finally:
+                self._mutex.lock()
+                self._current_task_id = None
+                self._current_worker = None
+                self._cancel_ids.discard(task_id)
+                self._mutex.unlock()
+
+    def _execute_job(self, task_id: int, descriptor: dict) -> None:
+        """Build the appropriate worker and run it synchronously."""
+        kind = str(descriptor.get("worker_kind", "procedure_batch"))
+
+        if kind == "procedure_single":
+            worker = ProcedureFitWorker(**descriptor["worker_args"])
+        else:
+            worker = BatchProcedureFitWorker(**descriptor["worker_args"])
+
+        self._mutex.lock()
+        self._current_worker = worker
+        if task_id in self._cancel_ids:
+            worker.cancel_requested = True
+        self._mutex.unlock()
+
+        results_box: List[Any] = []
+        error_box: List[str] = []
+        cancelled_box: List[bool] = []
+
+        def _on_progress(*args):
+            self.task_progress.emit(task_id, *args)
+
+        if isinstance(worker, ProcedureFitWorker):
+            worker.step_completed.connect(
+                lambda step_idx, step_result: self.task_progress.emit(
+                    task_id, step_idx, 0, step_result
                 )
-                row = self._fit_single_file(source_index, file_path)
-                if row is None:
-                    if self.cancel_requested:
-                        self.cancelled.emit()
-                        return
-                    continue
-                results.append(row)
-                completed += 1
-                self.progress.emit(completed, total, row)
+            )
+        else:
+            worker.progress.connect(_on_progress)
 
-            if self.cancel_requested:
-                self.cancelled.emit()
-                return
-            self.finished.emit(results)
-        except Exception as exc:
-            if self.cancel_requested:
-                self.cancelled.emit()
+        # Forward step/attempt signals for both worker types.
+        worker.step_completed.connect(
+            lambda step_idx, step_result: self.task_step_completed.emit(
+                task_id, step_idx, step_result
+            )
+        )
+        worker.attempt_completed.connect(
+            lambda step_idx, attempt, info: self.task_attempt_completed.emit(
+                task_id, step_idx, attempt, info
+            )
+        )
+
+        worker.finished.connect(results_box.append)
+        worker.failed.connect(error_box.append)
+        worker.cancelled.connect(lambda: cancelled_box.append(True))
+
+        worker.run()
+
+        if cancelled_box:
+            self.task_cancelled.emit(task_id)
+        elif error_box:
+            self.task_failed.emit(task_id, error_box[0])
+        elif results_box:
+            result = results_box[0]
+            if isinstance(result, list):
+                self.task_finished.emit(task_id, result)
+            elif isinstance(result, dict):
+                self.task_finished.emit(task_id, [result])
             else:
-                self.failed.emit(str(exc))
+                self.task_finished.emit(task_id, [])
+        else:
+            self.task_finished.emit(task_id, [])
 
 
 class ThumbnailRenderWorker(QObject):
@@ -1107,7 +830,7 @@ class ThumbnailRenderWorker(QObject):
 
                 pixmap = self.render_thumbnail(row)
                 row["plot_full"] = pixmap
-                row["plot_has_fit"] = has_nonempty_values(row.get("params"))
+                row["plot_has_fit"] = has_nonempty_values(fit_get(row, "params"))
                 row["plot_render_size"] = (
                     int(self.full_thumbnail_size[0]),
                     int(self.full_thumbnail_size[1]),
@@ -1131,3 +854,535 @@ class ThumbnailRenderWorker(QObject):
             smoothing_enabled=self.smoothing_enabled,
             smoothing_window=self.smoothing_window,
         )
+
+
+# ── New polymorphic procedure workers ────────────────────────────────
+
+
+class ProcedureFitWorker(QObject):
+    """Run a polymorphic multi-step procedure on a single file.
+
+    Uses ``run_procedure_pipeline`` which supports all step types
+    (fit, set_parameter, set_boundaries, randomize_seeds)
+    plus retry logic.
+    """
+
+    step_completed = pyqtSignal(int, object)
+    attempt_completed = pyqtSignal(int, int, object)  # (step_idx, attempt, info)
+    finished = pyqtSignal(object)
+    failed = pyqtSignal(str)
+    cancelled = pyqtSignal()
+
+    def __init__(
+        self,
+        x_data,
+        y_data_by_channel,
+        multi_model,
+        procedure,
+        seed_map,
+        bounds_map,
+        boundary_seeds=None,
+        bound_values=None,
+        boundary_name_groups=None,
+        use_jax=False,
+    ):
+        super().__init__()
+        self.x_data = np.asarray(x_data, dtype=float)
+        self.y_data_by_channel = {
+            str(k): np.asarray(v, dtype=float)
+            for k, v in dict(y_data_by_channel).items()
+        }
+        self.multi_model = multi_model
+        self.procedure = procedure
+        self.seed_map = dict(seed_map)
+        self.bounds_map = dict(bounds_map)
+        self.boundary_seeds = dict(boundary_seeds or {})
+        self.bound_values = dict(bound_values or {})
+        self.boundary_name_groups = dict(boundary_name_groups or {})
+        self.cancel_requested = False
+        self.use_jax = bool(use_jax)
+
+    def request_cancel(self):
+        self.cancel_requested = True
+
+    @pyqtSlot()
+    def run(self):
+        try:
+            if self.cancel_requested:
+                self.cancelled.emit()
+                return
+
+            def _step_cb(step_idx, step_result):
+                self.step_completed.emit(step_idx, step_result)
+
+            def _attempt_cb(step_idx, attempt, info):
+                self.attempt_completed.emit(step_idx, attempt, info)
+
+            result = run_procedure_pipeline(
+                self.x_data,
+                self.y_data_by_channel,
+                self.multi_model,
+                self.procedure,
+                self.seed_map,
+                self.bounds_map,
+                boundary_seeds=self.boundary_seeds,
+                cancel_check=lambda: self.cancel_requested,
+                step_callback=_step_cb,
+                attempt_callback=_attempt_cb,
+                bound_values=self.bound_values,
+                boundary_name_groups=self.boundary_name_groups,
+                use_jax=self.use_jax,
+            )
+            if self.cancel_requested:
+                self.cancelled.emit()
+                return
+            self.finished.emit(result)
+        except FitCancelledError:
+            self.cancelled.emit()
+        except Exception as exc:
+            if self.cancel_requested:
+                self.cancelled.emit()
+            else:
+                self.failed.emit(str(exc))
+
+
+class BatchProcedureFitWorker(QObject):
+    """Run a procedure across multiple batch files.
+
+    Iterates over files, loads data, resolves captures, and runs the
+    procedure pipeline on each.  Emits the same ``progress`` signal
+    interface as ``BatchFitWorker`` so the GUI can reuse the same
+    result-handling logic.
+    """
+
+    progress = pyqtSignal(int, int, object)  # (completed, total, row_result)
+    step_completed = pyqtSignal(int, object)  # (step_index, step_result_dict)
+    attempt_completed = pyqtSignal(int, int, object)  # (step_index, attempt, info)
+    finished = pyqtSignal(list)
+    failed = pyqtSignal(str)
+    cancelled = pyqtSignal()
+
+    def __init__(
+        self,
+        file_paths,
+        source_indices,
+        regex_pattern,
+        capture_defaults,
+        parameter_capture_map,
+        multi_channel_model,
+        ordered_param_keys,
+        seed_map,
+        bounds_map,
+        boundary_seeds_per_channel,
+        x_channel,
+        procedure,
+        smoothing_enabled=False,
+        smoothing_window=1,
+        boundary_name_groups=None,
+        use_jax=False,
+        # -- Cross-file sibling seeding --
+        existing_rows_by_file=None,
+        use_existing_fit_seed=True,
+    ):
+        super().__init__()
+        self.file_paths = list(file_paths)
+        self.source_indices = [
+            int(i) for i in (source_indices or range(len(self.file_paths)))
+        ]
+        if len(self.source_indices) != len(self.file_paths):
+            self.source_indices = list(range(len(self.file_paths)))
+        self.regex = re.compile(regex_pattern) if regex_pattern else None
+        self.capture_defaults = dict(capture_defaults or {})
+        self.parameter_capture_map = {
+            str(k): (str(v) if v not in (None, "") else None)
+            for k, v in dict(parameter_capture_map or {}).items()
+        }
+        self.multi_channel_model = multi_channel_model
+        self.ordered_param_keys = list(ordered_param_keys or ())
+        self.seed_map = dict(seed_map or {})
+        self.bounds_map = dict(bounds_map or {})
+        self.boundary_seeds_per_channel = dict(boundary_seeds_per_channel or {})
+        self.x_channel = str(x_channel)
+        self.procedure = procedure
+        self.smoothing_enabled = bool(smoothing_enabled)
+        self.smoothing_window = int(smoothing_window)
+        self.boundary_name_groups = dict(boundary_name_groups or {})
+        self.boundary_name_groups = dict(boundary_name_groups or {})
+        self.cancel_requested = False
+        self.use_jax = bool(use_jax)
+        self.use_existing_fit_seed = bool(use_existing_fit_seed)
+
+        # Derive capture_seed_keys from parameter_capture_map (same logic as
+        # BatchFitWorker) so sibling matching uses the same dimension keys.
+        self._capture_seed_keys: Tuple[str, ...] = tuple(
+            sorted(
+                {
+                    str(field)
+                    for field in self.parameter_capture_map.values()
+                    if field not in (None, "")
+                }
+            )
+        )
+
+        # Build the normalised sibling-results dict from any pre-existing fit
+        # rows the GUI already knows about.
+        self._sibling_results: Dict[str, Dict[str, Any]] = {}
+        _sibling_skipped = 0
+        if existing_rows_by_file:
+            for file_key, row in dict(existing_rows_by_file).items():
+                sibling = _row_to_sibling_result(row, self.ordered_param_keys)
+                if sibling is not None:
+                    self._sibling_results[str(file_key)] = sibling
+                else:
+                    _sibling_skipped += 1
+        _fit_log.detail(
+            "BatchProcedureFitWorker init: "
+            f"files={len(self.file_paths)} "
+            f"existing_rows={len(existing_rows_by_file or {})} "
+            f"siblings_built={len(self._sibling_results)} "
+            f"siblings_skipped={_sibling_skipped} "
+            f"capture_seed_keys={self._capture_seed_keys} "
+            f"param_capture_map={dict(self.parameter_capture_map)} "
+            f"seed_from_siblings={getattr(self.procedure, 'seed_from_siblings', '?')}"
+        )
+
+    def request_cancel(self):
+        self.cancel_requested = True
+
+    def _load_file_data(self, file_path):
+        """Load and smooth data for a single file."""
+        df = read_measurement_csv(file_path)
+        if df is None or df.empty:
+            return None, None
+        x_data = df[self.x_channel].to_numpy(dtype=float, copy=True)
+        if self.smoothing_enabled:
+            x_data = smooth_channel_array(x_data, self.smoothing_window)
+        y_data_by_channel = {}
+        for ch_model in self.multi_channel_model.channel_models:
+            col = ch_model.target_col
+            if col in df.columns:
+                y = df[col].to_numpy(dtype=float, copy=True)
+                if self.smoothing_enabled:
+                    y = smooth_channel_array(y, self.smoothing_window)
+                y_data_by_channel[col] = y
+        return x_data, y_data_by_channel
+
+    @pyqtSlot()
+    def run(self):
+        results = []
+        try:
+            total = len(self.file_paths)
+            if total == 0:
+                self.finished.emit([])
+                return
+
+            for idx, file_path in enumerate(self.file_paths):
+                if self.cancel_requested:
+                    self.cancelled.emit()
+                    return
+
+                source_index = (
+                    self.source_indices[idx] if idx < len(self.source_indices) else idx
+                )
+                row = self._fit_single_file(source_index, file_path)
+                if row is None:
+                    if self.cancel_requested:
+                        self.cancelled.emit()
+                        return
+                    continue
+                results.append(row)
+                self.progress.emit(idx + 1, total, row)
+
+            if self.cancel_requested:
+                self.cancelled.emit()
+                return
+            self.finished.emit(results)
+        except Exception as exc:
+            if self.cancel_requested:
+                self.cancelled.emit()
+            else:
+                self.failed.emit(str(exc))
+
+    def _fit_single_file(self, source_index, file_path):
+        """Load data, resolve captures, run procedure, return result row."""
+        # Extract captures.
+        stem = stem_for_file_ref(file_path)
+        captures = extract_captures(stem, self.regex, self.capture_defaults)
+        if captures is None:
+            return make_batch_result_row(
+                source_index,
+                file_path,
+                self.x_channel,
+                "",
+                pattern_error=_BATCH_PATTERN_MISMATCH_ERROR,
+            )
+
+        # Resolve bound params from captures.
+        bound_values, error = resolve_fixed_params_from_captures(
+            self.parameter_capture_map,
+            captures,
+        )
+        if error:
+            return make_batch_result_row(
+                source_index,
+                file_path,
+                self.x_channel,
+                "",
+                captures=captures,
+                error=error,
+            )
+
+        # Load data.
+        try:
+            x_data, y_data_by_channel = self._load_file_data(file_path)
+        except Exception as exc:
+            return make_batch_result_row(
+                source_index,
+                file_path,
+                self.x_channel,
+                "",
+                captures=captures,
+                error=str(exc),
+            )
+        if x_data is None or not y_data_by_channel:
+            return make_batch_result_row(
+                source_index,
+                file_path,
+                self.x_channel,
+                "",
+                captures=captures,
+                error="Failed to load data.",
+            )
+
+        # Determine primary target channel.
+        primary_target = self.multi_channel_model.primary.target_col
+
+        # --- Cross-file seeding: override seed_map from best sibling ---
+        file_seed_map = dict(self.seed_map)
+        file_boundary_seeds = dict(self.boundary_seeds_per_channel)
+        file_key = str(file_path)
+
+        if self.use_existing_fit_seed and self._sibling_results:
+            # Find best sibling by capture proximity.
+            if not self._capture_seed_keys:
+                _fit_log.detail(
+                    "pre-procedure sibling search skipped: "
+                    "no capture_seed_keys (need bound_params in procedure steps)"
+                )
+            else:
+                _fit_log.detail(
+                    "pre-procedure sibling search: "
+                    f"file={stem_for_file_ref(file_path)} "
+                    f"captures={dict(captures)} "
+                    f"seed_keys={self._capture_seed_keys} "
+                    f"n_siblings={len(self._sibling_results)}"
+                )
+                best_sibling: Optional[Dict[str, Any]] = None
+                closest_sibling: Optional[Dict[str, Any]] = None
+                closest_distance: Optional[float] = None
+                current_sig = _capture_seed_signature(captures, self._capture_seed_keys)
+                _fit_log.detail(f"current signature: {current_sig}")
+                for sib_key, sib in self._sibling_results.items():
+                    if sib_key == file_key:
+                        continue
+                    sib_caps = sib.get("captures")
+                    if not isinstance(sib_caps, dict):
+                        continue
+                    if not sib.get("params_by_key"):
+                        continue
+                    sib_sig = _capture_seed_signature(sib_caps, self._capture_seed_keys)
+                    if (
+                        current_sig is not None
+                        and sib_sig is not None
+                        and current_sig == sib_sig
+                    ):
+                        if best_sibling is None or (sib.get("r2") or 0) > (
+                            best_sibling.get("r2") or 0
+                        ):
+                            best_sibling = sib
+                        continue
+                    dist = _capture_distance(
+                        captures, sib_caps, self._capture_seed_keys
+                    )
+                    if dist is None:
+                        continue
+                    if closest_sibling is None or float(dist) < float(closest_distance):
+                        closest_sibling = sib
+                        closest_distance = float(dist)
+                    elif np.isclose(float(dist), float(closest_distance)) and (
+                        (sib.get("r2") or 0) > (closest_sibling.get("r2") or 0)
+                    ):
+                        closest_sibling = sib
+                        closest_distance = float(dist)
+                chosen = best_sibling or closest_sibling
+                if chosen is not None:
+                    applied_params = 0
+                    for key, val in (chosen.get("params_by_key") or {}).items():
+                        if key in file_seed_map:
+                            try:
+                                v = float(val)
+                                if np.isfinite(v):
+                                    file_seed_map[str(key)] = v
+                                    applied_params += 1
+                            except (TypeError, ValueError):
+                                pass
+                    applied_boundaries = 0
+                    for ch, ratios in (
+                        chosen.get("boundary_ratios_by_channel") or {}
+                    ).items():
+                        if ch in file_boundary_seeds and ratios is not None:
+                            try:
+                                file_boundary_seeds[str(ch)] = np.asarray(
+                                    ratios, dtype=float
+                                ).reshape(-1)
+                                applied_boundaries += 1
+                            except Exception:
+                                pass
+                    sib_kind = (
+                        "matching-captures"
+                        if best_sibling is not None
+                        else "closest-captures"
+                    )
+                    _fit_log.detail(
+                        "pre-procedure sibling seed applied: "
+                        f"kind={sib_kind} "
+                        f"r2={chosen.get('r2')} "
+                        f"params={applied_params} boundaries={applied_boundaries}"
+                    )
+                else:
+                    _fit_log.detail(
+                        "pre-procedure sibling seed: "
+                        f"{len(self._sibling_results)} sibling(s) available "
+                        "but no match found"
+                    )
+        elif self.use_existing_fit_seed:
+            _fit_log.detail(
+                "pre-procedure sibling search: no existing sibling results "
+                "(first batch run or all prior rows lack fit params)"
+            )
+
+        # Run the procedure pipeline.
+        try:
+
+            def _step_cb(step_idx, step_result):
+                self.step_completed.emit(step_idx, step_result)
+
+            def _attempt_cb(step_idx, attempt, info):
+                self.attempt_completed.emit(step_idx, attempt, info)
+
+            result = run_procedure_pipeline(
+                x_data,
+                y_data_by_channel,
+                self.multi_channel_model,
+                self.procedure,
+                file_seed_map,
+                dict(self.bounds_map),
+                boundary_seeds=file_boundary_seeds,
+                cancel_check=lambda: self.cancel_requested,
+                step_callback=_step_cb,
+                attempt_callback=_attempt_cb,
+                bound_values=dict(bound_values or {}),
+                boundary_name_groups=self.boundary_name_groups,
+                use_jax=self.use_jax,
+                # Cross-file sibling seeding context for procedure retries.
+                captures=captures,
+                sibling_results=dict(self._sibling_results),
+                capture_seed_keys=self._capture_seed_keys,
+            )
+        except FitCancelledError:
+            return None
+        except Exception as exc:
+            return make_batch_result_row(
+                source_index,
+                file_path,
+                self.x_channel,
+                primary_target,
+                captures=captures,
+                error=str(exc),
+            )
+
+        # Extract final param values as ordered array.
+        params_by_key = result.get("params_by_key") or {}
+        param_array = np.array(
+            [float(params_by_key.get(k, 0.0)) for k in self.ordered_param_keys],
+            dtype=float,
+        )
+
+        r2 = result.get("r2")
+        boundary_ratios = None
+        boundary_values = None
+        ch_results_raw = result.get("channel_results") or {}
+        ch_results: Dict[str, Dict[str, Any]] = {}
+        if isinstance(ch_results_raw, Mapping):
+            for raw_target, raw_entry in ch_results_raw.items():
+                if not isinstance(raw_entry, Mapping):
+                    continue
+                entry: Dict[str, Any] = {}
+                raw_ratios = raw_entry.get("boundary_ratios")
+                if raw_ratios is not None:
+                    try:
+                        ratios_arr = np.asarray(raw_ratios, dtype=float).reshape(-1)
+                    except Exception:
+                        ratios_arr = np.asarray([], dtype=float)
+                    entry["boundary_ratios"] = np.asarray(
+                        ratios_arr, dtype=float
+                    ).copy()
+                raw_r2 = finite_float_or_none(raw_entry.get("r2"))
+                if raw_r2 is not None:
+                    entry["r2"] = float(raw_r2)
+                if entry:
+                    ch_results[str(raw_target)] = entry
+        if primary_target in ch_results:
+            ch_r = ch_results[primary_target]
+            br = ch_r.get("boundary_ratios")
+            if br is not None:
+                boundary_ratios = np.asarray(br, dtype=float).reshape(-1)
+                n_boundaries = max(
+                    0,
+                    len(
+                        getattr(
+                            getattr(self.multi_channel_model, "primary", None),
+                            "segment_exprs",
+                            (),
+                        )
+                        or ()
+                    )
+                    - 1,
+                )
+                if n_boundaries <= 0:
+                    n_boundaries = int(boundary_ratios.size)
+                try:
+                    boundary_values = boundary_ratios_to_x_values(
+                        boundary_ratios,
+                        x_data,
+                        n_boundaries,
+                    )
+                except Exception:
+                    pass
+
+        row = make_batch_result_row(
+            source_index,
+            file_path,
+            self.x_channel,
+            primary_target,
+            captures=captures,
+            params=param_array,
+            r2=r2,
+            boundary_ratios=boundary_ratios,
+            boundary_values=boundary_values,
+        )
+        if ch_results:
+            fit_set(row, "channel_results", ch_results)
+        row["_procedure_result"] = {
+            "step_results": list(result.get("step_results") or []),
+            "r2": finite_float_or_none(result.get("r2")),
+            "stopped_at_step": result.get("stopped_at_step"),
+        }
+
+        # --- Write-back: make this result available as a sibling for subsequent
+        # files in the same batch run. ---
+        if not _row_has_error(row):
+            sibling = _result_to_sibling(captures, result, self.multi_channel_model)
+            self._sibling_results[file_key] = sibling
+
+        return row
