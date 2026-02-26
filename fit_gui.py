@@ -88,6 +88,7 @@ from PyQt6.QtGui import (
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
+from matplotlib import colors as mcolors
 
 from solver import (
     OrderedPiecewiseConfig,
@@ -7443,6 +7444,14 @@ class ManualFitGUI(QMainWindow):
             y_sorted = y_plot[order]
             file_refs_sorted = [file_refs[int(order_idx)] for order_idx in order]
             color = palette_color(idx)
+            r2_values = self.analysis_numeric_data.get("R2")
+            if r2_values is not None and np.size(r2_values) == np.size(mask):
+                r2_plot = r2_values[mask]
+                r2_sorted = r2_plot[order]
+                point_alphas = np.clip(r2_sorted, 0.5, 1.0)
+                point_alphas = np.where(np.isfinite(point_alphas), point_alphas, 0.5)
+            else:
+                point_alphas = np.full(np.size(x_sorted), 0.5, dtype=float)
             target_ax = axes[idx] if len(axes) > 1 else axes[0]
             param_plot_label = self._display_name_for_param_key_mathtext(param_name)
 
@@ -7450,8 +7459,16 @@ class ManualFitGUI(QMainWindow):
                 scatter_label = (
                     param_plot_label if not show_series_line else "_nolegend_"
                 )
+                rgba = mcolors.to_rgba(color)
+                point_colors = [
+                    (rgba[0], rgba[1], rgba[2], float(alpha)) for alpha in point_alphas
+                ]
                 scatter = target_ax.scatter(
-                    x_sorted, y_sorted, s=26, color=color, label=scatter_label
+                    x_sorted,
+                    y_sorted,
+                    s=26,
+                    color=point_colors,
+                    label=scatter_label,
                 )
                 scatter.set_picker(5)
                 self._analysis_scatter_files[scatter] = file_refs_sorted
@@ -7502,6 +7519,7 @@ class ManualFitGUI(QMainWindow):
             if show_legend:
                 axes[0].legend(loc="best", fontsize=8)
             axes[0].grid(True, alpha=0.3)
+            axes[0].set_xscale("log")
 
         if x_field in self.analysis_param_columns:
             x_axis_label = self._display_name_for_param_key_mathtext(x_field)
@@ -7685,13 +7703,19 @@ class ManualFitGUI(QMainWindow):
             min_box = self.param_min_spinboxes.get(spec.key)
             max_box = self.param_max_spinboxes.get(spec.key)
             value_box = self.param_spinboxes.get(spec.key)
-            low = float(min_box.value()) if min_box is not None else float(spec.min_value)
+            low = (
+                float(min_box.value()) if min_box is not None else float(spec.min_value)
+            )
             high = (
                 float(max_box.value()) if max_box is not None else float(spec.max_value)
             )
             if low > high:
                 low, high = high, low
-            value = float(value_box.value()) if value_box is not None else float(spec.default)
+            value = (
+                float(value_box.value())
+                if value_box is not None
+                else float(spec.default)
+            )
             serialized.append(
                 {
                     "key": str(spec.key),
@@ -10085,6 +10109,7 @@ class ManualFitGUI(QMainWindow):
         self._batch_cancel_requested = False
         self._batch_progress_done = 0
         self._batch_total_tasks = 0
+        self.update_batch_table()
         self.queue_visible_thumbnail_render()
         self._autosave_fit_details()
         self._refresh_batch_controls()
@@ -10380,8 +10405,8 @@ class ManualFitGUI(QMainWindow):
             self.batch_table.setHorizontalHeaderLabels(columns)
             rich_header = getattr(self, "batch_table_header", None)
             if isinstance(rich_header, RichTextHeaderView):
-                param_start = 6 + len(self.batch_capture_keys)
                 rich_map = {}
+                param_start = 6 + len(self.batch_capture_keys)
                 for offset, token in enumerate(param_column_tokens):
                     rich_html = parameter_symbol_to_html(token)
                     if rich_html:
@@ -10403,6 +10428,31 @@ class ManualFitGUI(QMainWindow):
         if sorting_enabled:
             self.batch_table.setSortingEnabled(False)
         try:
+            queue_value = row.get("_queue_position")
+            queue_text = (
+                str(int(queue_value))
+                if isinstance(queue_value, (int, np.integer))
+                else ""
+            )
+            status_text = str(row.get("_fit_status") or "").strip()
+            status_item = NumericSortTableWidgetItem(status_text)
+            status_lower = status_text.lower()
+            if status_lower == "running":
+                status_item.setForeground(QBrush(QColor("#1d4ed8")))
+            elif status_lower == "queued":
+                status_item.setForeground(QBrush(QColor("#64748b")))
+            elif status_lower == "done":
+                status_item.setForeground(QBrush(QColor("#15803d")))
+            elif status_lower == "no change":
+                status_item.setForeground(QBrush(QColor("#7c3aed")))
+            elif status_lower in {"failed", "cancelled"}:
+                status_item.setForeground(QBrush(QColor("#b91c1c")))
+
+            r2_old = _finite_float_or_none(row.get("_r2_old"))
+            r2_old_item = NumericSortTableWidgetItem(
+                f"{float(r2_old):.6f}" if r2_old is not None else ""
+            )
+
             # Plot column (index 0)
             self._update_batch_plot_cell(row_idx, row)
 
@@ -10429,43 +10479,25 @@ class ManualFitGUI(QMainWindow):
             param_columns = self._batch_parameter_column_items()
             error_col = param_start + len(param_columns)
 
-            queue_value = row.get("_queue_position")
-            queue_text = (
-                str(int(queue_value))
-                if isinstance(queue_value, (int, np.integer))
-                else ""
-            )
             self.batch_table.setItem(
                 row_idx,
                 queue_col,
                 NumericSortTableWidgetItem(queue_text),
             )
-            status_text = str(row.get("_fit_status") or "").strip()
-            status_item = NumericSortTableWidgetItem(status_text)
-            status_lower = status_text.lower()
-            if status_lower == "running":
-                status_item.setForeground(QBrush(QColor("#1d4ed8")))
-            elif status_lower == "queued":
-                status_item.setForeground(QBrush(QColor("#64748b")))
-            elif status_lower == "done":
-                status_item.setForeground(QBrush(QColor("#15803d")))
-            elif status_lower == "no change":
-                status_item.setForeground(QBrush(QColor("#7c3aed")))
-            elif status_lower in {"failed", "cancelled"}:
-                status_item.setForeground(QBrush(QColor("#b91c1c")))
             self.batch_table.setItem(row_idx, status_col, status_item)
 
-            r2_old = _finite_float_or_none(row.get("_r2_old"))
             self.batch_table.setItem(
                 row_idx,
                 r2_old_col,
-                NumericSortTableWidgetItem(f"{float(r2_old):.6f}" if r2_old is not None else ""),
+                r2_old_item,
             )
             r2_val = _finite_float_or_none(row.get("r2"))
             self.batch_table.setItem(
                 row_idx,
                 r2_new_col,
-                NumericSortTableWidgetItem(f"{float(r2_val):.6f}" if r2_val is not None else ""),
+                NumericSortTableWidgetItem(
+                    f"{float(r2_val):.6f}" if r2_val is not None else ""
+                ),
             )
 
             params = self._as_float_array(row.get("params"))
