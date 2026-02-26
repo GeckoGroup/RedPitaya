@@ -67,6 +67,7 @@ from PyQt6.QtWidgets import (
     QStyleOptionHeader,
     QStyleOptionViewItem,
     QStyledItemDelegate,
+    QMessageBox,
 )
 from PyQt6.QtCore import Qt, QTimer, QSize, QEvent, QRectF
 from PyQt6.QtCore import QObject, QThread, pyqtSignal, pyqtSlot
@@ -88,7 +89,7 @@ from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
 
-from ordered_blended_solver import (
+from solver import (
     OrderedPiecewiseConfig,
     SegmentSpec,
     predict_ordered_piecewise,
@@ -2255,6 +2256,11 @@ def make_batch_result_row(
     boundary_ratios=None,
     boundary_values=None,
     pattern_error=None,
+    equation_stale=False,
+    fit_status=None,
+    queue_position=None,
+    r2_old=None,
+    fit_task_id=None,
 ):
     return {
         "_source_index": int(source_index),
@@ -2272,6 +2278,13 @@ def make_batch_result_row(
         "boundary_ratios": boundary_ratios,
         "boundary_values": boundary_values,
         "pattern_error": pattern_error,
+        "_equation_stale": bool(equation_stale),
+        "_fit_status": (str(fit_status) if fit_status not in (None, "") else None),
+        "_queue_position": (
+            int(queue_position) if queue_position not in (None, "") else None
+        ),
+        "_r2_old": r2_old,
+        "_fit_task_id": (int(fit_task_id) if fit_task_id not in (None, "") else None),
     }
 
 
@@ -2479,6 +2492,15 @@ class BatchFitWorker(QObject):
             str(key): (str(value) if value not in (None, "") else None)
             for key, value in dict(parameter_capture_map or {}).items()
         }
+        self._capture_seed_keys = tuple(
+            sorted(
+                {
+                    str(field)
+                    for field in self.parameter_capture_map.values()
+                    if field not in (None, "")
+                }
+            )
+        )
         self.model_def = model_def
         self.ordered_param_keys = list(ordered_param_keys or ())
         self.seed_map = {
@@ -2565,6 +2587,110 @@ class BatchFitWorker(QObject):
             updated_seed[key] = value
         return updated_seed
 
+    def _capture_seed_signature(
+        self, captures: Mapping[str, Any]
+    ) -> Optional[Tuple[Tuple[str, str], ...]]:
+        if not self._capture_seed_keys:
+            return None
+        signature: List[Tuple[str, str]] = []
+        for key in self._capture_seed_keys:
+            value = captures.get(key)
+            if value in (None, ""):
+                return None
+            signature.append((key, str(value)))
+        return tuple(signature)
+
+    @staticmethod
+    def _capture_value_distance(left: Any, right: Any) -> float:
+        left_num = _finite_float_or_none(left)
+        right_num = _finite_float_or_none(right)
+        if left_num is not None and right_num is not None:
+            denom = abs(left_num) + abs(right_num) + 1.0
+            return float(abs(left_num - right_num) / denom)
+        return 0.0 if str(left) == str(right) else 1.0
+
+    @staticmethod
+    def _is_seed_candidate_good(row: Mapping[str, Any]) -> bool:
+        if not has_nonempty_values(row.get("params")):
+            return False
+        return not _row_has_error(row)
+
+    def _capture_distance(
+        self,
+        left_captures: Mapping[str, Any],
+        right_captures: Mapping[str, Any],
+    ) -> Optional[float]:
+        if not self._capture_seed_keys:
+            return None
+        total = 0.0
+        count = 0
+        for key in self._capture_seed_keys:
+            left_value = left_captures.get(key)
+            right_value = right_captures.get(key)
+            if left_value in (None, "") or right_value in (None, ""):
+                total += 1.0
+                count += 1
+                continue
+            total += self._capture_value_distance(left_value, right_value)
+            count += 1
+        if count <= 0:
+            return None
+        return float(total / float(count))
+
+    def _best_matching_capture_seed_row(
+        self, *, captures: Mapping[str, Any], exclude_file_path: str
+    ) -> Tuple[Optional[Mapping[str, Any]], Optional[str], Optional[str]]:
+        target_signature = self._capture_seed_signature(captures)
+        best_row: Optional[Mapping[str, Any]] = None
+        best_file: Optional[str] = None
+        closest_row: Optional[Mapping[str, Any]] = None
+        closest_file: Optional[str] = None
+        closest_distance: Optional[float] = None
+        exclude_key = str(exclude_file_path)
+        for file_key, candidate_row in self.existing_rows_by_file.items():
+            if str(file_key) == exclude_key:
+                continue
+            if not self._is_seed_candidate_good(candidate_row):
+                continue
+            candidate_captures = candidate_row.get("captures")
+            if not isinstance(candidate_captures, Mapping):
+                continue
+            candidate_signature = self._capture_seed_signature(candidate_captures)
+            if (
+                target_signature is not None
+                and candidate_signature is not None
+                and candidate_signature == target_signature
+            ):
+                if best_row is None or is_fit_row_improved(candidate_row, best_row):
+                    best_row = candidate_row
+                    best_file = str(file_key)
+                continue
+            distance = self._capture_distance(captures, candidate_captures)
+            if distance is None:
+                continue
+            if closest_row is None:
+                closest_row = candidate_row
+                closest_file = str(file_key)
+                closest_distance = float(distance)
+                continue
+            if float(distance) < float(closest_distance):
+                closest_row = candidate_row
+                closest_file = str(file_key)
+                closest_distance = float(distance)
+                continue
+            if np.isclose(
+                float(distance), float(closest_distance)
+            ) and is_fit_row_improved(candidate_row, closest_row):
+                closest_row = candidate_row
+                closest_file = str(file_key)
+                closest_distance = float(distance)
+
+        if best_row is not None:
+            return best_row, "matching-captures", best_file
+        if closest_row is not None:
+            return closest_row, "closest-captures", closest_file
+        return None, None, None
+
     def _boundary_seed_for_file(self, existing_row: Mapping[str, Any]) -> np.ndarray:
         candidate = np.asarray(self.boundary_seed, dtype=float).reshape(-1)
         if candidate.size <= 0:
@@ -2643,6 +2769,11 @@ class BatchFitWorker(QObject):
             pattern_error=pattern_error,
         )
 
+        def _copy_existing_no_change_row():
+            copied = self._copy_fit_fields_from_existing(row, existing_row)
+            copied["_fit_no_change"] = True
+            return copied
+
         try:
             data = read_measurement_csv(file_path)
             if self.x_channel not in data.columns:
@@ -2658,57 +2789,103 @@ class BatchFitWorker(QObject):
             fixed_params, mapping_error = self._mapping_fixed_params(captures)
             if mapping_error:
                 if existing_has_fit:
-                    return self._copy_fit_fields_from_existing(row, existing_row)
+                    return _copy_existing_no_change_row()
                 row["error"] = mapping_error
                 return row
 
             if self.cancel_requested:
                 return None
 
+            attempt_inputs: List[
+                Tuple[Dict[str, float], np.ndarray, str, Optional[str]]
+            ] = []
             if self.use_existing_fit_seed:
-                primary_seed_map = self._seed_map_with_existing_fit(
-                    self.seed_map, existing_row
+                matching_seed_row, matching_seed_kind, matching_seed_file = (
+                    self._best_matching_capture_seed_row(
+                        captures=captures,
+                        exclude_file_path=str(file_path),
+                    )
                 )
-                primary_boundary_seed = self._boundary_seed_for_file(existing_row)
-            else:
-                primary_seed_map = dict(self.seed_map)
-                primary_boundary_seed = np.asarray(
-                    self.boundary_seed, dtype=float
-                ).reshape(-1)
 
-            attempt_inputs: List[Tuple[Dict[str, float], np.ndarray]] = [
-                (
-                    dict(primary_seed_map),
-                    np.asarray(primary_boundary_seed, dtype=float).reshape(-1),
+                derived_row = matching_seed_row
+                derived_kind = str(matching_seed_kind or "")
+                derived_file: Optional[str] = (
+                    str(matching_seed_file)
+                    if matching_seed_file not in (None, "")
+                    else None
                 )
-            ]
-            if self.use_existing_fit_seed and existing_has_fit:
+                if derived_row is None and self._is_seed_candidate_good(existing_row):
+                    derived_row = existing_row
+                    derived_kind = "existing-row"
+                    derived_file = str(file_path)
+
+                if derived_row is not None:
+                    derived_seed = self._seed_map_with_existing_fit(
+                        self.seed_map, derived_row
+                    )
+                    derived_boundary = self._boundary_seed_for_file(derived_row)
+                    attempt_inputs.append(
+                        (
+                            dict(derived_seed),
+                            np.asarray(derived_boundary, dtype=float).reshape(-1),
+                            (derived_kind or "matching-captures"),
+                            derived_file,
+                        )
+                    )
+                else:
+                    attempt_inputs.append(
+                        (
+                            dict(self.seed_map),
+                            np.asarray(self.boundary_seed, dtype=float).reshape(-1),
+                            "default",
+                            None,
+                        )
+                    )
+
+                attempt_inputs.append(
+                    (
+                        self._randomized_seed_map(self.seed_map),
+                        self._randomized_boundary_seed(self.boundary_seed),
+                        "random-restart",
+                        None,
+                    )
+                )
+            else:
                 attempt_inputs.append(
                     (
                         dict(self.seed_map),
                         np.asarray(self.boundary_seed, dtype=float).reshape(-1),
+                        "default",
+                        None,
                     )
                 )
-                for _ in range(self.random_restarts):
-                    attempt_inputs.append(
-                        (
-                            self._randomized_seed_map(self.seed_map),
-                            self._randomized_boundary_seed(self.boundary_seed),
-                        )
-                    )
 
-            deduped_attempts: List[Tuple[Dict[str, float], np.ndarray]] = []
+            deduped_attempts: List[
+                Tuple[Dict[str, float], np.ndarray, str, Optional[str]]
+            ] = []
             seen_signatures: Set[Tuple[float, ...]] = set()
-            for seed_candidate, boundary_candidate in attempt_inputs:
+            for (
+                seed_candidate,
+                boundary_candidate,
+                seed_source,
+                seed_source_file,
+            ) in attempt_inputs:
                 sig = self._seed_signature(seed_candidate, boundary_candidate)
                 if sig in seen_signatures:
                     continue
                 seen_signatures.add(sig)
-                deduped_attempts.append((seed_candidate, boundary_candidate))
+                deduped_attempts.append(
+                    (seed_candidate, boundary_candidate, seed_source, seed_source_file)
+                )
 
             best_row = None
             last_error = None
-            for seed_candidate, boundary_candidate in deduped_attempts:
+            for (
+                seed_candidate,
+                boundary_candidate,
+                seed_source,
+                seed_source_file,
+            ) in deduped_attempts:
                 if self.cancel_requested:
                     return None
                 seed_map = dict(seed_candidate)
@@ -2756,22 +2933,24 @@ class BatchFitWorker(QObject):
                     n_boundaries,
                 )
                 candidate_row["error"] = None
+                candidate_row["_seed_source"] = str(seed_source)
+                candidate_row["_seed_source_file"] = seed_source_file
                 if best_row is None or is_fit_row_improved(candidate_row, best_row):
                     best_row = candidate_row
 
             if best_row is None:
                 if existing_has_fit:
-                    return self._copy_fit_fields_from_existing(row, existing_row)
+                    return _copy_existing_no_change_row()
                 row["error"] = str(last_error or "No fit result.")
                 return row
             if existing_has_fit and not is_fit_row_improved(best_row, existing_row):
-                return self._copy_fit_fields_from_existing(row, existing_row)
+                return _copy_existing_no_change_row()
             return best_row
         except FitCancelledError:
             return None
         except Exception as exc:
             if existing_has_fit:
-                return self._copy_fit_fields_from_existing(row, existing_row)
+                return _copy_existing_no_change_row()
             row["error"] = str(exc)
             return row
 
@@ -3722,6 +3901,11 @@ class ManualFitGUI(QMainWindow):
             if str(task.get("status")) != "pending":
                 continue
             task["status"] = "running"
+            if str(task.get("kind")) == "batch":
+                self._set_batch_row_runtime_fields(
+                    task.get("file_path"),
+                    _fit_status="Running",
+                )
             thread = task.get("thread")
             if thread is not None:
                 thread.start()
@@ -4325,6 +4509,7 @@ class ManualFitGUI(QMainWindow):
     def _on_breakpoint_slider_released(self):
         self.slider_active = False
         self.do_full_update()
+        self._autosave_fit_details()
 
     def _create_param_label(self, spec, width):
         """Create a one-line parameter label."""
@@ -4728,15 +4913,8 @@ class ManualFitGUI(QMainWindow):
         lower = []
         upper = []
         for spec in self.param_specs:
-            if (
-                spec.key in self.param_min_spinboxes
-                and spec.key in self.param_max_spinboxes
-            ):
-                low = float(self.param_min_spinboxes[spec.key].value())
-                high = float(self.param_max_spinboxes[spec.key].value())
-            else:
-                low = float(spec.min_value)
-                high = float(spec.max_value)
+            low = float(spec.min_value)
+            high = float(spec.max_value)
             if low > high:
                 low, high = high, low
             lower.append(low)
@@ -4791,20 +4969,6 @@ class ManualFitGUI(QMainWindow):
 
         low = float(min_box.value())
         high = float(max_box.value())
-        spec = next((item for item in self.param_specs if item.key == key), None)
-        if spec is not None:
-            spec_low = float(min(spec.min_value, spec.max_value))
-            spec_high = float(max(spec.min_value, spec.max_value))
-            if low < spec_low:
-                min_box.blockSignals(True)
-                min_box.setValue(spec_low)
-                min_box.blockSignals(False)
-                low = spec_low
-            if high > spec_high:
-                max_box.blockSignals(True)
-                max_box.setValue(spec_high)
-                max_box.blockSignals(False)
-                high = spec_high
         if low > high:
             if source == "min":
                 max_box.blockSignals(True)
@@ -4817,6 +4981,26 @@ class ManualFitGUI(QMainWindow):
                 min_box.blockSignals(False)
                 low = high
 
+        updated_specs = []
+        for spec in self.param_specs:
+            if spec.key != key:
+                updated_specs.append(spec)
+                continue
+            clipped_default = float(np.clip(float(spec.default), low, high))
+            updated_specs.append(
+                ParameterSpec(
+                    key=spec.key,
+                    symbol=spec.symbol,
+                    description=spec.description,
+                    default=clipped_default,
+                    min_value=float(low),
+                    max_value=float(high),
+                    decimals=int(spec.decimals),
+                )
+            )
+        self.param_specs = updated_specs
+        self.defaults = self._default_param_values(self.param_specs)
+
         value_box.blockSignals(True)
         value_box.setMinimum(low)
         value_box.setMaximum(high)
@@ -4824,6 +5008,7 @@ class ManualFitGUI(QMainWindow):
         value_box.blockSignals(False)
         self._sync_slider_from_spinbox(key)
         self.update_plot(fast=False)
+        self._autosave_fit_details()
 
     def _build_fit_context(
         self,
@@ -4848,18 +5033,12 @@ class ManualFitGUI(QMainWindow):
         seed_map = {}
         missing_keys = []
         for key in ordered_keys:
-            min_box = self.param_min_spinboxes.get(key)
-            max_box = self.param_max_spinboxes.get(key)
-            if min_box is not None and max_box is not None:
-                low = float(min_box.value())
-                high = float(max_box.value())
-            else:
-                spec = spec_by_key.get(key)
-                if spec is None:
-                    missing_keys.append(key)
-                    continue
-                low = float(spec.min_value)
-                high = float(spec.max_value)
+            spec = spec_by_key.get(key)
+            if spec is None:
+                missing_keys.append(key)
+                continue
+            low = float(spec.min_value)
+            high = float(spec.max_value)
             if low > high:
                 low, high = high, low
             bounds_by_key[key] = (low, high)
@@ -4931,16 +5110,13 @@ class ManualFitGUI(QMainWindow):
         model_def = self._piecewise_model
         if model_def is None:
             raise ValueError("No compiled piecewise model is available.")
+        spec_by_key = {spec.key: spec for spec in self.param_specs}
         bounds_map = {
-            spec.key: (
-                float(self.param_min_spinboxes[spec.key].value())
-                if spec.key in self.param_min_spinboxes
-                else float(spec.min_value),
-                float(self.param_max_spinboxes[spec.key].value())
-                if spec.key in self.param_max_spinboxes
-                else float(spec.max_value),
+            key: (
+                float(min(spec.min_value, spec.max_value)),
+                float(max(spec.min_value, spec.max_value)),
             )
-            for spec in self.param_specs
+            for key, spec in spec_by_key.items()
         }
         missing_bounds = [
             key for key in model_def.global_param_names if key not in bounds_map
@@ -6037,14 +6213,27 @@ class ManualFitGUI(QMainWindow):
             self.update_plot(fast=False, preserve_view=False)
             self._reset_plot_home_view()
             if self.batch_results:
-                for row in self.batch_results:
-                    row["params"] = None
-                    row["r2"] = None
-                    row["error"] = None
-                    row["boundary_ratios"] = None
-                    row["boundary_values"] = None
-                    row["plot_full"] = None
-                    row["plot"] = None
+                batch_action = self._prompt_batch_results_on_equation_change()
+                if batch_action == "cancel":
+                    return False
+                if batch_action == "wipe":
+                    for row in self.batch_results:
+                        row["params"] = None
+                        row["r2"] = None
+                        row["error"] = None
+                        row["boundary_ratios"] = None
+                        row["boundary_values"] = None
+                        row["plot_full"] = None
+                        row["plot"] = None
+                        row["plot_render_size"] = None
+                        row["plot_has_fit"] = None
+                        row["_equation_stale"] = False
+                else:
+                    for row in self.batch_results:
+                        row["_equation_stale"] = True
+                    self.stats_text.append(
+                        "Equation updated; existing batch results were kept and marked stale."
+                    )
                 self.update_batch_table()
                 self._refresh_batch_analysis_if_run()
                 self.queue_visible_thumbnail_render()
@@ -6121,6 +6310,7 @@ class ManualFitGUI(QMainWindow):
         value_box.valueChanged.connect(
             lambda _value, name=key: self._sync_slider_from_spinbox(name)
         )
+        value_box.valueChanged.connect(lambda: self._autosave_fit_details())
         layout.addWidget(value_box)
 
         tail_spacer = QWidget()
@@ -6146,6 +6336,7 @@ class ManualFitGUI(QMainWindow):
         def slider_released():
             self.slider_active = False
             self.do_full_update()
+            self._autosave_fit_details()
 
         slider.valueChanged.connect(slider_to_spinbox)
         slider.sliderPressed.connect(slider_pressed)
@@ -6808,12 +6999,15 @@ class ManualFitGUI(QMainWindow):
     def _batch_row_error_text(self, row):
         pattern_error = str(row.get("pattern_error") or "").strip()
         fit_error = str(row.get("error") or "").strip()
+        is_stale = bool(row.get("_equation_stale"))
 
         normalized_fit_error = fit_error.lower().replace(".", "").strip()
         if normalized_fit_error in {"cancelled", "canceled"}:
             fit_error = ""
 
         parts = []
+        if is_stale:
+            parts.append("Stale fit (equation changed)")
         if pattern_error:
             parts.append(pattern_error)
         if fit_error and fit_error not in parts:
@@ -7491,30 +7685,23 @@ class ManualFitGUI(QMainWindow):
             min_box = self.param_min_spinboxes.get(spec.key)
             max_box = self.param_max_spinboxes.get(spec.key)
             value_box = self.param_spinboxes.get(spec.key)
+            low = float(min_box.value()) if min_box is not None else float(spec.min_value)
+            high = (
+                float(max_box.value()) if max_box is not None else float(spec.max_value)
+            )
+            if low > high:
+                low, high = high, low
+            value = float(value_box.value()) if value_box is not None else float(spec.default)
             serialized.append(
                 {
                     "key": str(spec.key),
                     "symbol": str(spec.symbol),
                     "description": str(spec.description),
-                    "default": float(spec.default),
-                    "min_value": float(spec.min_value),
-                    "max_value": float(spec.max_value),
+                    "default": float(np.clip(float(spec.default), low, high)),
+                    "min_value": float(low),
+                    "max_value": float(high),
                     "decimals": int(spec.decimals),
-                    "ui_min": (
-                        float(min_box.value())
-                        if min_box is not None
-                        else float(spec.min_value)
-                    ),
-                    "ui_max": (
-                        float(max_box.value())
-                        if max_box is not None
-                        else float(spec.max_value)
-                    ),
-                    "value": (
-                        float(value_box.value())
-                        if value_box is not None
-                        else float(spec.default)
-                    ),
+                    "value": float(np.clip(value, low, high)),
                 }
             )
         return serialized
@@ -7868,6 +8055,8 @@ class ManualFitGUI(QMainWindow):
             row["plot"] = None
             row["plot_render_size"] = None
             row["plot_has_fit"] = has_nonempty_values(row.get("params"))
+            if row.get("plot_has_fit"):
+                row["_equation_stale"] = False
             row = self._apply_param_range_validation_to_row(row)
             existing_by_file[file_ref] = row
             applied += 1
@@ -7961,8 +8150,6 @@ class ManualFitGUI(QMainWindow):
                         decimals=decimals,
                     )
                     value_by_key[key] = {
-                        "ui_min": entry.get("ui_min"),
-                        "ui_max": entry.get("ui_max"),
                         "value": entry.get("value"),
                     }
 
@@ -7983,14 +8170,8 @@ class ManualFitGUI(QMainWindow):
                         spinbox = self.param_spinboxes.get(spec.key)
                         if min_box is None or max_box is None or spinbox is None:
                             continue
-                        low = self._json_float_or_none(state.get("ui_min"))
-                        high = self._json_float_or_none(state.get("ui_max"))
-                        if low is None:
-                            low = float(spec.min_value)
-                        if high is None:
-                            high = float(spec.max_value)
-                        if low > high:
-                            low, high = high, low
+                        low = float(min(spec.min_value, spec.max_value))
+                        high = float(max(spec.min_value, spec.max_value))
                         min_box.setValue(float(low))
                         max_box.setValue(float(high))
                         value = self._json_float_or_none(state.get("value"))
@@ -8190,6 +8371,7 @@ class ManualFitGUI(QMainWindow):
         row["plot"] = None
         row["plot_render_size"] = None
         row["plot_has_fit"] = True
+        row["_equation_stale"] = False
         row = self._apply_param_range_validation_to_row(row)
         self.batch_results[row_idx] = row
         self._rebuild_batch_capture_keys_from_rows()
@@ -8306,6 +8488,7 @@ class ManualFitGUI(QMainWindow):
                 existing_row.get("boundary_values") if preserve_fit_result else None
             ),
             pattern_error=pattern_error,
+            equation_stale=bool(existing_row.get("_equation_stale")),
         )
         return self._apply_param_range_validation_to_row(row)
 
@@ -8322,6 +8505,92 @@ class ManualFitGUI(QMainWindow):
             start_dir = Path.cwd()
         return start_dir
 
+    def _confirm_clear_batch_results(self, action_label):
+        rows = list(getattr(self, "batch_results", []) or [])
+        if not rows:
+            return True
+
+        action_text = str(action_label or "this action").strip() or "this action"
+        row_count = len(rows)
+        plural = "s" if row_count != 1 else ""
+        reply = QMessageBox.question(
+            self,
+            "Clear Batch Results?",
+            (
+                f"{action_text} will clear {row_count} existing batch result{plural}.\n"
+                "Do you want to continue?"
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return reply == QMessageBox.StandardButton.Yes
+
+    def _prompt_batch_results_on_rerun(self):
+        rows = list(getattr(self, "batch_results", []) or [])
+        if not rows:
+            return "keep"
+
+        row_count = len(rows)
+        plural = "s" if row_count != 1 else ""
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Icon.Warning)
+        dialog.setWindowTitle("Run Batch")
+        dialog.setText(f"Batch rerun found {row_count} existing result{plural}.")
+        dialog.setInformativeText(
+            "Choose whether to keep existing results for comparison/seeding, or clear them first."
+        )
+
+        keep_btn = dialog.addButton(
+            "Proceed and Keep", QMessageBox.ButtonRole.AcceptRole
+        )
+        clear_btn = dialog.addButton(
+            "Proceed and Clear", QMessageBox.ButtonRole.DestructiveRole
+        )
+        cancel_btn = dialog.addButton(QMessageBox.StandardButton.Cancel)
+        dialog.setDefaultButton(keep_btn)
+
+        dialog.exec()
+        clicked = dialog.clickedButton()
+        if clicked == cancel_btn:
+            return "cancel"
+        if clicked == clear_btn:
+            return "clear"
+        return "keep"
+
+    def _prompt_batch_results_on_equation_change(self):
+        rows = list(getattr(self, "batch_results", []) or [])
+        if not rows:
+            return "wipe"
+
+        row_count = len(rows)
+        plural = "s" if row_count != 1 else ""
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Icon.Warning)
+        dialog.setWindowTitle("Equation Changed")
+        dialog.setText(
+            f"Changing the equation affects {row_count} existing batch result{plural}."
+        )
+        dialog.setInformativeText(
+            "Choose whether to keep old batch results or clear them before continuing."
+        )
+
+        keep_btn = dialog.addButton(
+            "Proceed and Keep", QMessageBox.ButtonRole.AcceptRole
+        )
+        wipe_btn = dialog.addButton(
+            "Proceed and Clear", QMessageBox.ButtonRole.DestructiveRole
+        )
+        cancel_btn = dialog.addButton(QMessageBox.StandardButton.Cancel)
+        dialog.setDefaultButton(keep_btn)
+
+        dialog.exec()
+        clicked = dialog.clickedButton()
+        if clicked == cancel_btn:
+            return "cancel"
+        if clicked == wipe_btn:
+            return "wipe"
+        return "keep"
+
     def _apply_data_file_list(self, files, *, empty_message):
         deduped_files = []
         seen = set()
@@ -8331,6 +8600,10 @@ class ManualFitGUI(QMainWindow):
                 continue
             seen.add(text)
             deduped_files.append(text)
+
+        if not self._confirm_clear_batch_results("Loading a new data source"):
+            self.stats_text.append("Load cancelled; existing batch results kept.")
+            return False
 
         self.data_files = deduped_files
         self.file_combo.clear()
@@ -9379,6 +9652,8 @@ class ManualFitGUI(QMainWindow):
             print(f"Error updating stats: {type(e).__name__}: {e}", file=sys.stderr)
 
     def _apply_fit_row_update(self, row):
+        if has_nonempty_values(row.get("params")):
+            row["_equation_stale"] = False
         row = self._apply_param_range_validation_to_row(row)
         row_index = row.get("_source_index")
         if row_index is None:
@@ -9393,7 +9668,17 @@ class ManualFitGUI(QMainWindow):
             row_index = len(self.batch_results) - 1
         else:
             existing = self.batch_results[row_index]
+            for runtime_key in (
+                "_fit_status",
+                "_queue_position",
+                "_r2_old",
+                "_fit_task_id",
+            ):
+                if runtime_key not in row:
+                    row[runtime_key] = existing.get(runtime_key)
             row_has_fit = has_nonempty_values(row.get("params"))
+            if (not row_has_fit) and ("_equation_stale" not in row):
+                row["_equation_stale"] = bool(existing.get("_equation_stale"))
             existing_plot_has_fit = existing.get("plot_has_fit")
             if existing_plot_has_fit is None:
                 existing_plot_has_fit = has_nonempty_values(existing.get("params"))
@@ -9430,6 +9715,28 @@ class ManualFitGUI(QMainWindow):
         if current_file and row.get("file") == current_file and row_has_fit:
             self._apply_batch_params_for_file(current_file)
             self.update_plot(fast=False)
+        self._refresh_batch_analysis_if_run()
+
+    def _set_batch_row_runtime_fields(self, file_path, **updates):
+        row_idx = self._find_batch_result_index_by_file(file_path)
+        if row_idx is None:
+            return False
+        row = dict(self.batch_results[row_idx])
+        changed = False
+        for key, value in updates.items():
+            if row.get(key) == value:
+                continue
+            row[key] = value
+            changed = True
+        if not changed:
+            return False
+        self.batch_results[row_idx] = row
+        table_row_idx = self._find_table_row_by_file(file_path)
+        if table_row_idx is None:
+            self.update_batch_table()
+        else:
+            self.update_batch_table_row(table_row_idx, row)
+        return True
 
     def _upsert_fit_error_row(self, file_path, source_index, error_text):
         row_idx = self._find_batch_result_index_by_file(file_path)
@@ -9467,6 +9774,7 @@ class ManualFitGUI(QMainWindow):
             self.update_batch_table()
         else:
             self.update_batch_table_row(table_row_idx, row)
+        self._refresh_batch_analysis_if_run()
 
     def _start_file_fit_task(
         self,
@@ -9478,6 +9786,7 @@ class ManualFitGUI(QMainWindow):
         capture_regex_pattern,
         capture_defaults,
         parameter_capture_map,
+        queue_position=None,
     ):
         task_id = self._next_fit_task_id()
         existing_idx = self._find_batch_result_index_by_file(file_path)
@@ -9505,7 +9814,16 @@ class ManualFitGUI(QMainWindow):
                 if boundary_seed.size > 0:
                     overridden["boundary_ratios"] = np.clip(boundary_seed, 0.0, 1.0)
                 existing_row = overridden
-        existing_rows_by_file = {file_path: existing_row} if existing_row else {}
+        if str(kind) == "batch":
+            existing_rows_by_file = {
+                str(row.get("file")): dict(row)
+                for row in list(self.batch_results or [])
+                if row.get("file")
+            }
+            if existing_row:
+                existing_rows_by_file[str(file_path)] = dict(existing_row)
+        else:
+            existing_rows_by_file = {file_path: existing_row} if existing_row else {}
 
         thread = QThread(self)
         worker = BatchFitWorker(
@@ -9538,12 +9856,28 @@ class ManualFitGUI(QMainWindow):
             "file_path": str(file_path),
             "file_key": self._fit_task_file_key(file_path),
             "source_index": int(source_index),
+            "queue_position": (
+                int(queue_position) if queue_position not in (None, "") else None
+            ),
             "status": "pending",
             "thread": thread,
             "worker": worker,
         }
         if str(kind) == "batch":
             self._batch_active_task_ids.add(int(task_id))
+            existing_r2 = None
+            row_idx = self._find_batch_result_index_by_file(file_path)
+            if row_idx is not None and 0 <= row_idx < len(self.batch_results):
+                existing_r2 = self.batch_results[row_idx].get("r2")
+            self._set_batch_row_runtime_fields(
+                file_path,
+                _fit_status="Queued",
+                _fit_task_id=int(task_id),
+                _queue_position=(
+                    int(queue_position) if queue_position not in (None, "") else None
+                ),
+                _r2_old=existing_r2,
+            )
         else:
             self._manual_active_task_ids.add(int(task_id))
 
@@ -9615,6 +9949,36 @@ class ManualFitGUI(QMainWindow):
             else:
                 error_text = str(row.get("error") or "No fit result.")
                 self.stats_text.append(f"✗ Auto-fit failed [{file_name}]: {error_text}")
+        elif task.get("kind") == "batch" and row is not None:
+            status_text = "Done"
+            if bool(row.get("_fit_no_change")):
+                status_text = "No Change"
+            elif self._batch_row_error_text(row):
+                status_text = "Failed"
+            elif not has_nonempty_values(row.get("params")):
+                status_text = "No Result"
+            self._set_batch_row_runtime_fields(
+                task.get("file_path"),
+                _fit_status=status_text,
+                _fit_task_id=None,
+            )
+            if has_nonempty_values(row.get("params")):
+                seed_source = str(row.get("_seed_source") or "").strip().lower()
+                if seed_source in {"matching-captures", "closest-captures"}:
+                    file_path = str(task.get("file_path"))
+                    file_name = stem_for_file_ref(file_path)
+                    source_file = str(row.get("_seed_source_file") or "").strip()
+                    source_name = (
+                        stem_for_file_ref(source_file) if source_file else "another row"
+                    )
+                    if seed_source == "matching-captures":
+                        self.stats_text.append(
+                            f"ℹ Seed used [{file_name}]: matched extracted fields from {source_name}."
+                        )
+                    else:
+                        self.stats_text.append(
+                            f"ℹ Seed used [{file_name}]: closest extracted fields from {source_name}."
+                        )
 
         self._finish_fit_task(int(task_id))
 
@@ -9625,6 +9989,12 @@ class ManualFitGUI(QMainWindow):
         file_path = str(task.get("file_path"))
         source_index = int(task.get("source_index", 0))
         self._upsert_fit_error_row(file_path, source_index, error_text)
+        if task.get("kind") == "batch":
+            self._set_batch_row_runtime_fields(
+                file_path,
+                _fit_status="Failed",
+                _fit_task_id=None,
+            )
         if task.get("kind") == "manual":
             file_name = stem_for_file_ref(file_path)
             self.stats_text.append(f"✗ Auto-fit failed [{file_name}]: {error_text}")
@@ -9634,6 +10004,12 @@ class ManualFitGUI(QMainWindow):
         task = self.fit_tasks.get(int(task_id))
         if task is None:
             return
+        if task.get("kind") == "batch":
+            self._set_batch_row_runtime_fields(
+                task.get("file_path"),
+                _fit_status="Cancelled",
+                _fit_task_id=None,
+            )
         if task.get("kind") == "manual":
             file_name = stem_for_file_ref(task.get("file_path"))
             self.stats_text.append(f"Auto-fit cancelled: {file_name}")
@@ -9657,6 +10033,10 @@ class ManualFitGUI(QMainWindow):
             self._batch_progress_done = min(
                 int(self._batch_total_tasks),
                 int(self._batch_progress_done) + 1,
+            )
+            self._set_batch_row_runtime_fields(
+                task.get("file_path"),
+                _fit_task_id=None,
             )
         else:
             self._manual_active_task_ids.discard(int(task_id))
@@ -9714,6 +10094,12 @@ class ManualFitGUI(QMainWindow):
         if self.batch_fit_in_progress:
             self.stats_text.append("Batch fit is already running.")
             return
+        rerun_choice = self._prompt_batch_results_on_rerun()
+        if rerun_choice == "cancel":
+            self.stats_text.append("Batch fit cancelled; existing batch results kept.")
+            return
+        clear_existing_results = rerun_choice == "clear"
+        previous_rows = list(getattr(self, "batch_results", []) or [])
         self._sync_batch_files_from_shared(sync_pattern=False)
         if not self.batch_files:
             self.stats_text.append("No files available from the shared folder list.")
@@ -9735,11 +10121,33 @@ class ManualFitGUI(QMainWindow):
         self._batch_cancel_pending = False
         self._batch_cancel_requested = False
 
-        existing_by_file = {row["file"]: row for row in self.batch_results}
+        existing_by_file = {}
+        if not clear_existing_results:
+            for row in previous_rows:
+                file_ref = str(row.get("file") or "").strip()
+                if not file_ref:
+                    continue
+                existing_by_file[self._fit_task_file_key(file_ref)] = row
+            for row in list(getattr(self, "batch_results", []) or []):
+                file_ref = str(row.get("file") or "").strip()
+                if not file_ref:
+                    continue
+                existing_by_file[self._fit_task_file_key(file_ref)] = row
         self.batch_results = []
         work_items = []
+
+        def _refit_priority(existing_row, source_index_value, has_existing_fit):
+            if not has_existing_fit:
+                return (0, 0.0, int(source_index_value))
+            r2_val = _finite_float_or_none(existing_row.get("r2"))
+            if r2_val is None:
+                distance = float("inf")
+            else:
+                distance = float(abs(1.0 - float(r2_val)))
+            return (1, -distance, int(source_index_value))
+
         for source_index, file_path in enumerate(self.batch_files):
-            existing = existing_by_file.get(file_path, {})
+            existing = existing_by_file.get(self._fit_task_file_key(file_path), {})
             extracted = extract_captures(
                 stem_for_file_ref(file_path),
                 capture_config.regex,
@@ -9754,19 +10162,25 @@ class ManualFitGUI(QMainWindow):
                     captures=captures,
                     pattern_error=pattern_error,
                     existing=existing,
-                    preserve_fit_result=True,
+                    preserve_fit_result=(not clear_existing_results),
                 )
+            )
+            has_existing_fit = (
+                has_nonempty_values(existing.get("params"))
+                if not clear_existing_results
+                else False
             )
             work_items.append(
                 (
                     source_index,
                     file_path,
-                    has_nonempty_values(existing.get("params")),
+                    has_existing_fit,
+                    _refit_priority(existing, source_index, has_existing_fit),
                 )
             )
         self.update_batch_table()
 
-        prioritized_items = sorted(work_items, key=lambda item: (item[2], item[0]))
+        prioritized_items = sorted(work_items, key=lambda item: item[3])
         self._batch_total_tasks = len(prioritized_items)
         self._batch_active_task_ids = set()
         self._refresh_batch_controls()
@@ -9775,7 +10189,12 @@ class ManualFitGUI(QMainWindow):
         )
 
         parameter_capture_map = self._current_param_capture_map()
-        for source_index, file_path, _already_fitted in prioritized_items:
+        for queue_position, (
+            source_index,
+            file_path,
+            _already_fitted,
+            _priority,
+        ) in enumerate(prioritized_items, start=1):
             self._start_file_fit_task(
                 kind="batch",
                 file_path=file_path,
@@ -9784,6 +10203,7 @@ class ManualFitGUI(QMainWindow):
                 capture_regex_pattern=capture_config.regex_pattern,
                 capture_defaults=capture_config.defaults,
                 parameter_capture_map=parameter_capture_map,
+                queue_position=queue_position,
             )
 
     def on_batch_progress(self, completed, total, row):
@@ -9885,6 +10305,11 @@ class ManualFitGUI(QMainWindow):
             if task is None:
                 continue
             self._request_worker_cancel(task.get("worker"))
+            self._set_batch_row_runtime_fields(
+                task.get("file_path"),
+                _fit_status="Cancelled",
+                _fit_task_id=None,
+            )
             self._finish_fit_task(int(task_id), force_terminate=True)
 
     def cancel_batch_fit(self):
@@ -9899,6 +10324,11 @@ class ManualFitGUI(QMainWindow):
                 if task is None:
                     continue
                 if str(task.get("status")) == "pending":
+                    self._set_batch_row_runtime_fields(
+                        task.get("file_path"),
+                        _fit_status="Cancelled",
+                        _fit_task_id=None,
+                    )
                     self._finish_fit_task(int(task_id))
                 else:
                     self._request_worker_cancel(task.get("worker"))
@@ -9942,7 +10372,7 @@ class ManualFitGUI(QMainWindow):
                 ["Plot"]
                 + ["File"]
                 + self.batch_capture_keys
-                + ["R2"]
+                + ["Queue", "Status", "R² Old", "R² New"]
                 + param_column_tokens
                 + ["Error"]
             )
@@ -9950,7 +10380,7 @@ class ManualFitGUI(QMainWindow):
             self.batch_table.setHorizontalHeaderLabels(columns)
             rich_header = getattr(self, "batch_table_header", None)
             if isinstance(rich_header, RichTextHeaderView):
-                param_start = 3 + len(self.batch_capture_keys)
+                param_start = 6 + len(self.batch_capture_keys)
                 rich_map = {}
                 for offset, token in enumerate(param_column_tokens):
                     rich_html = parameter_symbol_to_html(token)
@@ -9989,26 +10419,54 @@ class ManualFitGUI(QMainWindow):
                     row_idx, col_idx, NumericSortTableWidgetItem(str(value))
                 )
 
-            # R2 column comes right after capture columns.
-            r2_col = 2 + len(self.batch_capture_keys)
-            # Parameter columns come after R2.
-            param_start = r2_col + 1
+            # Runtime columns come right after capture columns.
+            queue_col = 2 + len(self.batch_capture_keys)
+            status_col = queue_col + 1
+            r2_old_col = status_col + 1
+            r2_new_col = r2_old_col + 1
+            # Parameter columns come after runtime columns.
+            param_start = r2_new_col + 1
             param_columns = self._batch_parameter_column_items()
             error_col = param_start + len(param_columns)
 
-            r2_val = row.get("r2")
-            if r2_val is not None:
-                self.batch_table.setItem(
-                    row_idx,
-                    r2_col,
-                    NumericSortTableWidgetItem(f"{r2_val:.6f}"),
-                )
-            else:
-                self.batch_table.setItem(
-                    row_idx,
-                    r2_col,
-                    NumericSortTableWidgetItem(""),
-                )
+            queue_value = row.get("_queue_position")
+            queue_text = (
+                str(int(queue_value))
+                if isinstance(queue_value, (int, np.integer))
+                else ""
+            )
+            self.batch_table.setItem(
+                row_idx,
+                queue_col,
+                NumericSortTableWidgetItem(queue_text),
+            )
+            status_text = str(row.get("_fit_status") or "").strip()
+            status_item = NumericSortTableWidgetItem(status_text)
+            status_lower = status_text.lower()
+            if status_lower == "running":
+                status_item.setForeground(QBrush(QColor("#1d4ed8")))
+            elif status_lower == "queued":
+                status_item.setForeground(QBrush(QColor("#64748b")))
+            elif status_lower == "done":
+                status_item.setForeground(QBrush(QColor("#15803d")))
+            elif status_lower == "no change":
+                status_item.setForeground(QBrush(QColor("#7c3aed")))
+            elif status_lower in {"failed", "cancelled"}:
+                status_item.setForeground(QBrush(QColor("#b91c1c")))
+            self.batch_table.setItem(row_idx, status_col, status_item)
+
+            r2_old = _finite_float_or_none(row.get("_r2_old"))
+            self.batch_table.setItem(
+                row_idx,
+                r2_old_col,
+                NumericSortTableWidgetItem(f"{float(r2_old):.6f}" if r2_old is not None else ""),
+            )
+            r2_val = _finite_float_or_none(row.get("r2"))
+            self.batch_table.setItem(
+                row_idx,
+                r2_new_col,
+                NumericSortTableWidgetItem(f"{float(r2_val):.6f}" if r2_val is not None else ""),
+            )
 
             params = self._as_float_array(row.get("params"))
             boundary_values = self._as_float_array(row.get("boundary_values"))
