@@ -25,13 +25,14 @@ from typing import (
     Optional,
     Pattern,
     Sequence,
+    Set,
     Tuple,
 )
 import numpy as np
 from pathlib import Path
 from sklearn.metrics import r2_score
 from pandas import read_csv
-from scipy.optimize import curve_fit, least_squares
+from scipy.optimize import least_squares
 
 from PyQt6.QtWidgets import (
     QApplication,
@@ -692,7 +693,7 @@ DEFAULT_WINDOW_TITLE = "Curve Fitting"
 FIT_DETAILS_FILENAME = "fit_details.json"
 DEFAULT_TARGET_CHANNEL = "CH2"
 DEFAULT_EXPRESSION = (
-    "m*x+c ; abs(A_MI*sin(A_mod*sin(2*pi*f_mod*x+phi_mod)+phi_MI))**2+V_0 ; m*x+c"
+    "m*x+c ; abs(A_MI*sin(A_mod*sin(2*pi*f_mod*x+pi*phi_mod)+pi*phi_MI))**2+V_0 ; m*x+c"
 )
 DEFAULT_PARAM_SPECS = (
     ParameterSpec(
@@ -836,16 +837,6 @@ class FitCancelledError(RuntimeError):
     """Internal exception used to abort fitting when cancellation is requested."""
 
 
-def _sum_squared_error(y_true, y_pred):
-    y_true_arr = np.asarray(y_true, dtype=float).reshape(-1)
-    y_pred_arr = np.asarray(y_pred, dtype=float).reshape(-1)
-    valid = np.isfinite(y_true_arr) & np.isfinite(y_pred_arr)
-    if np.count_nonzero(valid) == 0:
-        return None
-    residual = y_true_arr[valid] - y_pred_arr[valid]
-    return float(np.dot(residual, residual))
-
-
 def has_nonempty_values(values) -> bool:
     if values is None:
         return False
@@ -867,6 +858,15 @@ def _finite_float_or_none(value) -> Optional[float]:
     return numeric
 
 
+def _row_has_error(row: Mapping[str, Any]) -> bool:
+    pattern_error = str(row.get("pattern_error") or "").strip()
+    fit_error = str(row.get("error") or "").strip()
+    normalized_fit_error = fit_error.lower().replace(".", "").strip()
+    if normalized_fit_error in {"cancelled", "canceled"}:
+        fit_error = ""
+    return bool(pattern_error or fit_error)
+
+
 def is_fit_row_improved(
     candidate_row: Mapping[str, Any], baseline_row: Mapping[str, Any]
 ) -> bool:
@@ -879,14 +879,11 @@ def is_fit_row_improved(
     if not baseline_has_fit:
         return True
 
-    candidate_sse = _finite_float_or_none(candidate_row.get("fit_sse"))
-    baseline_sse = _finite_float_or_none(baseline_row.get("fit_sse"))
-    if candidate_sse is not None and baseline_sse is not None:
-        tolerance = 1e-12 * max(1.0, abs(baseline_sse))
-        return bool(candidate_sse < (baseline_sse - tolerance))
-    if candidate_sse is not None and baseline_sse is None:
+    candidate_has_error = _row_has_error(candidate_row)
+    baseline_has_error = _row_has_error(baseline_row)
+    if baseline_has_error and not candidate_has_error:
         return True
-    if candidate_sse is None and baseline_sse is not None:
+    if candidate_has_error and not baseline_has_error:
         return False
 
     candidate_r2 = _finite_float_or_none(candidate_row.get("r2"))
@@ -1160,24 +1157,6 @@ def _shared_to_local_flat(
     return np.asarray(parts, dtype=float)
 
 
-FIT_MODE_PIECEWISE = "piecewise"
-FIT_MODE_CURVE_FIT = "curve_fit"
-
-
-def normalize_fit_mode(mode: Optional[str]) -> str:
-    text = str(mode or "").strip().lower()
-    if text in {"curve_fit", "curvefit", "curve", "fast", "standard"}:
-        return FIT_MODE_CURVE_FIT
-    return FIT_MODE_PIECEWISE
-
-
-def fit_mode_label(mode: Optional[str]) -> str:
-    normalized = normalize_fit_mode(mode)
-    if normalized == FIT_MODE_CURVE_FIT:
-        return "standard curve_fit"
-    return "piecewise"
-
-
 def run_piecewise_fit_pipeline(
     x_data: np.ndarray,
     y_data: np.ndarray,
@@ -1226,6 +1205,15 @@ def run_piecewise_fit_pipeline(
             ) from exc
         if not np.isfinite(numeric):
             raise ValueError(f"Fixed value for parameter '{key}' is not finite.")
+        if key in bounds_map:
+            low_raw, high_raw = bounds_map[key]
+            low = float(min(low_raw, high_raw))
+            high = float(max(low_raw, high_raw))
+            tolerance = 1e-12 * max(1.0, abs(low), abs(high))
+            if numeric < (low - tolerance) or numeric > (high + tolerance):
+                raise ValueError(
+                    f"Fixed value for parameter '{key}'={numeric:.6g} is outside [{low:.6g}, {high:.6g}]."
+                )
         fixed_by_key[key] = float(numeric)
         seed_by_key[key] = float(numeric)
 
@@ -1292,9 +1280,6 @@ def run_piecewise_fit_pipeline(
             local_seed_flat,
             prefer_jit=True,
         )
-        fixed_sse = _sum_squared_error(y_arr, fixed_pred["y_hat"])
-        if fixed_sse is None:
-            fixed_sse = float("inf")
         return {
             "params_by_key": {name: float(seed_by_key[name]) for name in global_names},
             "params_vector": np.asarray(
@@ -1304,17 +1289,7 @@ def run_piecewise_fit_pipeline(
             "boundary_ratios": np.asarray([], dtype=float),
             "boundaries": np.asarray(fixed_pred["boundaries"], dtype=float),
             "y_hat": np.asarray(fixed_pred["y_hat"], dtype=float),
-            "sse": float(fixed_sse),
             "r2": compute_r2(y_arr, fixed_pred["y_hat"]),
-            "diagnostics": {
-                "fit_mode": FIT_MODE_PIECEWISE,
-                "selected_stage": "fixed_only",
-                "shared_refine_fallback": False,
-                "fixed_params": dict(fixed_by_key),
-                "free_param_count": int(len(free_param_names)),
-                "seed_refit_sse": float(fixed_sse),
-                "final_sse": float(fixed_sse),
-            },
         }
 
     stage_a_nfev = int(np.clip(700 * max(1, local_seed_flat.size), 3000, 14000))
@@ -1368,14 +1343,6 @@ def run_piecewise_fit_pipeline(
         ]
     )
 
-    refined_diagnostics: Dict[str, Any] = {
-        "fit_mode": FIT_MODE_PIECEWISE,
-        "selected_stage": "seed_refit",
-        "shared_refine_fallback": False,
-        "fixed_params": dict(fixed_by_key),
-        "free_param_count": int(len(free_param_names)),
-    }
-
     shared_template = np.asarray(shared_seed, dtype=float)
     for idx, value in fixed_index_values:
         shared_template[idx] = float(value)
@@ -1424,10 +1391,6 @@ def run_piecewise_fit_pipeline(
         best_local_flat,
         prefer_jit=True,
     )
-    best_sse = _sum_squared_error(y_arr, best_pred["y_hat"])
-    if best_sse is None:
-        best_sse = float("inf")
-
     if x0.size > 0:
         try:
             diff_step = None
@@ -1461,27 +1424,13 @@ def run_piecewise_fit_pipeline(
                 refined_local,
                 prefer_jit=True,
             )
-            refined_sse = _sum_squared_error(y_arr, refined_pred["y_hat"])
-            if (
-                refined_sse is not None
-                and np.isfinite(refined_sse)
-                and refined_sse <= best_sse
-            ):
-                best_shared = refined_shared
-                best_boundary = refined_boundary
-                best_local_flat = refined_local
-                best_pred = refined_pred
-                best_sse = float(refined_sse)
-                refined_diagnostics["selected_stage"] = "shared_refine"
-            else:
-                refined_diagnostics["shared_refine_fallback"] = True
+            best_shared = refined_shared
+            best_boundary = refined_boundary
+            best_local_flat = refined_local
+            best_pred = refined_pred
+
         except FitCancelledError:
             raise
-        except Exception as exc:
-            refined_diagnostics["shared_refine_fallback"] = True
-            refined_diagnostics["shared_refine_error"] = str(exc)
-    else:
-        refined_diagnostics["shared_refine_skipped"] = True
 
     return {
         "params_by_key": {
@@ -1492,279 +1441,8 @@ def run_piecewise_fit_pipeline(
         "boundary_ratios": np.asarray(best_boundary, dtype=float),
         "boundaries": np.asarray(best_pred["boundaries"], dtype=float),
         "y_hat": np.asarray(best_pred["y_hat"], dtype=float),
-        "sse": float(best_sse),
         "r2": compute_r2(y_arr, best_pred["y_hat"]),
-        "diagnostics": {
-            **refined_diagnostics,
-            "seed_refit_sse": float(stage_a.sse),
-            "final_sse": float(best_sse),
-        },
     }
-
-
-def run_standard_curve_fit_pipeline(
-    x_data: np.ndarray,
-    y_data: np.ndarray,
-    model_def: PiecewiseModelDefinition,
-    seed_map: Mapping[str, float],
-    bounds_map: Mapping[str, Tuple[float, float]],
-    boundary_seed: Optional[np.ndarray] = None,
-    cancel_check: Optional[Callable[[], bool]] = None,
-    fixed_params: Optional[Mapping[str, float]] = None,
-) -> Dict[str, Any]:
-    x_arr = np.asarray(x_data, dtype=float).reshape(-1)
-    y_arr = np.asarray(y_data, dtype=float).reshape(-1)
-    if x_arr.size != y_arr.size:
-        raise ValueError("x and y must have equal length.")
-    if x_arr.size < 8:
-        raise ValueError("Not enough points to run piecewise fitting.")
-
-    global_names = list(model_def.global_param_names)
-    allowed_names = set(global_names)
-    global_index = {name: idx for idx, name in enumerate(global_names)}
-
-    seed_by_key: Dict[str, float] = {}
-    for name in global_names:
-        if name not in seed_map:
-            raise ValueError(f"Missing seed for parameter '{name}'.")
-        value = float(seed_map[name])
-        if not np.isfinite(value):
-            raise ValueError(f"Seed for parameter '{name}' is not finite.")
-        seed_by_key[name] = float(value)
-
-    fixed_by_key: Dict[str, float] = {}
-    for raw_key, raw_value in dict(fixed_params or {}).items():
-        key = str(raw_key).strip()
-        if not key:
-            continue
-        if key not in allowed_names:
-            raise ValueError(f"Unknown fixed parameter '{key}'.")
-        numeric = float(raw_value)
-        if not np.isfinite(numeric):
-            raise ValueError(f"Fixed value for parameter '{key}' is not finite.")
-        fixed_by_key[key] = float(numeric)
-        seed_by_key[key] = float(numeric)
-
-    def is_cancelled() -> bool:
-        if cancel_check is None:
-            return False
-        try:
-            return bool(cancel_check())
-        except Exception:
-            return False
-
-    if is_cancelled():
-        raise FitCancelledError("cancelled")
-
-    segments = _make_segment_specs(
-        model_def,
-        seed_by_key,
-        bounds_map,
-        fixed_param_values=fixed_by_key,
-    )
-    n_boundaries = max(0, len(segments) - 1)
-    if boundary_seed is None:
-        boundary_seed_arr = default_boundary_ratios(n_boundaries)
-    else:
-        boundary_seed_arr = np.clip(
-            np.asarray(boundary_seed, dtype=float).reshape(-1), 0.0, 1.0
-        )
-        if boundary_seed_arr.size != n_boundaries:
-            boundary_seed_arr = default_boundary_ratios(n_boundaries)
-
-    free_param_names = [name for name in global_names if name not in fixed_by_key]
-    free_param_indices = np.asarray(
-        [global_index[name] for name in free_param_names], dtype=int
-    )
-    n_free = int(free_param_indices.size)
-    free_lower = np.asarray(
-        [
-            min(float(bounds_map[name][0]), float(bounds_map[name][1]))
-            for name in free_param_names
-        ],
-        dtype=float,
-    )
-    free_upper = np.asarray(
-        [
-            max(float(bounds_map[name][0]), float(bounds_map[name][1]))
-            for name in free_param_names
-        ],
-        dtype=float,
-    )
-
-    shared_seed = np.asarray(
-        [float(seed_by_key[name]) for name in global_names], dtype=float
-    )
-    shared_template = np.asarray(shared_seed, dtype=float)
-    for name, value in fixed_by_key.items():
-        shared_template[global_index[name]] = float(value)
-
-    local_to_global_idx = []
-    for seg_names in model_def.segment_param_names:
-        for name in seg_names:
-            if name in fixed_by_key:
-                continue
-            local_to_global_idx.append(global_index[name])
-    local_to_global_idx = np.asarray(local_to_global_idx, dtype=int)
-    n_local_params = int(local_to_global_idx.size)
-
-    seed_free = (
-        np.asarray(shared_template[free_param_indices], dtype=float)
-        if n_free > 0
-        else np.asarray([], dtype=float)
-    )
-    x0 = np.concatenate(
-        [
-            np.clip(seed_free, free_lower, free_upper),
-            np.clip(boundary_seed_arr, 0.0, 1.0),
-        ]
-    )
-    lower = np.concatenate([free_lower, np.zeros(n_boundaries, dtype=float)])
-    upper = np.concatenate([free_upper, np.ones(n_boundaries, dtype=float)])
-
-    shared_work = np.asarray(shared_template, dtype=float).copy()
-    local_work = np.empty(n_local_params + n_boundaries, dtype=float)
-
-    def _compose_shared_vector(free_values: np.ndarray) -> np.ndarray:
-        np.copyto(shared_work, shared_template)
-        if n_free > 0:
-            shared_work[free_param_indices] = np.asarray(free_values, dtype=float)
-        return shared_work
-
-    def _compose_local_flat(
-        shared_values: np.ndarray, boundary_values: np.ndarray
-    ) -> np.ndarray:
-        if n_local_params > 0:
-            local_work[:n_local_params] = shared_values[local_to_global_idx]
-        if n_boundaries > 0:
-            local_work[n_local_params:] = np.asarray(boundary_values, dtype=float)
-        return local_work
-
-    def _predict_from_values(values: np.ndarray) -> Dict[str, np.ndarray]:
-        shared_vals = _compose_shared_vector(values[:n_free])
-        local_flat = _compose_local_flat(shared_vals, values[n_free:])
-        pred = predict_ordered_piecewise(
-            x_arr,
-            segments,
-            local_flat,
-            prefer_jit=True,
-        )
-        return {
-            "shared": np.asarray(shared_vals, dtype=float).copy(),
-            "local": np.asarray(local_flat, dtype=float).copy(),
-            "boundary": np.asarray(values[n_free:], dtype=float).copy(),
-            "pred": pred,
-        }
-
-    seed_eval = _predict_from_values(x0)
-    best_shared = seed_eval["shared"]
-    best_local = seed_eval["local"]
-    best_boundary = seed_eval["boundary"]
-    best_pred = seed_eval["pred"]
-    best_sse = _sum_squared_error(y_arr, best_pred["y_hat"])
-    if best_sse is None:
-        best_sse = float("inf")
-
-    diagnostics: Dict[str, Any] = {
-        "fit_mode": FIT_MODE_CURVE_FIT,
-        "selected_stage": "curve_fit_seed",
-        "curve_fit_fallback": False,
-        "fixed_params": dict(fixed_by_key),
-        "free_param_count": int(len(free_param_names)),
-        "seed_refit_sse": float(best_sse),
-    }
-
-    if is_cancelled():
-        raise FitCancelledError("cancelled")
-
-    if x0.size > 0:
-        try:
-            maxfev = int(np.clip(350 * max(1, x0.size), 2000, 9000))
-
-            def model_for_curve_fit(_x, *vals):
-                if is_cancelled():
-                    raise FitCancelledError("cancelled")
-                values = np.asarray(vals, dtype=float)
-                pred = _predict_from_values(values)["pred"]
-                return np.asarray(pred["y_hat"], dtype=float)
-
-            popt, _ = curve_fit(
-                model_for_curve_fit,
-                x_arr,
-                y_arr,
-                p0=x0,
-                bounds=(lower, upper),
-                method="trf",
-                maxfev=maxfev,
-            )
-            fit_eval = _predict_from_values(np.asarray(popt, dtype=float))
-            fit_sse = _sum_squared_error(y_arr, fit_eval["pred"]["y_hat"])
-            if fit_sse is not None and np.isfinite(fit_sse) and fit_sse <= best_sse:
-                best_shared = fit_eval["shared"]
-                best_local = fit_eval["local"]
-                best_boundary = fit_eval["boundary"]
-                best_pred = fit_eval["pred"]
-                best_sse = float(fit_sse)
-                diagnostics["selected_stage"] = "curve_fit"
-            else:
-                diagnostics["curve_fit_fallback"] = True
-        except FitCancelledError:
-            raise
-        except Exception as exc:
-            diagnostics["curve_fit_fallback"] = True
-            diagnostics["curve_fit_error"] = str(exc)
-
-    return {
-        "params_by_key": {
-            name: float(best_shared[idx]) for idx, name in enumerate(global_names)
-        },
-        "params_vector": np.asarray(best_shared, dtype=float),
-        "local_flat": np.asarray(best_local, dtype=float),
-        "boundary_ratios": np.asarray(best_boundary, dtype=float),
-        "boundaries": np.asarray(best_pred["boundaries"], dtype=float),
-        "y_hat": np.asarray(best_pred["y_hat"], dtype=float),
-        "sse": float(best_sse),
-        "r2": compute_r2(y_arr, best_pred["y_hat"]),
-        "diagnostics": {
-            **diagnostics,
-            "final_sse": float(best_sse),
-        },
-    }
-
-
-def run_fit_pipeline(
-    x_data: np.ndarray,
-    y_data: np.ndarray,
-    model_def: PiecewiseModelDefinition,
-    seed_map: Mapping[str, float],
-    bounds_map: Mapping[str, Tuple[float, float]],
-    boundary_seed: Optional[np.ndarray] = None,
-    cancel_check: Optional[Callable[[], bool]] = None,
-    fixed_params: Optional[Mapping[str, float]] = None,
-    fit_mode: Optional[str] = None,
-) -> Dict[str, Any]:
-    mode = normalize_fit_mode(fit_mode)
-    if mode == FIT_MODE_CURVE_FIT:
-        return run_standard_curve_fit_pipeline(
-            x_data,
-            y_data,
-            model_def,
-            seed_map,
-            bounds_map,
-            boundary_seed=boundary_seed,
-            cancel_check=cancel_check,
-            fixed_params=fixed_params,
-        )
-    return run_piecewise_fit_pipeline(
-        x_data,
-        y_data,
-        model_def,
-        seed_map,
-        bounds_map,
-        boundary_seed=boundary_seed,
-        cancel_check=cancel_check,
-        fixed_params=fixed_params,
-    )
 
 
 _PARAMETER_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -2524,6 +2202,7 @@ def extract_captures(
 
 
 _BATCH_PATTERN_MISMATCH_ERROR = "Pattern mismatch: filename does not match pattern."
+_FIT_PARAM_RANGE_ERROR_PREFIX = "Out-of-range fit parameter(s):"
 
 
 def resolve_fixed_params_from_captures(
@@ -2575,9 +2254,6 @@ def make_batch_result_row(
     plot_render_size=None,
     boundary_ratios=None,
     boundary_values=None,
-    fit_stage=None,
-    fit_sse=None,
-    fit_diagnostics=None,
     pattern_error=None,
 ):
     return {
@@ -2595,9 +2271,6 @@ def make_batch_result_row(
         "plot_render_size": plot_render_size,
         "boundary_ratios": boundary_ratios,
         "boundary_values": boundary_values,
-        "fit_stage": fit_stage,
-        "fit_sse": fit_sse,
-        "fit_diagnostics": dict(fit_diagnostics or {}),
         "pattern_error": pattern_error,
     }
 
@@ -2742,7 +2415,7 @@ class FitWorker(QObject):
                 self.cancelled.emit()
                 return
 
-            result = run_fit_pipeline(
+            result = run_piecewise_fit_pipeline(
                 self.x_data,
                 self.y_data,
                 self.fit_context["model_def"],
@@ -2751,7 +2424,6 @@ class FitWorker(QObject):
                 boundary_seed=self.fit_context.get("boundary_seed"),
                 cancel_check=lambda: self.cancel_requested,
                 fixed_params=self.fit_context.get("fixed_params"),
-                fit_mode=self.fit_context.get("fit_mode"),
             )
             if self.cancel_requested:
                 self.cancelled.emit()
@@ -2785,9 +2457,10 @@ class BatchFitWorker(QObject):
         seed_map,
         bounds_map,
         boundary_seed,
-        fit_mode,
         x_channel,
         y_channel,
+        use_existing_fit_seed=True,
+        random_restarts=0,
         smoothing_enabled=False,
         smoothing_window=1,
     ):
@@ -2816,9 +2489,11 @@ class BatchFitWorker(QObject):
             for key, v in dict(bounds_map or {}).items()
         }
         self.boundary_seed = np.asarray(boundary_seed, dtype=float)
-        self.fit_mode = normalize_fit_mode(fit_mode)
         self.x_channel = str(x_channel)
         self.y_channel = str(y_channel)
+        self.use_existing_fit_seed = bool(use_existing_fit_seed)
+        self.random_restarts = max(0, int(random_restarts))
+        self._rng = np.random.default_rng()
         self.smoothing_enabled = bool(smoothing_enabled)
         self.smoothing_window = int(smoothing_window)
         self.cancel_requested = False
@@ -2846,9 +2521,6 @@ class BatchFitWorker(QObject):
                 pass
         preserved["params"] = existing_params
         preserved["r2"] = existing_row.get("r2")
-        preserved["fit_sse"] = existing_row.get("fit_sse")
-        preserved["fit_stage"] = existing_row.get("fit_stage")
-        preserved["fit_diagnostics"] = dict(existing_row.get("fit_diagnostics") or {})
         preserved["error"] = (
             None if has_nonempty_values(existing_params) else existing_row.get("error")
         )
@@ -2912,6 +2584,43 @@ class BatchFitWorker(QObject):
             return candidate
         return np.clip(existing_arr, 0.0, 1.0)
 
+    def _randomized_seed_map(self, seed_map: Mapping[str, float]) -> Dict[str, float]:
+        randomized = {str(key): float(val) for key, val in dict(seed_map or {}).items()}
+        for key, bounds in self.bounds_map.items():
+            try:
+                low_raw, high_raw = bounds
+                low = float(min(low_raw, high_raw))
+                high = float(max(low_raw, high_raw))
+            except Exception:
+                continue
+            if not np.isfinite(low) or not np.isfinite(high):
+                continue
+            if np.isclose(low, high):
+                randomized[str(key)] = float(low)
+                continue
+            randomized[str(key)] = float(self._rng.uniform(low, high))
+        return randomized
+
+    def _randomized_boundary_seed(self, boundary_seed: np.ndarray) -> np.ndarray:
+        base = np.asarray(boundary_seed, dtype=float).reshape(-1)
+        if base.size <= 0:
+            return base
+        return np.asarray(self._rng.uniform(0.0, 1.0, size=base.size), dtype=float)
+
+    def _seed_signature(
+        self, seed_map: Mapping[str, float], boundary_seed: np.ndarray
+    ) -> Tuple[float, ...]:
+        values: List[float] = []
+        for key in self.ordered_param_keys:
+            try:
+                values.append(float(seed_map.get(key, 0.0)))
+            except Exception:
+                values.append(0.0)
+        boundary = np.asarray(boundary_seed, dtype=float).reshape(-1)
+        if boundary.size > 0:
+            values.extend(boundary.tolist())
+        return tuple(round(float(v), 12) for v in values)
+
     def _fit_single_file(self, source_index, file_path):
         if self.cancel_requested:
             return None
@@ -2946,62 +2655,118 @@ class BatchFitWorker(QObject):
                 x_data = smooth_channel_array(x_data, self.smoothing_window)
                 y_data = smooth_channel_array(y_data, self.smoothing_window)
 
-            seed_map = self._seed_map_with_existing_fit(self.seed_map, existing_row)
             fixed_params, mapping_error = self._mapping_fixed_params(captures)
             if mapping_error:
                 if existing_has_fit:
                     return self._copy_fit_fields_from_existing(row, existing_row)
                 row["error"] = mapping_error
                 return row
-            if fixed_params:
-                for key, value in fixed_params.items():
-                    if key in seed_map:
-                        seed_map[key] = float(value)
 
             if self.cancel_requested:
                 return None
 
-            result = run_fit_pipeline(
-                x_data,
-                y_data,
-                self.model_def,
-                seed_map,
-                self.bounds_map,
-                boundary_seed=self._boundary_seed_for_file(existing_row),
-                cancel_check=lambda: self.cancel_requested,
-                fixed_params=fixed_params,
-                fit_mode=self.fit_mode,
-            )
-            if self.cancel_requested:
-                return None
+            if self.use_existing_fit_seed:
+                primary_seed_map = self._seed_map_with_existing_fit(
+                    self.seed_map, existing_row
+                )
+                primary_boundary_seed = self._boundary_seed_for_file(existing_row)
+            else:
+                primary_seed_map = dict(self.seed_map)
+                primary_boundary_seed = np.asarray(
+                    self.boundary_seed, dtype=float
+                ).reshape(-1)
 
-            params_by_key = dict(result.get("params_by_key") or {})
-            row["params"] = [
-                float(params_by_key.get(key, seed_map.get(key, 0.0)))
-                for key in self.ordered_param_keys
+            attempt_inputs: List[Tuple[Dict[str, float], np.ndarray]] = [
+                (
+                    dict(primary_seed_map),
+                    np.asarray(primary_boundary_seed, dtype=float).reshape(-1),
+                )
             ]
-            row["r2"] = float(result["r2"]) if result.get("r2") is not None else None
-            row["fit_sse"] = (
-                float(result["sse"]) if result.get("sse") is not None else None
-            )
-            diagnostics = dict(result.get("diagnostics") or {})
-            diagnostics["fixed_params"] = dict(fixed_params or {})
-            boundary_values = result.get("boundary_ratios")
-            if boundary_values is None:
-                boundary_values = []
-            row["boundary_ratios"] = np.asarray(boundary_values, dtype=float)
-            n_boundaries = max(0, len(self.model_def.segment_exprs) - 1)
-            row["boundary_values"] = boundary_ratios_to_x_values(
-                row["boundary_ratios"],
-                x_data,
-                n_boundaries,
-            )
-            row["fit_stage"] = diagnostics.get("selected_stage")
-            row["fit_diagnostics"] = diagnostics
-            row["error"] = None
-            if existing_has_fit and not is_fit_row_improved(row, existing_row):
+            if self.use_existing_fit_seed and existing_has_fit:
+                attempt_inputs.append(
+                    (
+                        dict(self.seed_map),
+                        np.asarray(self.boundary_seed, dtype=float).reshape(-1),
+                    )
+                )
+                for _ in range(self.random_restarts):
+                    attempt_inputs.append(
+                        (
+                            self._randomized_seed_map(self.seed_map),
+                            self._randomized_boundary_seed(self.boundary_seed),
+                        )
+                    )
+
+            deduped_attempts: List[Tuple[Dict[str, float], np.ndarray]] = []
+            seen_signatures: Set[Tuple[float, ...]] = set()
+            for seed_candidate, boundary_candidate in attempt_inputs:
+                sig = self._seed_signature(seed_candidate, boundary_candidate)
+                if sig in seen_signatures:
+                    continue
+                seen_signatures.add(sig)
+                deduped_attempts.append((seed_candidate, boundary_candidate))
+
+            best_row = None
+            last_error = None
+            for seed_candidate, boundary_candidate in deduped_attempts:
+                if self.cancel_requested:
+                    return None
+                seed_map = dict(seed_candidate)
+                if fixed_params:
+                    for key, value in fixed_params.items():
+                        if key in seed_map:
+                            seed_map[key] = float(value)
+
+                try:
+                    result = run_piecewise_fit_pipeline(
+                        x_data,
+                        y_data,
+                        self.model_def,
+                        seed_map,
+                        self.bounds_map,
+                        boundary_seed=boundary_candidate,
+                        cancel_check=lambda: self.cancel_requested,
+                        fixed_params=fixed_params,
+                    )
+                except FitCancelledError:
+                    return None
+                except Exception as exc:
+                    last_error = str(exc)
+                    continue
+
+                candidate_row = dict(row)
+                params_by_key = dict(result.get("params_by_key") or {})
+                candidate_row["params"] = [
+                    float(params_by_key.get(key, seed_map.get(key, 0.0)))
+                    for key in self.ordered_param_keys
+                ]
+                candidate_row["r2"] = (
+                    float(result["r2"]) if result.get("r2") is not None else None
+                )
+                boundary_values = result.get("boundary_ratios")
+                if boundary_values is None:
+                    boundary_values = []
+                candidate_row["boundary_ratios"] = np.asarray(
+                    boundary_values, dtype=float
+                )
+                n_boundaries = max(0, len(self.model_def.segment_exprs) - 1)
+                candidate_row["boundary_values"] = boundary_ratios_to_x_values(
+                    candidate_row["boundary_ratios"],
+                    x_data,
+                    n_boundaries,
+                )
+                candidate_row["error"] = None
+                if best_row is None or is_fit_row_improved(candidate_row, best_row):
+                    best_row = candidate_row
+
+            if best_row is None:
+                if existing_has_fit:
+                    return self._copy_fit_fields_from_existing(row, existing_row)
+                row["error"] = str(last_error or "No fit result.")
+                return row
+            if existing_has_fit and not is_fit_row_improved(best_row, existing_row):
                 return self._copy_fit_fields_from_existing(row, existing_row)
-            return row
+            return best_row
         except FitCancelledError:
             return None
         except Exception as exc:
@@ -3220,10 +2985,7 @@ class ManualFitGUI(QMainWindow):
         self.last_popt = None
         self.last_pcov = None
         self.last_r2 = None
-        self.last_fit_diagnostics = None
         self.auto_fit_btn_default_text = "Auto Fit"
-        self.curve_fit_btn_default_text = "Fast Fit"
-        self._active_fit_mode = FIT_MODE_PIECEWISE
         self.current_boundary_ratios = default_boundary_ratios(
             max(0, len(self._piecewise_model.segment_exprs) - 1)
             if self._piecewise_model is not None
@@ -3239,6 +3001,7 @@ class ManualFitGUI(QMainWindow):
         self.fit_tasks = {}
         self._fit_task_counter = 0
         self._fit_max_concurrent = max(1, int((os.cpu_count() or 2) - 1))
+        self._batch_refit_random_restarts = 2
         self._pending_fit_task_ids = deque()
         self._batch_active_task_ids = set()
         self._batch_total_tasks = 0
@@ -3913,6 +3676,25 @@ class ManualFitGUI(QMainWindow):
             return files[idx]
         return None
 
+    def _fit_task_file_key(self, file_path):
+        text = str(file_path or "").strip()
+        if not text:
+            return ""
+        if "::" in text:
+            archive_text, member = text.split("::", 1)
+            archive = Path(archive_text).expanduser()
+            try:
+                archive_key = str(archive.resolve(strict=False))
+            except Exception:
+                archive_key = str(archive)
+            member_key = str(member).strip().replace("\\", "/")
+            return f"{archive_key}::{member_key}"
+        path_obj = Path(text).expanduser()
+        try:
+            return str(path_obj.resolve(strict=False))
+        except Exception:
+            return str(path_obj)
+
     def _next_fit_task_id(self):
         self._fit_task_counter = int(getattr(self, "_fit_task_counter", 0)) + 1
         return int(self._fit_task_counter)
@@ -3945,13 +3727,16 @@ class ManualFitGUI(QMainWindow):
                 thread.start()
 
     def _active_fit_tasks_for_file(self, file_path):
-        target = str(file_path or "").strip()
+        target = self._fit_task_file_key(file_path)
         if not target:
             return []
         return [
             meta
             for meta in self.fit_tasks.values()
-            if str(meta.get("file_path") or "").strip() == target
+            if str(
+                meta.get("file_key") or self._fit_task_file_key(meta.get("file_path"))
+            )
+            == target
         ]
 
     def _is_file_fit_active(self, file_path):
@@ -3964,25 +3749,13 @@ class ManualFitGUI(QMainWindow):
             meta for meta in active_tasks if str(meta.get("kind")) == "manual"
         ]
 
-        piecewise_running = any(
-            normalize_fit_mode(meta.get("fit_mode")) == FIT_MODE_PIECEWISE
-            for meta in manual_tasks
-        )
-        curve_running = any(
-            normalize_fit_mode(meta.get("fit_mode")) == FIT_MODE_CURVE_FIT
-            for meta in manual_tasks
-        )
+        piecewise_running = bool(manual_tasks)
         any_running = bool(active_tasks)
 
         if hasattr(self, "auto_fit_btn"):
             self.auto_fit_btn.setEnabled((not any_running) or piecewise_running)
             self.auto_fit_btn.setText(
                 "Cancel" if piecewise_running else self.auto_fit_btn_default_text
-            )
-        if hasattr(self, "curve_fit_btn"):
-            self.curve_fit_btn.setEnabled((not any_running) or curve_running)
-            self.curve_fit_btn.setText(
-                "Cancel" if curve_running else self.curve_fit_btn_default_text
             )
         if hasattr(self, "reset_from_batch_btn"):
             self.reset_from_batch_btn.setEnabled(not any_running)
@@ -4116,8 +3889,8 @@ class ManualFitGUI(QMainWindow):
         spec,
         value,
         *,
-        minimum=-1e12,
-        maximum=1e12,
+        minimum=None,
+        maximum=None,
         width=72,
         object_name=None,
         tooltip=None,
@@ -4125,8 +3898,14 @@ class ManualFitGUI(QMainWindow):
         spinbox = CompactDoubleSpinBox()
         if object_name:
             spinbox.setObjectName(str(object_name))
+        if minimum is None:
+            minimum = float(spec.min_value)
+        if maximum is None:
+            maximum = float(spec.max_value)
+        low = float(min(minimum, maximum))
+        high = float(max(minimum, maximum))
         spinbox.setDecimals(int(spec.decimals))
-        spinbox.setRange(float(minimum), float(maximum))
+        spinbox.setRange(low, high)
         spinbox.setSingleStep(float(spec.inferred_step))
         spinbox.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
         spinbox.setKeyboardTracking(False)
@@ -4135,7 +3914,7 @@ class ManualFitGUI(QMainWindow):
         spinbox.setProperty("defocus_on_outside_click", True)
         if tooltip:
             spinbox.setToolTip(str(tooltip))
-        spinbox.setValue(float(value))
+        spinbox.setValue(float(np.clip(float(value), low, high)))
         return spinbox
 
     def _effective_smoothing_window(self):
@@ -4170,10 +3949,6 @@ class ManualFitGUI(QMainWindow):
             toggle = getattr(self, "smoothing_enable_cb", None)
         enabled = bool(toggle and toggle.isChecked())
         spin.setEnabled(enabled)
-
-    def _on_show_channels_toggled(self):
-        self.update_plot(fast=False)
-        self._autosave_fit_details()
 
     def _on_smoothing_controls_changed(self):
         toggle = getattr(self, "smoothing_toggle_btn", None)
@@ -4702,13 +4477,11 @@ class ManualFitGUI(QMainWindow):
 
             if is_locked and str(key) in mapped_values and value_box is not None:
                 locked_value = float(mapped_values[str(key)])
-                if min_box is not None and locked_value < float(min_box.value()):
-                    min_box.setValue(locked_value)
-                if max_box is not None and locked_value > float(max_box.value()):
-                    max_box.setValue(locked_value)
+                low = float(value_box.minimum())
+                high = float(value_box.maximum())
                 if not np.isclose(float(value_box.value()), locked_value):
                     value_box.blockSignals(True)
-                    value_box.setValue(locked_value)
+                    value_box.setValue(float(np.clip(locked_value, low, high)))
                     value_box.blockSignals(False)
                     any_value_changed = True
             if is_locked:
@@ -5018,6 +4791,20 @@ class ManualFitGUI(QMainWindow):
 
         low = float(min_box.value())
         high = float(max_box.value())
+        spec = next((item for item in self.param_specs if item.key == key), None)
+        if spec is not None:
+            spec_low = float(min(spec.min_value, spec.max_value))
+            spec_high = float(max(spec.min_value, spec.max_value))
+            if low < spec_low:
+                min_box.blockSignals(True)
+                min_box.setValue(spec_low)
+                min_box.blockSignals(False)
+                low = spec_low
+            if high > spec_high:
+                max_box.blockSignals(True)
+                max_box.setValue(spec_high)
+                max_box.blockSignals(False)
+                high = spec_high
         if low > high:
             if source == "min":
                 max_box.blockSignals(True)
@@ -5042,7 +4829,6 @@ class ManualFitGUI(QMainWindow):
         self,
         seed_overrides=None,
         fixed_params=None,
-        fit_mode: Optional[str] = None,
     ):
         model_def = self._piecewise_model
         if model_def is None:
@@ -5132,7 +4918,6 @@ class ManualFitGUI(QMainWindow):
             "model_def": model_def,
             "boundary_seed": boundary_seed,
             "fixed_params": fixed_map,
-            "fit_mode": normalize_fit_mode(fit_mode),
         }
 
     def evaluate_model_map(
@@ -5811,13 +5596,6 @@ class ManualFitGUI(QMainWindow):
             checked=False,
             toggled_handler=lambda: self.update_plot(fast=False),
         )
-        self.show_channels_cb = self._new_button(
-            "Channels",
-            checkable=True,
-            checked=True,
-            toggled_handler=self._on_show_channels_toggled,
-            tooltip="Show or hide all measured channel traces on the main plot.",
-        )
 
         self.smoothing_toggle_btn = self._new_button(
             "Smooth",
@@ -5836,11 +5614,6 @@ class ManualFitGUI(QMainWindow):
             primary=True,
         )
         fit_actions_row.addWidget(self.auto_fit_btn)
-        self.curve_fit_btn = self._new_button(
-            self.curve_fit_btn_default_text,
-            handler=self.auto_fit_curve,
-        )
-        fit_actions_row.addWidget(self.curve_fit_btn)
 
         self.reset_from_batch_btn = self._new_button(
             "Reset",
@@ -5854,7 +5627,6 @@ class ManualFitGUI(QMainWindow):
         fit_view_row = QHBoxLayout()
         fit_view_row.setSpacing(4)
         fit_view_row.addWidget(self.show_residuals_cb)
-        fit_view_row.addWidget(self.show_channels_cb)
         fit_view_row.addWidget(self.smoothing_toggle_btn)
         fit_view_row.addWidget(
             self._new_label(
@@ -6271,9 +6043,6 @@ class ManualFitGUI(QMainWindow):
                     row["error"] = None
                     row["boundary_ratios"] = None
                     row["boundary_values"] = None
-                    row["fit_stage"] = None
-                    row["fit_sse"] = None
-                    row["fit_diagnostics"] = {}
                     row["plot_full"] = None
                     row["plot"] = None
                 self.update_batch_table()
@@ -7051,6 +6820,102 @@ class ManualFitGUI(QMainWindow):
             parts.append(fit_error)
         return " | ".join(parts)
 
+    def _fit_param_range_violations(self, params):
+        values = self._as_float_array(params)
+        if values.size <= 0:
+            return []
+        violations = []
+        for idx, spec in enumerate(self.param_specs):
+            if idx >= values.size:
+                break
+            value = float(values[idx])
+            if not np.isfinite(value):
+                continue
+            low = float(min(spec.min_value, spec.max_value))
+            high = float(max(spec.min_value, spec.max_value))
+            tolerance = 1e-12 * max(1.0, abs(low), abs(high))
+            if value < (low - tolerance) or value > (high + tolerance):
+                violations.append(
+                    {
+                        "index": int(idx),
+                        "key": str(spec.key),
+                        "value": float(value),
+                        "low": float(low),
+                        "high": float(high),
+                    }
+                )
+        return violations
+
+    def _fit_param_range_error_text(self, violations):
+        rows = list(violations or [])
+        if not rows:
+            return None
+        samples = []
+        for item in rows[:3]:
+            key = str(item.get("key") or "")
+            label = self._display_name_for_param_key(key) if key else key
+            value = float(item.get("value"))
+            low = float(item.get("low"))
+            high = float(item.get("high"))
+            samples.append(f"{label}={value:.6g} not in [{low:.6g}, {high:.6g}]")
+        remainder = len(rows) - len(samples)
+        suffix = f" (+{remainder} more)" if remainder > 0 else ""
+        return f"{_FIT_PARAM_RANGE_ERROR_PREFIX} {'; '.join(samples)}{suffix}"
+
+    def _apply_param_range_validation_to_row(self, row):
+        normalized = dict(row or {})
+        violations = self._fit_param_range_violations(normalized.get("params"))
+        violation_keys = [
+            str(item.get("key")) for item in violations if item.get("key")
+        ]
+        normalized["_param_range_violation_keys"] = violation_keys
+
+        range_error = self._fit_param_range_error_text(violations)
+        existing_parts = [
+            part.strip()
+            for part in str(normalized.get("error") or "").split("|")
+            if str(part).strip()
+        ]
+        existing_parts = [
+            part
+            for part in existing_parts
+            if not str(part).startswith(_FIT_PARAM_RANGE_ERROR_PREFIX)
+        ]
+        if range_error:
+            existing_parts.append(range_error)
+        normalized["error"] = (
+            " | ".join(dict.fromkeys(existing_parts)) if existing_parts else None
+        )
+        return normalized
+
+    def _current_file_param_violation_keys(self):
+        file_path = self._current_loaded_file_path()
+        if not file_path:
+            return set()
+        row_index = self._find_batch_result_index_by_file(file_path)
+        if row_index is None or row_index < 0 or row_index >= len(self.batch_results):
+            return set()
+        row = self.batch_results[row_index]
+        violations = self._fit_param_range_violations(row.get("params"))
+        return {str(item.get("key")) for item in violations if item.get("key")}
+
+    def _refresh_param_value_error_highlighting(self):
+        invalid_by_row = self._current_file_param_violation_keys()
+        for spec in self.param_specs:
+            key = str(spec.key)
+            box = self.param_spinboxes.get(key)
+            if box is None:
+                continue
+            numeric = _finite_float_or_none(box.value())
+            low = float(min(spec.min_value, spec.max_value))
+            high = float(max(spec.min_value, spec.max_value))
+            tolerance = 1e-12 * max(1.0, abs(low), abs(high))
+            out_of_spec = numeric is not None and (
+                numeric < (low - tolerance) or numeric > (high + tolerance)
+            )
+            invalid = bool(out_of_spec or key in invalid_by_row)
+            box.setStyleSheet("color: #b91c1c;" if invalid else "")
+
     def _extract_analysis_records_from_batch(self):
         records = []
         param_columns = self._batch_parameter_column_items()
@@ -7076,7 +6941,6 @@ class ManualFitGUI(QMainWindow):
                     )
                 record[str(item["key"])] = value
             record["R2"] = row.get("r2")
-            record["SSE"] = row.get("fit_sse")
             record["Error"] = self._batch_row_error_text(row)
             records.append(record)
         return records
@@ -7681,8 +7545,6 @@ class ManualFitGUI(QMainWindow):
                     "boundary_values": self._float_list_or_none(
                         row.get("boundary_values")
                     ),
-                    "fit_sse": self._json_float_or_none(row.get("fit_sse")),
-                    "fit_diagnostics": dict(row.get("fit_diagnostics") or {}),
                     "pattern_error": (
                         str(row.get("pattern_error"))
                         if row.get("pattern_error") not in (None, "")
@@ -7700,7 +7562,7 @@ class ManualFitGUI(QMainWindow):
             + self.batch_capture_keys
             + ["R2"]
             + [str(item["key"]) for item in param_columns]
-            + ["SSE", "Error"]
+            + ["Error"]
         )
         rows = []
         for row in list(getattr(self, "batch_results", []) or []):
@@ -7709,7 +7571,6 @@ class ManualFitGUI(QMainWindow):
             params = self._as_float_array(row.get("params"))
             boundary_values = self._as_float_array(row.get("boundary_values"))
             r2_val = row.get("r2")
-            sse_val = row.get("fit_sse")
             error_text = self._batch_row_error_text(row)
             param_values = []
             for item in param_columns:
@@ -7731,7 +7592,6 @@ class ManualFitGUI(QMainWindow):
                 + [captures.get(key, "") for key in self.batch_capture_keys]
                 + [f"{r2_val:.6f}" if r2_val is not None else ""]
                 + param_values
-                + [f"{float(sse_val):.6g}" if sse_val is not None else ""]
                 + [error_text]
             )
         return columns, rows
@@ -7743,12 +7603,11 @@ class ManualFitGUI(QMainWindow):
         rows = list(table_payload.get("rows") or [])
         if not columns or not rows:
             return []
-        if "File" not in columns or "R2" not in columns or "SSE" not in columns:
+        if "File" not in columns or "R2" not in columns or "Error" not in columns:
             return []
         try:
             file_idx = columns.index("File")
             r2_idx = columns.index("R2")
-            sse_idx = columns.index("SSE")
             error_idx = columns.index("Error")
         except Exception:
             return []
@@ -7758,7 +7617,7 @@ class ManualFitGUI(QMainWindow):
             str(item["key"]): dict(item)
             for item in self._batch_parameter_column_items()
         }
-        param_cols = columns[r2_idx + 1 : sse_idx]
+        param_cols = columns[r2_idx + 1 : error_idx]
         current_params = list(self.get_current_params())
         imported = []
         for row_values in rows:
@@ -7814,7 +7673,6 @@ class ManualFitGUI(QMainWindow):
                     "captures": captures,
                     "params": param_values,
                     "r2": self._json_float_or_none(values[r2_idx]),
-                    "fit_sse": self._json_float_or_none(values[sse_idx]),
                     "error": error_text if error_text else None,
                     "boundary_values": (
                         boundary_values
@@ -7836,10 +7694,6 @@ class ManualFitGUI(QMainWindow):
                 "equation": str(getattr(self, "current_expression", "")).strip(),
                 "x_channel": str(getattr(self, "x_channel", "")).strip(),
                 "y_channel": str(getattr(self, "y_channel", "")).strip(),
-                "show_channels": bool(
-                    getattr(self, "show_channels_cb", None)
-                    and self.show_channels_cb.isChecked()
-                ),
                 "smoothing_enabled": bool(getattr(self, "smoothing_enabled", False)),
                 "smoothing_window": int(getattr(self, "smoothing_window", 1) or 1),
                 "capture_pattern": (
@@ -7987,10 +7841,7 @@ class ManualFitGUI(QMainWindow):
                 if raw_row.get("pattern_error") not in (None, "")
                 else row.get("pattern_error")
             )
-            row["fit_sse"] = self._json_float_or_none(raw_row.get("fit_sse"))
             row["r2"] = self._json_float_or_none(raw_row.get("r2"))
-            row["fit_diagnostics"] = dict(raw_row.get("fit_diagnostics") or {})
-            row["fit_stage"] = row["fit_diagnostics"].get("selected_stage")
 
             params = self._as_float_array(raw_row.get("params"))
             if params.size > 0:
@@ -8017,6 +7868,7 @@ class ManualFitGUI(QMainWindow):
             row["plot"] = None
             row["plot_render_size"] = None
             row["plot_has_fit"] = has_nonempty_values(row.get("params"))
+            row = self._apply_param_range_validation_to_row(row)
             existing_by_file[file_ref] = row
             applied += 1
 
@@ -8162,12 +8014,6 @@ class ManualFitGUI(QMainWindow):
                 if idx >= 0:
                     self.y_channel_combo.setCurrentIndex(idx)
 
-            if hasattr(self, "show_channels_cb"):
-                show_channels = bool(gui.get("show_channels", True))
-                self.show_channels_cb.blockSignals(True)
-                self.show_channels_cb.setChecked(show_channels)
-                self.show_channels_cb.blockSignals(False)
-
             if hasattr(self, "smoothing_toggle_btn"):
                 self.smoothing_toggle_btn.setChecked(
                     bool(gui.get("smoothing_enabled", self.smoothing_enabled))
@@ -8271,11 +8117,9 @@ class ManualFitGUI(QMainWindow):
         file_path,
         ordered_keys,
         fit_result,
-        fit_diagnostics,
     ):
         if not file_path:
             return None
-        diagnostics = dict(fit_diagnostics or {})
         params_by_key = dict((fit_result or {}).get("params_by_key") or {})
         row_params = [float(params_by_key.get(key, 0.0)) for key in ordered_keys]
         row_r2 = (
@@ -8283,12 +8127,6 @@ class ManualFitGUI(QMainWindow):
             if fit_result is not None and fit_result.get("r2") is not None
             else None
         )
-        row_sse = (
-            float(fit_result["sse"])
-            if fit_result is not None and fit_result.get("sse") is not None
-            else None
-        )
-        row_stage = diagnostics.get("selected_stage")
         boundary_vals = (
             fit_result.get("boundary_ratios") if isinstance(fit_result, dict) else None
         )
@@ -8344,18 +8182,15 @@ class ManualFitGUI(QMainWindow):
 
         row["params"] = list(row_params)
         row["r2"] = row_r2
-        row["fit_stage"] = row_stage
-        row["fit_sse"] = row_sse
-        row["fit_diagnostics"] = diagnostics
         row["boundary_ratios"] = boundary_vals
         row["boundary_values"] = boundary_x_vals
-        row["error"] = None
         row["x_channel"] = self.x_channel
         row["y_channel"] = self.y_channel
         row["plot_full"] = None
         row["plot"] = None
         row["plot_render_size"] = None
         row["plot_has_fit"] = True
+        row = self._apply_param_range_validation_to_row(row)
         self.batch_results[row_idx] = row
         self._rebuild_batch_capture_keys_from_rows()
 
@@ -8447,7 +8282,7 @@ class ManualFitGUI(QMainWindow):
                 existing_plot_full = existing_row.get("thumbnail")
             existing_plot = existing_row.get("plot")
             existing_plot_render_size = existing_row.get("plot_render_size")
-        return make_batch_result_row(
+        row = make_batch_result_row(
             source_index=source_index,
             file_path=file_path,
             x_channel=self.x_channel,
@@ -8470,13 +8305,9 @@ class ManualFitGUI(QMainWindow):
             boundary_values=(
                 existing_row.get("boundary_values") if preserve_fit_result else None
             ),
-            fit_stage=existing_row.get("fit_stage") if preserve_fit_result else None,
-            fit_sse=existing_row.get("fit_sse") if preserve_fit_result else None,
-            fit_diagnostics=(
-                existing_row.get("fit_diagnostics") if preserve_fit_result else None
-            ),
             pattern_error=pattern_error,
         )
+        return self._apply_param_range_validation_to_row(row)
 
     def _source_dialog_start_dir(self):
         current_path = Path(self.current_dir).expanduser()
@@ -8799,12 +8630,6 @@ class ManualFitGUI(QMainWindow):
                 continue
             if not np.isfinite(value):
                 continue
-            min_box = self.param_min_spinboxes.get(spec.key)
-            max_box = self.param_max_spinboxes.get(spec.key)
-            if min_box is not None and value < float(min_box.value()):
-                min_box.setValue(value)
-            if max_box is not None and value > float(max_box.value()):
-                max_box.setValue(value)
             if not np.isclose(float(spinbox.value()), value):
                 changed = True
             spinbox.setValue(value)
@@ -8839,6 +8664,7 @@ class ManualFitGUI(QMainWindow):
                     boundary_changed = True
                 self.current_boundary_ratios = new_boundary
         self._sync_breakpoint_sliders_from_state()
+        self._refresh_param_value_error_highlighting()
         return bool(changed or boundary_changed)
 
     def reset_params(self):
@@ -8949,13 +8775,9 @@ class ManualFitGUI(QMainWindow):
 
     def auto_fit(self):
         """Start the default piecewise auto-fit in a worker thread."""
-        self._start_auto_fit(FIT_MODE_PIECEWISE)
+        self._start_auto_fit()
 
-    def auto_fit_curve(self):
-        """Start standard curve_fit auto-fit in a worker thread."""
-        self._start_auto_fit(FIT_MODE_CURVE_FIT)
-
-    def _start_auto_fit(self, fit_mode: Optional[str]):
+    def _start_auto_fit(self):
         """Start auto-fit in a worker thread to keep GUI responsive."""
         if self.current_data is None:
             self.stats_text.append("No data loaded!")
@@ -8966,14 +8788,11 @@ class ManualFitGUI(QMainWindow):
             self.stats_text.append("No current file loaded!")
             return
 
-        selected_mode = normalize_fit_mode(fit_mode)
         active_tasks = self._active_fit_tasks_for_file(current_file)
-        active_manual_modes = {
-            normalize_fit_mode(meta.get("fit_mode"))
-            for meta in active_tasks
-            if str(meta.get("kind")) == "manual"
-        }
-        if selected_mode in active_manual_modes:
+        active_manual_tasks = [
+            meta for meta in active_tasks if str(meta.get("kind")) == "manual"
+        ]
+        if active_manual_tasks:
             self.cancel_auto_fit()
             return
         if active_tasks:
@@ -8989,7 +8808,6 @@ class ManualFitGUI(QMainWindow):
             # Seed from current UI controls so refits follow the slider state.
             fit_context = self._build_fit_context(
                 fixed_params=fixed_params,
-                fit_mode=fit_mode,
             )
         except Exception as exc:
             self.stats_text.append(f"Fit setup error: {exc}")
@@ -9010,7 +8828,7 @@ class ManualFitGUI(QMainWindow):
             parameter_capture_map=self._current_param_capture_map(),
         )
         self.stats_text.append(
-            f"Auto-fit started for {stem_for_file_ref(current_file)} ({fit_mode_label(selected_mode)}, full trace)."
+            f"Auto-fit started for {stem_for_file_ref(current_file)} (full trace)."
         )
         self._refresh_fit_action_buttons()
 
@@ -9034,11 +8852,6 @@ class ManualFitGUI(QMainWindow):
             else None
         )
         self._last_r2 = self.last_r2
-        self.last_fit_diagnostics = (
-            dict((fit_result or {}).get("diagnostics") or {})
-            if isinstance(fit_result, dict)
-            else {}
-        )
         if (
             isinstance(fit_result, dict)
             and fit_result.get("boundary_ratios") is not None
@@ -9054,20 +8867,15 @@ class ManualFitGUI(QMainWindow):
                 self.param_spinboxes[key].setValue(self.last_popt[idx])
         self.defaults = list(self.last_popt)
 
-        mode_used = (
-            self.last_fit_diagnostics.get("fit_mode")
-            if isinstance(self.last_fit_diagnostics, dict)
-            else self._active_fit_mode
-        )
         r2_text = f"{self.last_r2:.6f}" if self.last_r2 is not None else "N/A"
-        self.stats_text.append(
-            f"✓ Auto-fit successful ({fit_mode_label(mode_used)})! R² (full trace) = {r2_text}"
-        )
-        if isinstance(fit_result, dict):
-            stage = self.last_fit_diagnostics.get("selected_stage") or "n/a"
-            sse = fit_result.get("sse")
-            sse_text = f"{float(sse):.6g}" if sse is not None else "n/a"
-            self.stats_text.append(f"Fit diagnostics: stage={stage}, SSE={sse_text}")
+        violations = self._fit_param_range_violations(best_params)
+        range_error = self._fit_param_range_error_text(violations)
+        if range_error:
+            self.stats_text.append(f"✗ Auto-fit failed: {range_error}")
+        else:
+            self.stats_text.append(
+                f"✓ Auto-fit successful! R² (full trace) = {r2_text}"
+            )
         summary = ", ".join(
             f"{self._display_name_for_param_key(key)}={self.last_popt[idx]:.4f}"
             for idx, key in enumerate(ordered_keys)
@@ -9081,7 +8889,6 @@ class ManualFitGUI(QMainWindow):
                 current_file,
                 ordered_keys,
                 fit_result,
-                self.last_fit_diagnostics,
             )
             is not None
         )
@@ -9107,11 +8914,15 @@ class ManualFitGUI(QMainWindow):
         current_file = self._current_loaded_file_path()
         if not current_file:
             return
+        current_key = self._fit_task_file_key(current_file)
         cancelled = False
         for task_id, task in list(self.fit_tasks.items()):
             if str(task.get("kind")) != "manual":
                 continue
-            if str(task.get("file_path")) != str(current_file):
+            task_key = str(
+                task.get("file_key") or self._fit_task_file_key(task.get("file_path"))
+            )
+            if task_key != current_key:
                 continue
             if str(task.get("status")) == "pending":
                 self._finish_fit_task(int(task_id))
@@ -9165,11 +8976,8 @@ class ManualFitGUI(QMainWindow):
         self.fit_worker = None
         self.auto_fit_btn.setEnabled(True)
         self.auto_fit_btn.setText(self.auto_fit_btn_default_text)
-        self.curve_fit_btn.setEnabled(True)
-        self.curve_fit_btn.setText(self.curve_fit_btn_default_text)
         if hasattr(self, "reset_from_batch_btn"):
             self.reset_from_batch_btn.setEnabled(True)
-        self._active_fit_mode = FIT_MODE_PIECEWISE
 
     def cleanup_batch_thread(self, *, force=False):
         self._shutdown_thread(
@@ -9279,37 +9087,32 @@ class ManualFitGUI(QMainWindow):
         x_display = x_data[display_idx]
         y_display = y_data[display_idx]
         channel_data_display = self._slice_channel_data(channel_data_full, display_idx)
-        show_channels = bool(
-            getattr(self, "show_channels_cb", None)
-            and self.show_channels_cb.isChecked()
-        )
 
         plot_channel_names = []
-        if show_channels:
-            for name in [self.y_channel]:
-                key = str(name).strip()
-                if not key or key in plot_channel_names:
+        for name in [self.y_channel]:
+            key = str(name).strip()
+            if not key or key in plot_channel_names:
+                continue
+            if key in channel_data_display:
+                plot_channel_names.append(key)
+
+        if self.current_data is not None:
+            for col in self.current_data.columns:
+                key = str(col).strip()
+                if not key or key == self.x_channel or key in plot_channel_names:
                     continue
                 if key in channel_data_display:
                     plot_channel_names.append(key)
-
-            if self.current_data is not None:
-                for col in self.current_data.columns:
-                    key = str(col).strip()
-                    if not key or key == self.x_channel or key in plot_channel_names:
-                        continue
-                    if key in channel_data_display:
-                        plot_channel_names.append(key)
-            else:
-                for key in channel_data_display.keys():
-                    key_text = str(key).strip()
-                    if (
-                        not key_text
-                        or key_text == self.x_channel
-                        or key_text in plot_channel_names
-                    ):
-                        continue
-                    plot_channel_names.append(key_text)
+        else:
+            for key in channel_data_display.keys():
+                key_text = str(key).strip()
+                if (
+                    not key_text
+                    or key_text == self.x_channel
+                    or key_text in plot_channel_names
+                ):
+                    continue
+                plot_channel_names.append(key_text)
 
         plot_channel_displays = {
             key: np.asarray(channel_data_display[key], dtype=float)
@@ -9387,6 +9190,7 @@ class ManualFitGUI(QMainWindow):
             preserve_view: If True, keep current zoom/pan limits when possible
         """
         if self.current_data is None:
+            self._refresh_param_value_error_highlighting()
             return
 
         # Debounce full updates during slider movement
@@ -9397,6 +9201,7 @@ class ManualFitGUI(QMainWindow):
             return
 
         try:
+            self._refresh_param_value_error_highlighting()
             params = self.get_current_params()
             context = self._prepare_plot_context(params)
             if context is None:
@@ -9574,6 +9379,7 @@ class ManualFitGUI(QMainWindow):
             print(f"Error updating stats: {type(e).__name__}: {e}", file=sys.stderr)
 
     def _apply_fit_row_update(self, row):
+        row = self._apply_param_range_validation_to_row(row)
         row_index = row.get("_source_index")
         if row_index is None:
             for idx, existing_row in enumerate(self.batch_results):
@@ -9678,6 +9484,27 @@ class ManualFitGUI(QMainWindow):
         existing_row = (
             self.batch_results[existing_idx] if existing_idx is not None else {}
         )
+        if str(kind) == "batch":
+            current_file = self._current_loaded_file_path()
+            if current_file and str(file_path) == str(current_file):
+                overridden = dict(existing_row or {})
+                ordered_keys = list(fit_context.get("ordered_keys") or ())
+                seed_map = dict(fit_context.get("seed_map") or {})
+                if ordered_keys and seed_map:
+                    try:
+                        overridden["params"] = [
+                            float(seed_map[key])
+                            for key in ordered_keys
+                            if key in seed_map
+                        ]
+                    except Exception:
+                        pass
+                boundary_seed = np.asarray(
+                    fit_context.get("boundary_seed", []), dtype=float
+                ).reshape(-1)
+                if boundary_seed.size > 0:
+                    overridden["boundary_ratios"] = np.clip(boundary_seed, 0.0, 1.0)
+                existing_row = overridden
         existing_rows_by_file = {file_path: existing_row} if existing_row else {}
 
         thread = QThread(self)
@@ -9693,9 +9520,14 @@ class ManualFitGUI(QMainWindow):
             fit_context["seed_map"],
             fit_context["bounds_map"],
             fit_context["boundary_seed"],
-            fit_context["fit_mode"],
             self.x_channel,
             self.y_channel,
+            use_existing_fit_seed=(str(kind) == "batch"),
+            random_restarts=(
+                int(getattr(self, "_batch_refit_random_restarts", 0))
+                if str(kind) == "batch"
+                else 0
+            ),
             smoothing_enabled=self.smoothing_enabled,
             smoothing_window=self._effective_smoothing_window(),
         )
@@ -9704,8 +9536,8 @@ class ManualFitGUI(QMainWindow):
             "id": int(task_id),
             "kind": str(kind),
             "file_path": str(file_path),
+            "file_key": self._fit_task_file_key(file_path),
             "source_index": int(source_index),
-            "fit_mode": normalize_fit_mode(fit_context.get("fit_mode")),
             "status": "pending",
             "thread": thread,
             "worker": worker,
@@ -9748,31 +9580,36 @@ class ManualFitGUI(QMainWindow):
         if isinstance(results, (list, tuple)) and results:
             row = results[0]
             if row is not None:
+                row = self._apply_param_range_validation_to_row(row)
                 self._apply_fit_row_update(row)
 
         if task.get("kind") == "manual":
             file_path = str(task.get("file_path"))
             file_name = stem_for_file_ref(file_path)
-            mode_text = fit_mode_label(task.get("fit_mode"))
             if row is None:
                 self.stats_text.append(f"Auto-fit finished with no result: {file_name}")
             elif has_nonempty_values(row.get("params")):
                 r2_val = _finite_float_or_none(row.get("r2"))
-                stage = str(row.get("fit_stage") or "n/a")
-                sse_val = _finite_float_or_none(row.get("fit_sse"))
                 r2_text = f"{float(r2_val):.6f}" if r2_val is not None else "N/A"
-                sse_text = f"{float(sse_val):.6g}" if sse_val is not None else "n/a"
-                self.stats_text.append(
-                    f"✓ Auto-fit successful ({mode_text}) [{file_name}] R²={r2_text}, stage={stage}, SSE={sse_text}"
-                )
-                if self._current_loaded_file_path() == file_path:
+                row_error = self._batch_row_error_text(row)
+                if row_error:
+                    self.stats_text.append(
+                        f"✗ Auto-fit failed [{file_name}]: {row_error}"
+                    )
+                else:
+                    self.stats_text.append(
+                        f"✓ Auto-fit successful [{file_name}] R²={r2_text}"
+                    )
+                current_file = self._current_loaded_file_path()
+                if self._fit_task_file_key(current_file) == self._fit_task_file_key(
+                    file_path
+                ):
                     params = self._as_float_array(row.get("params"))
                     self.last_popt = params
                     self._last_fit_active_keys = self._ordered_param_keys()
                     self.last_pcov = None
                     self.last_r2 = r2_val
                     self._last_r2 = r2_val
-                    self.last_fit_diagnostics = dict(row.get("fit_diagnostics") or {})
                     self._apply_batch_params_for_file(file_path)
                     self.update_plot(fast=False)
             else:
@@ -9862,48 +9699,6 @@ class ManualFitGUI(QMainWindow):
         else:
             self.stats_text.append("✓ Batch fit completed.")
 
-        diagnostic_rows = [
-            row
-            for row in self.batch_results
-            if row.get("fit_stage") is not None or row.get("fit_sse") is not None
-        ]
-        if diagnostic_rows:
-            stages = sorted(
-                {
-                    str(row.get("fit_stage"))
-                    for row in diagnostic_rows
-                    if row.get("fit_stage") not in (None, "")
-                }
-            )
-            sse_values = np.asarray(
-                [
-                    float(row.get("fit_sse"))
-                    for row in diagnostic_rows
-                    if row.get("fit_sse") is not None
-                ],
-                dtype=float,
-            )
-            r2_values = np.asarray(
-                [
-                    float(row.get("r2"))
-                    for row in diagnostic_rows
-                    if row.get("r2") is not None
-                ],
-                dtype=float,
-            )
-            stage_text = ", ".join(stages) if stages else "n/a"
-            sse_text = (
-                f"{float(np.nanmedian(sse_values)):.6g}"
-                if sse_values.size > 0
-                else "n/a"
-            )
-            r2_text = (
-                f"{float(np.nanmean(r2_values)):.6f}" if r2_values.size > 0 else "n/a"
-            )
-            self.stats_text.append(
-                f"Batch diagnostics: stages={stage_text}, median SSE={sse_text}, mean R²={r2_text}."
-            )
-
         self.batch_fit_in_progress = False
         self._batch_active_task_ids = set()
         self._batch_cancel_pending = False
@@ -9976,7 +9771,7 @@ class ManualFitGUI(QMainWindow):
         self._batch_active_task_ids = set()
         self._refresh_batch_controls()
         self.stats_text.append(
-            f"Batch fit started ({fit_mode_label(fit_context.get('fit_mode'))}, queued, max parallel={self._fit_max_concurrent})."
+            f"Batch fit started (queued, max parallel={self._fit_max_concurrent})."
         )
 
         parameter_capture_map = self._current_param_capture_map()
@@ -10068,47 +9863,6 @@ class ManualFitGUI(QMainWindow):
             self.update_plot(fast=False)
         self._refresh_batch_analysis_if_run()
         self.stats_text.append("✓ Batch fit completed.")
-        diagnostic_rows = [
-            row
-            for row in self.batch_results
-            if row.get("fit_stage") is not None or row.get("fit_sse") is not None
-        ]
-        if diagnostic_rows:
-            stages = sorted(
-                {
-                    str(row.get("fit_stage"))
-                    for row in diagnostic_rows
-                    if row.get("fit_stage") not in (None, "")
-                }
-            )
-            sse_values = np.asarray(
-                [
-                    float(row.get("fit_sse"))
-                    for row in diagnostic_rows
-                    if row.get("fit_sse") is not None
-                ],
-                dtype=float,
-            )
-            r2_values = np.asarray(
-                [
-                    float(row.get("r2"))
-                    for row in diagnostic_rows
-                    if row.get("r2") is not None
-                ],
-                dtype=float,
-            )
-            stage_text = ", ".join(stages) if stages else "n/a"
-            sse_text = (
-                f"{float(np.nanmedian(sse_values)):.6g}"
-                if sse_values.size > 0
-                else "n/a"
-            )
-            r2_text = (
-                f"{float(np.nanmean(r2_values)):.6f}" if r2_values.size > 0 else "n/a"
-            )
-            self.stats_text.append(
-                f"Batch diagnostics: stages={stage_text}, median SSE={sse_text}, mean R²={r2_text}."
-            )
         self.cleanup_batch_thread()
         self.queue_visible_thumbnail_render()
         self._autosave_fit_details()
@@ -10190,7 +9944,7 @@ class ManualFitGUI(QMainWindow):
                 + self.batch_capture_keys
                 + ["R2"]
                 + param_column_tokens
-                + ["SSE", "Error"]
+                + ["Error"]
             )
             self.batch_table.setColumnCount(len(columns))
             self.batch_table.setHorizontalHeaderLabels(columns)
@@ -10240,8 +9994,7 @@ class ManualFitGUI(QMainWindow):
             # Parameter columns come after R2.
             param_start = r2_col + 1
             param_columns = self._batch_parameter_column_items()
-            sse_col = param_start + len(param_columns)
-            error_col = sse_col + 1
+            error_col = param_start + len(param_columns)
 
             r2_val = row.get("r2")
             if r2_val is not None:
@@ -10259,6 +10012,10 @@ class ManualFitGUI(QMainWindow):
 
             params = self._as_float_array(row.get("params"))
             boundary_values = self._as_float_array(row.get("boundary_values"))
+            violation_indices = {
+                int(item.get("index"))
+                for item in self._fit_param_range_violations(row.get("params"))
+            }
             for offset, item in enumerate(param_columns):
                 idx = int(item["index"])
                 if item["kind"] == "param":
@@ -10270,19 +10027,10 @@ class ManualFitGUI(QMainWindow):
                         else None
                     )
                 cell_text = f"{value:.6f}" if value is not None else ""
-                self.batch_table.setItem(
-                    row_idx,
-                    param_start + offset,
-                    NumericSortTableWidgetItem(cell_text),
-                )
-            sse_value = row.get("fit_sse")
-            self.batch_table.setItem(
-                row_idx,
-                sse_col,
-                NumericSortTableWidgetItem(
-                    f"{float(sse_value):.6g}" if sse_value is not None else ""
-                ),
-            )
+                cell_item = NumericSortTableWidgetItem(cell_text)
+                if item["kind"] == "param" and idx in violation_indices:
+                    cell_item.setForeground(QBrush(QColor("#b91c1c")))
+                self.batch_table.setItem(row_idx, param_start + offset, cell_item)
             error_text = self._batch_row_error_text(row)
             self.batch_table.setItem(
                 row_idx,
