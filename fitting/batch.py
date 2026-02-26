@@ -10,20 +10,18 @@ from typing import (
     Mapping,
     Optional,
     Pattern,
-    Sequence,
     Set,
     Tuple,
 )
 
 import numpy as np
 from matplotlib.figure import Figure
-from PyQt6.QtCore import QObject, QThread, pyqtSignal, pyqtSlot, Qt
+from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot, Qt
 from PyQt6.QtGui import QPixmap
 
 from expression import _PARAMETER_NAME_RE
 from model import (
     FitCancelledError,
-    PiecewiseModelDefinition,
     boundary_ratios_to_x_values,
     has_nonempty_values,
     is_fit_row_improved,

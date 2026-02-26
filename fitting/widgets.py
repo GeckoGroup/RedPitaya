@@ -21,7 +21,7 @@ from PyQt6.QtWidgets import (
     QStyledItemDelegate,
     QComboBox,
 )
-from PyQt6.QtCore import Qt, QTimer, QSize, QEvent, QRectF
+from PyQt6.QtCore import Qt, QTimer, QSize, QRectF
 from PyQt6.QtGui import (
     QColor,
     QPainter,

@@ -595,7 +595,9 @@ def is_valid_parameter_name(name: str) -> bool:
     return bool(_PARAMETER_NAME_RE.fullmatch(str(name)))
 
 
-def get_expression_reserved_names(channel_names: Optional[Sequence[str]] = None) -> Set[str]:
+def get_expression_reserved_names(
+    channel_names: Optional[Sequence[str]] = None,
+) -> Set[str]:
     """Return the set of names that cannot be used as parameter names.
 
     Includes standard helpers (``col``, ``columns``, ``C``, ``math``, ``np``)
@@ -639,7 +641,11 @@ def colorize_expression_html(
 
     _column_set: Set[str] = {str(n) for n in column_names}
     _param_set: Set[str] = {str(t) for t in param_tokens}
-    _constant_set: Set[str] = {str(t) for t in constant_tokens} if constant_tokens is not None else {"pi", "e"}
+    _constant_set: Set[str] = (
+        {str(t) for t in constant_tokens}
+        if constant_tokens is not None
+        else {"pi", "e"}
+    )
     _symbol_map: Mapping[str, str] = symbol_map or {}
 
     column_tokens_upper = {name.upper() for name in _column_set}
