@@ -188,7 +188,7 @@ _UNICODE_SUBSCRIPT_TRANS = str.maketrans(
 )
 
 
-def _format_boundary_display_name(index: int) -> str:
+def format_boundary_display_name(index: int) -> str:
     idx = max(0, int(index))
     return f"X{str(idx).translate(_UNICODE_SUBSCRIPT_TRANS)}"
 
@@ -471,7 +471,7 @@ class MultiHandleSlider(QWidget):
             label = (
                 str(self._labels[idx])
                 if idx < len(self._labels) and str(self._labels[idx]).strip()
-                else _format_boundary_display_name(idx)
+                else format_boundary_display_name(idx)
             )
             text_width = int(metrics.horizontalAdvance(label))
             tx = int(round(x_pos - (text_width * 0.5)))

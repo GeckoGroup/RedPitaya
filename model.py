@@ -213,7 +213,7 @@ def has_nonempty_values(values) -> bool:
         return bool(values)
 
 
-def _finite_float_or_none(value) -> Optional[float]:
+def finite_float_or_none(value) -> Optional[float]:
     try:
         numeric = float(value)
     except Exception:
@@ -251,8 +251,8 @@ def is_fit_row_improved(
     if candidate_has_error and not baseline_has_error:
         return False
 
-    candidate_r2 = _finite_float_or_none(candidate_row.get("r2"))
-    baseline_r2 = _finite_float_or_none(baseline_row.get("r2"))
+    candidate_r2 = finite_float_or_none(candidate_row.get("r2"))
+    baseline_r2 = finite_float_or_none(baseline_row.get("r2"))
     if candidate_r2 is not None and baseline_r2 is not None:
         tolerance = 1e-12
         return bool(candidate_r2 > (baseline_r2 + tolerance))
@@ -438,7 +438,7 @@ def build_piecewise_model_definition(
     )
 
 
-def _make_segment_specs(
+def make_segment_specs(
     model_def: PiecewiseModelDefinition,
     seed_map: Mapping[str, float],
     bounds_map: Mapping[str, Tuple[float, float]],
@@ -496,7 +496,7 @@ def _make_segment_specs(
     return tuple(segments)
 
 
-def _shared_to_local_flat(
+def shared_to_local_flat(
     model_def: PiecewiseModelDefinition,
     shared_values: np.ndarray,
     boundary_ratios: np.ndarray,
@@ -603,7 +603,7 @@ def run_piecewise_fit_pipeline(
         if name in global_index
     ]
 
-    segments = _make_segment_specs(
+    segments = make_segment_specs(
         model_def,
         seed_by_key,
         bounds_map,

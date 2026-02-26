@@ -85,36 +85,20 @@ from matplotlib import colors as mcolors
 # use Qt5Agg backend for better performance
 from matplotlib.pyplot import switch_backend
 
-from data_io import normalize_column_name, read_measurement_csv, stem_for_file_ref
+from data_io import read_measurement_csv, stem_for_file_ref
 from expression import (
-    _PARAMETER_NAME_RE,
-    _EXPRESSION_COLUMN_COLOR,
-    _EXPRESSION_PARAM_COLOR,
-    _EXPRESSION_CONSTANT_COLOR,
-    _EXPRESSION_ALLOWED_FUNCTIONS,
-    _EXPRESSION_ALLOWED_CONSTANTS,
-    _EXPRESSION_HELPER_NAMES,
-    _LATEX_HTML_COMMANDS,
-    _DISPLAY_FUNCTION_NAMES,
-    _normalize_latex_symbol_token,
-    _normalize_latex_script_token,
-    _strip_outer_braces,
-    _latex_fragment_to_html,
-    latex_symbol_to_plain,
+    COLUMN_COLOR,
+    PARAM_COLOR,
+    CONSTANT_COLOR,
     parameter_symbol_to_html,
     parameter_symbol_to_mathtext,
     resolve_parameter_symbol,
-    _format_number_literal,
-    _ast_callable_name,
-    _parenthesize_if_binop,
-    _parenthesize_if_add_sub,
-    _render_expression_pretty,
     format_expression_pretty,
     format_equation_pretty,
     ExpressionSyntaxHighlighter,
-    _ExpressionParameterCollector,
-    extract_expression_parameter_names,
-    compile_expression_function,
+    colorize_expression_html,
+    is_valid_parameter_name,
+    get_expression_reserved_names,
 )
 from model import (
     ParameterSpec,
@@ -124,24 +108,16 @@ from model import (
     DEFAULT_EXPRESSION,
     DEFAULT_PARAM_SPECS,
     FIT_CURVE_COLOR,
-    CHANNEL_PLOT_COLORS,
     palette_color,
-    PiecewiseModelDefinition,
-    FitCancelledError,
     has_nonempty_values,
-    _finite_float_or_none,
-    _row_has_error,
-    is_fit_row_improved,
+    finite_float_or_none,
     default_boundary_ratios,
     boundary_ratios_to_positions,
     boundary_ratios_to_x_values,
-    _boundary_ratio_diff_step_from_x,
     extract_segment_parameter_names,
-    compile_segment_expression,
     build_piecewise_model_definition,
-    _make_segment_specs,
-    _shared_to_local_flat,
-    run_piecewise_fit_pipeline,
+    make_segment_specs,
+    shared_to_local_flat,
     compute_r2,
     smooth_channel_array,
 )
@@ -152,29 +128,20 @@ from widgets import (
     ClickableLabel,
     SingleLineStatusLabel,
     VerticallyCenteredTextEdit,
-    _UNICODE_SUBSCRIPT_TRANS,
-    _format_boundary_display_name,
-    _RICH_TEXT_ROLE,
+    format_boundary_display_name,
     RichTextItemDelegate,
     RichTextComboBox,
     RichTextHeaderView,
     MultiHandleSlider,
 )
 from batch import (
-    CapturePatternConfig,
-    _FIELD_NAME_RE,
-    _is_optional_delimiter,
-    _template_to_regex,
     parse_capture_pattern,
     extract_captures,
     resolve_fixed_params_from_captures,
     make_batch_result_row,
-    render_batch_thumbnail,
-    FitWorker,
     BatchFitWorker,
     ThumbnailRenderWorker,
 )
-
 
 
 switch_backend("Qt5Agg")
@@ -1547,7 +1514,7 @@ class ManualFitGUI(QMainWindow):
             slider.blockSignals(True)
             slider.set_values(positions.tolist())
             slider.set_labels(
-                [_format_boundary_display_name(idx) for idx in range(n_boundaries)]
+                [format_boundary_display_name(idx) for idx in range(n_boundaries)]
             )
             slider.blockSignals(False)
             slider.setEnabled(True)
@@ -1950,11 +1917,7 @@ class ManualFitGUI(QMainWindow):
         return names
 
     def _expression_reserved_names(self):
-        reserved = set(_EXPRESSION_HELPER_NAMES) | {"np"}
-        for name in self._available_channel_names():
-            if _PARAMETER_NAME_RE.fullmatch(name):
-                reserved.add(name)
-        return reserved
+        return get_expression_reserved_names(self._available_channel_names())
 
     def _expression_channel_data(self):
         if self.current_data is None:
@@ -2219,7 +2182,7 @@ class ManualFitGUI(QMainWindow):
             raise ValueError(
                 f"Model/UI parameter mismatch. Missing parameter values: {missing_text}"
             )
-        segments = _make_segment_specs(model_def, seed_map, bounds_map)
+        segments = make_segment_specs(model_def, seed_map, bounds_map)
         shared = np.asarray(
             [seed_map[key] for key in model_def.global_param_names], dtype=float
         )
@@ -2237,7 +2200,7 @@ class ManualFitGUI(QMainWindow):
             b = np.asarray(boundary_ratios, dtype=float)
         if b.size != n_boundaries:
             b = default_boundary_ratios(n_boundaries)
-        local_flat = _shared_to_local_flat(model_def, shared, np.clip(b, 0.0, 1.0))
+        local_flat = shared_to_local_flat(model_def, shared, np.clip(b, 0.0, 1.0))
         pred = predict_ordered_piecewise(
             np.asarray(x_data, dtype=float).reshape(-1),
             segments,
@@ -2327,7 +2290,7 @@ class ManualFitGUI(QMainWindow):
                 index = int(match.group(1)) - 1
             except Exception:
                 index = 0
-            return _format_boundary_display_name(max(0, index))
+            return format_boundary_display_name(max(0, index))
 
         def break_token(name):
             display_name = break_display_name(name)
@@ -2500,62 +2463,14 @@ class ManualFitGUI(QMainWindow):
             except Exception:
                 param_tokens = set()
 
-        column_tokens = {str(name) for name in self._available_channel_names()}
+        column_names = list(self._available_channel_names())
         if target_col:
-            column_tokens.add(str(target_col))
-        column_tokens_upper = {token.upper() for token in column_tokens}
-        constant_tokens = {"e", "pi"}
+            column_names.append(str(target_col))
 
-        token_set = set(column_tokens) | set(param_tokens) | set(constant_tokens)
-        special_tokens = sorted(
-            [
-                token
-                for token in token_set
-                if token and not _PARAMETER_NAME_RE.fullmatch(token)
-            ],
-            key=len,
-            reverse=True,
-        )
-
-        number_token_re = r"(?<![A-Za-z_])(?:\d+\.\d*|\d*\.?\d+)(?:[eE][-+]?\d+)?"
-        token_parts = [number_token_re]
-        token_parts.extend(re.escape(token) for token in special_tokens)
-        token_parts.append(r"[A-Za-z_][A-Za-z0-9_]*")
-        token_re = re.compile("|".join(token_parts))
-        number_re = re.compile(rf"^{number_token_re}$")
-
-        parts = []
-        cursor = 0
-        for match in token_re.finditer(text):
-            start = match.start()
-            end = match.end()
-            if start > cursor:
-                parts.append(html.escape(text[cursor:start]))
-            token = match.group(0)
-            rendered = html.escape(token)
-            style = None
-            if token.upper() in column_tokens_upper:
-                style = f"color:{_EXPRESSION_COLUMN_COLOR}; font-weight:600;"
-            elif token in param_tokens:
-                style = f"color:{_EXPRESSION_PARAM_COLOR}; font-weight:600;"
-                rendered = parameter_symbol_to_html(token)
-            elif token in constant_tokens or number_re.fullmatch(token):
-                style = f"color:{_EXPRESSION_CONSTANT_COLOR};"
-            if style:
-                parts.append(f'<span style="{style}">{rendered}</span>')
-            else:
-                parts.append(rendered)
-            cursor = end
-
-        if cursor < len(text):
-            parts.append(html.escape(text[cursor:]))
-        rendered = "".join(parts)
-        rendered = re.sub(
-            r"\^(-?\d+)",
-            lambda m: f"<sup>{html.escape(m.group(1))}</sup>",
-            rendered,
-        )
-        return rendered
+        html_symbol_map = {
+            token: parameter_symbol_to_html(token) or token for token in param_tokens
+        }
+        return colorize_expression_html(text, column_names, param_tokens, symbol_map=html_symbol_map)
 
     def _is_expression_editor_child(self, widget):
         if widget is None or not hasattr(self, "expression_editor_widget"):
@@ -3081,7 +2996,7 @@ class ManualFitGUI(QMainWindow):
             lhs_text = self.y_channel
             rhs_text = equation
 
-        if not _PARAMETER_NAME_RE.fullmatch(lhs_text):
+        if not is_valid_parameter_name(lhs_text):
             raise ValueError("Invalid left-hand column. Use a CSV column name.")
         if not rhs_text:
             raise ValueError("Right-hand expression is empty.")
@@ -3119,7 +3034,7 @@ class ManualFitGUI(QMainWindow):
             style_sheet=(
                 f"""
             QPushButton {{
-                color: {_EXPRESSION_COLUMN_COLOR};
+                color: {COLUMN_COLOR};
                 background: #ffffff;
                 border: 1px solid #bfdbfe;
                 border-radius: 8px;
@@ -4177,7 +4092,7 @@ class ManualFitGUI(QMainWindow):
             box = self.param_spinboxes.get(key)
             if box is None:
                 continue
-            numeric = _finite_float_or_none(box.value())
+            numeric = finite_float_or_none(box.value())
             low = float(min(spec.min_value, spec.max_value))
             high = float(max(spec.min_value, spec.max_value))
             tolerance = 1e-12 * max(1.0, abs(low), abs(high))
@@ -4715,7 +4630,7 @@ class ManualFitGUI(QMainWindow):
                     "kind": "boundary",
                     "index": int(idx),
                     "key": f"X_{idx}",
-                    "token": _format_boundary_display_name(idx),
+                    "token": format_boundary_display_name(idx),
                 }
             )
         return items
@@ -7023,7 +6938,7 @@ class ManualFitGUI(QMainWindow):
             if row is None:
                 self.stats_text.append(f"Auto-fit finished with no result: {file_name}")
             elif has_nonempty_values(row.get("params")):
-                r2_val = _finite_float_or_none(row.get("r2"))
+                r2_val = finite_float_or_none(row.get("r2"))
                 r2_text = f"{float(r2_val):.6f}" if r2_val is not None else "N/A"
                 row_error = self._batch_row_error_text(row)
                 if row_error:
@@ -7240,7 +7155,7 @@ class ManualFitGUI(QMainWindow):
         def _refit_priority(existing_row, source_index_value, has_existing_fit):
             if not has_existing_fit:
                 return (0, 0.0, int(source_index_value))
-            r2_val = _finite_float_or_none(existing_row.get("r2"))
+            r2_val = finite_float_or_none(existing_row.get("r2"))
             if r2_val is None:
                 distance = float("inf")
             else:
@@ -7524,7 +7439,7 @@ class ManualFitGUI(QMainWindow):
             elif status_lower in {"failed", "cancelled"}:
                 status_item.setForeground(QBrush(QColor("#b91c1c")))
 
-            r2_old = _finite_float_or_none(row.get("_r2_old"))
+            r2_old = finite_float_or_none(row.get("_r2_old"))
             r2_old_item = NumericSortTableWidgetItem(
                 f"{float(r2_old):.6f}" if r2_old is not None else ""
             )
@@ -7567,7 +7482,7 @@ class ManualFitGUI(QMainWindow):
                 r2_old_col,
                 r2_old_item,
             )
-            r2_val = _finite_float_or_none(row.get("r2"))
+            r2_val = finite_float_or_none(row.get("r2"))
             self.batch_table.setItem(
                 row_idx,
                 r2_new_col,

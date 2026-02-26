@@ -9,6 +9,7 @@ from typing import (
     Mapping,
     Optional,
     Sequence,
+    Set,
 )
 
 import numpy as np
@@ -20,6 +21,11 @@ _PARAMETER_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _EXPRESSION_COLUMN_COLOR = "#1d4ed8"
 _EXPRESSION_PARAM_COLOR = "#047857"
 _EXPRESSION_CONSTANT_COLOR = "#9333ea"
+
+# Public aliases for the syntax colors, for use in stylesheets.
+COLUMN_COLOR = _EXPRESSION_COLUMN_COLOR
+PARAM_COLOR = _EXPRESSION_PARAM_COLOR
+CONSTANT_COLOR = _EXPRESSION_CONSTANT_COLOR
 _EXPRESSION_ALLOWED_FUNCTIONS = {
     "abs": np.abs,
     "sin": np.sin,
@@ -575,3 +581,108 @@ def compile_expression_function(
         return result_array
 
     return _evaluate
+
+
+# ---------------------------------------------------------------------------
+# Public convenience helpers
+# ---------------------------------------------------------------------------
+
+
+def is_valid_parameter_name(name: str) -> bool:
+    """Return True if *name* is a valid fit-parameter identifier."""
+    return bool(_PARAMETER_NAME_RE.fullmatch(str(name)))
+
+
+def get_expression_reserved_names(channel_names: Optional[Sequence[str]] = None) -> Set[str]:
+    """Return the set of names that cannot be used as parameter names.
+
+    Includes standard helpers (``col``, ``columns``, ``C``, ``math``, ``np``)
+    plus any *channel_names* that are valid identifiers.
+    """
+    reserved: Set[str] = set(_EXPRESSION_HELPER_NAMES) | {"np"}
+    if channel_names:
+        for name in channel_names:
+            if _PARAMETER_NAME_RE.fullmatch(str(name)):
+                reserved.add(name)
+    return reserved
+
+
+def colorize_expression_html(
+    text: str,
+    column_names: Sequence[str],
+    param_tokens: Sequence[str],
+    constant_tokens: Optional[Sequence[str]] = None,
+    symbol_map: Optional[Mapping[str, str]] = None,
+) -> str:
+    """Render *text* as HTML with syntax-colored ``<span>`` elements.
+
+    Parameters
+    ----------
+    text:
+        Raw expression / equation string to colorize.
+    column_names:
+        CSV column names (rendered in ``COLUMN_COLOR``).
+    param_tokens:
+        Parameter display names (rendered in ``PARAM_COLOR``).
+    constant_tokens:
+        Constant names such as ``pi`` and ``e`` (rendered in ``CONSTANT_COLOR``).
+        Defaults to ``{"pi", "e"}`` when *None*.
+    symbol_map:
+        Mapping from parameter key → HTML symbol, used to substitute rendered
+        tokens inside the colored spans.
+    """
+    _text = str(text).strip()
+    if not _text:
+        return ""
+
+    _column_set: Set[str] = {str(n) for n in column_names}
+    _param_set: Set[str] = {str(t) for t in param_tokens}
+    _constant_set: Set[str] = {str(t) for t in constant_tokens} if constant_tokens is not None else {"pi", "e"}
+    _symbol_map: Mapping[str, str] = symbol_map or {}
+
+    column_tokens_upper = {name.upper() for name in _column_set}
+    token_set = _column_set | _param_set | _constant_set
+    special_tokens = sorted(
+        [t for t in token_set if t and not _PARAMETER_NAME_RE.fullmatch(t)],
+        key=len,
+        reverse=True,
+    )
+
+    _num_re = r"(?<![A-Za-z_])(?:\d+\.\d*|\d*\.?\d+)(?:[eE][-+]?\d+)?"
+    token_parts = [_num_re]
+    token_parts.extend(re.escape(t) for t in special_tokens)
+    token_parts.append(r"[A-Za-z_][A-Za-z0-9_]*")
+    token_re = re.compile("|".join(token_parts))
+    number_re = re.compile(rf"^{_num_re}$")
+
+    parts: List[str] = []
+    cursor = 0
+    for match in token_re.finditer(_text):
+        start, end = match.start(), match.end()
+        if start > cursor:
+            parts.append(html.escape(_text[cursor:start]))
+        token = match.group(0)
+        rendered = html.escape(token)
+        style = None
+        if token.upper() in column_tokens_upper:
+            style = f"color:{_EXPRESSION_COLUMN_COLOR}; font-weight:600;"
+        elif token in _param_set:
+            style = f"color:{_EXPRESSION_PARAM_COLOR}; font-weight:600;"
+            rendered = _symbol_map.get(token, rendered)
+        elif token in _constant_set or number_re.fullmatch(token):
+            style = f"color:{_EXPRESSION_CONSTANT_COLOR};"
+        if style:
+            parts.append(f'<span style="{style}">{rendered}</span>')
+        else:
+            parts.append(rendered)
+        cursor = end
+
+    if cursor < len(_text):
+        parts.append(html.escape(_text[cursor:]))
+    result = "".join(parts)
+    result = re.sub(
+        r"\^(-?\d+)",
+        lambda m: f"<sup>{html.escape(m.group(1))}</sup>",
+        result,
+    )
+    return result

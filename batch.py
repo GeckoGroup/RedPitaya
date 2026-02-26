@@ -29,7 +29,7 @@ from model import (
     is_fit_row_improved,
     run_piecewise_fit_pipeline,
     smooth_channel_array,
-    _finite_float_or_none,
+    finite_float_or_none,
     _row_has_error,
     FIT_CURVE_COLOR,
     palette_color,
@@ -632,8 +632,8 @@ class BatchFitWorker(QObject):
 
     @staticmethod
     def _capture_value_distance(left: Any, right: Any) -> float:
-        left_num = _finite_float_or_none(left)
-        right_num = _finite_float_or_none(right)
+        left_num = finite_float_or_none(left)
+        right_num = finite_float_or_none(right)
         if left_num is not None and right_num is not None:
             denom = abs(left_num) + abs(right_num) + 1.0
             return float(abs(left_num - right_num) / denom)
