@@ -5049,6 +5049,19 @@ class ManualFitGUI(QMainWindow):
         header.addWidget(self._proc_name_edit)
         header.addStretch()
 
+        self._proc_save_btn = self._new_button(
+            "Save…",
+            handler=self._proc_save_procedure,
+            tooltip="Save this procedure to a JSON file",
+        )
+        header.addWidget(self._proc_save_btn)
+        self._proc_load_btn = self._new_button(
+            "Load…",
+            handler=self._proc_load_procedure,
+            tooltip="Load a procedure from a JSON file",
+        )
+        header.addWidget(self._proc_load_btn)
+
         self._proc_add_btn = self._new_button(
             "+ Add Step",
             handler=self._proc_add_step,
@@ -5098,12 +5111,94 @@ class ManualFitGUI(QMainWindow):
         )
         parent_layout.addWidget(self._proc_status_label)
 
+        # --- Per-step results log ---
+        self._proc_results_log = QTextEdit()
+        self._proc_results_log.setReadOnly(True)
+        self._proc_results_log.setMaximumHeight(120)
+        self._proc_results_log.setPlaceholderText(
+            "Step results will appear here after running the procedure…"
+        )
+        self._proc_results_log.setStyleSheet(
+            "QTextEdit { font-family: 'Courier New', Consolas, monospace; font-size: 11px; }"
+        )
+        parent_layout.addWidget(self._proc_results_log)
+
         # Populate from current _procedure_steps.
         self._proc_rebuild_step_cards()
 
     def _on_proc_name_changed(self, text):
         self._procedure_name = str(text).strip() or "Procedure"
         self._autosave_fit_details()
+
+    def _proc_save_procedure(self):
+        """Save the current procedure to a standalone JSON file."""
+        procedure = self._build_procedure()
+        start_dir = (
+            str(Path(self.current_dir).expanduser())
+            if self.current_dir
+            else str(Path.cwd())
+        )
+        safe_name = re.sub(r"[^\w\-. ]", "_", procedure.name) or "procedure"
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Procedure",
+            str(Path(start_dir) / f"{safe_name}.json"),
+            "JSON Files (*.json);;All Files (*.*)",
+        )
+        if not file_path:
+            return
+        try:
+            payload = {
+                "format": "fit_procedure",
+                "version": 1,
+                "saved_at_utc": datetime.now(timezone.utc).isoformat(),
+                "procedure": procedure.serialize(),
+            }
+            with open(file_path, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, indent=2, ensure_ascii=True)
+            self.stats_text.append(f"✓ Saved procedure to {file_path}")
+        except Exception as exc:
+            self.stats_text.append(f"✗ Save procedure failed: {exc}")
+
+    def _proc_load_procedure(self):
+        """Load a procedure from a JSON file (standalone or fit_details format)."""
+        start_dir = (
+            str(Path(self.current_dir).expanduser())
+            if self.current_dir
+            else str(Path.cwd())
+        )
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load Procedure",
+            start_dir,
+            "JSON Files (*.json);;All Files (*.*)",
+        )
+        if not file_path:
+            return
+        try:
+            with open(file_path, "r", encoding="utf-8") as fh:
+                payload = json.load(fh)
+            if not isinstance(payload, dict):
+                raise ValueError("Invalid file format: expected a JSON object.")
+            # Support standalone procedure files and fit_details files.
+            proc_data = payload.get("procedure") or (
+                (payload.get("gui") or {}).get("procedure")
+            )
+            if not isinstance(proc_data, dict):
+                raise ValueError("No procedure data found in file.")
+            procedure = FitProcedure.deserialize(proc_data)
+            self._procedure_steps = list(procedure.steps)
+            self._procedure_name = procedure.name
+            if hasattr(self, "_proc_name_edit"):
+                self._proc_name_edit.setText(self._procedure_name)
+            self._proc_rebuild_step_cards()
+            self._autosave_fit_details()
+            self.stats_text.append(
+                f"✓ Loaded procedure '{procedure.name}'"
+                f" ({len(procedure.steps)} steps) from {file_path}"
+            )
+        except Exception as exc:
+            self.stats_text.append(f"✗ Load procedure failed: {exc}")
 
     def _proc_available_params(self):
         """Return list of currently available parameter keys."""
@@ -5512,6 +5607,10 @@ class ManualFitGUI(QMainWindow):
             self.stats_text.append("No data loaded.")
             return
 
+        # Clear the per-step results log for a fresh run.
+        if hasattr(self, "_proc_results_log"):
+            self._proc_results_log.clear()
+
         multi_model = getattr(self, "_multi_channel_model", None)
         piecewise_model = getattr(self, "_piecewise_model", None)
         if multi_model is None and piecewise_model is None:
@@ -5608,6 +5707,16 @@ class ManualFitGUI(QMainWindow):
         r2_text = f"R²={r2:.6f}" if r2 is not None else "R²=N/A"
         self._proc_status_label.setText(f"Completed {label}: {r2_text}")
         self.stats_text.append(f"  {label}: {r2_text}")
+        if hasattr(self, "_proc_results_log"):
+            free_params = step_result.get("free_params") or []
+            _max_shown = 6
+            free_text = ", ".join(str(p) for p in free_params[:_max_shown])
+            if len(free_params) > _max_shown:
+                free_text += f" (+{len(free_params) - _max_shown} more)"
+            line = f"{label}: {r2_text}"
+            if free_text:
+                line += f"  [free: {free_text}]"
+            self._proc_results_log.append(line)
 
     def _on_procedure_finished(self, result):
         self._procedure_running = False
@@ -5617,17 +5726,19 @@ class ManualFitGUI(QMainWindow):
 
         stopped = result.get("stopped_at_step")
         if stopped is not None:
-            self._proc_status_label.setText(
-                f"Procedure stopped early at step {stopped + 1} (R² threshold)."
-            )
-            self.stats_text.append(
-                f"Procedure stopped early at step {stopped + 1} (R² below threshold)."
-            )
+            msg = f"Procedure stopped early at step {stopped + 1} (R² threshold)."
+            self._proc_status_label.setText(msg)
+            self.stats_text.append(msg)
+            if hasattr(self, "_proc_results_log"):
+                self._proc_results_log.append(f"⚠ {msg}")
         else:
             r2 = result.get("r2")
             r2_text = f"R²={r2:.6f}" if r2 is not None else ""
-            self._proc_status_label.setText(f"Procedure complete. {r2_text}")
-            self.stats_text.append(f"Procedure complete. {r2_text}")
+            msg = f"Procedure complete. {r2_text}".strip()
+            self._proc_status_label.setText(msg)
+            self.stats_text.append(msg)
+            if hasattr(self, "_proc_results_log"):
+                self._proc_results_log.append(f"✓ {msg}")
 
         # Apply final parameters to UI.
         self.on_fit_finished(result)
@@ -5637,8 +5748,11 @@ class ManualFitGUI(QMainWindow):
         self._proc_run_btn.setEnabled(True)
         self._proc_cancel_btn.setEnabled(False)
         self._cleanup_procedure_thread()
-        self._proc_status_label.setText(f"Procedure failed: {error_msg}")
-        self.stats_text.append(f"Procedure failed: {error_msg}")
+        msg = f"Procedure failed: {error_msg}"
+        self._proc_status_label.setText(msg)
+        self.stats_text.append(msg)
+        if hasattr(self, "_proc_results_log"):
+            self._proc_results_log.append(f"✗ {msg}")
 
     def _on_procedure_cancelled(self):
         self._procedure_running = False
@@ -5647,6 +5761,8 @@ class ManualFitGUI(QMainWindow):
         self._cleanup_procedure_thread()
         self._proc_status_label.setText("Procedure cancelled.")
         self.stats_text.append("Procedure cancelled.")
+        if hasattr(self, "_proc_results_log"):
+            self._proc_results_log.append("— Procedure cancelled.")
 
     def _cleanup_procedure_thread(self):
         thread = self._procedure_thread
