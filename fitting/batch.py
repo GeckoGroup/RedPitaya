@@ -463,6 +463,7 @@ class ProcedureFitWorker(QObject):
         bounds_map,
         boundary_seeds=None,
         bound_values=None,
+        random_restarts=0,
     ):
         super().__init__()
         self.x_data = np.asarray(x_data, dtype=float)
@@ -476,6 +477,7 @@ class ProcedureFitWorker(QObject):
         self.bounds_map = dict(bounds_map)
         self.boundary_seeds = dict(boundary_seeds or {})
         self.bound_values = dict(bound_values or {})
+        self.random_restarts = max(0, int(random_restarts))
         self.cancel_requested = False
 
     def request_cancel(self):
@@ -502,6 +504,7 @@ class ProcedureFitWorker(QObject):
                 cancel_check=lambda: self.cancel_requested,
                 step_callback=_step_cb,
                 bound_values=self.bound_values,
+                n_random_restarts=self.random_restarts,
             )
             if self.cancel_requested:
                 self.cancelled.emit()
@@ -911,14 +914,16 @@ class BatchFitWorker(QObject):
                         )
                     )
 
-                attempt_inputs.append(
-                    (
-                        self._randomized_seed_map(self.seed_map),
-                        self._randomized_boundary_seed(self.boundary_seed),
-                        "random-restart",
-                        None,
+                n_restarts = max(1, self.random_restarts)
+                for _ in range(n_restarts):
+                    attempt_inputs.append(
+                        (
+                            self._randomized_seed_map(self.seed_map),
+                            self._randomized_boundary_seed(self.boundary_seed),
+                            "random-restart",
+                            None,
+                        )
                     )
-                )
             else:
                 attempt_inputs.append(
                     (
@@ -928,6 +933,15 @@ class BatchFitWorker(QObject):
                         None,
                     )
                 )
+                for _ in range(self.random_restarts):
+                    attempt_inputs.append(
+                        (
+                            self._randomized_seed_map(self.seed_map),
+                            self._randomized_boundary_seed(self.boundary_seed),
+                            "random-restart",
+                            None,
+                        )
+                    )
 
             deduped_attempts: List[
                 Tuple[Dict[str, float], np.ndarray, str, Optional[str]]

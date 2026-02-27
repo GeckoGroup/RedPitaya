@@ -661,6 +661,32 @@ def shared_to_local_flat(
     return np.asarray(parts, dtype=float)
 
 
+def _random_seed_within_bounds(
+    seed_map: Mapping[str, float],
+    bounds_map: Mapping[str, Tuple[float, float]],
+    fixed_params: Optional[Mapping[str, float]],
+    rng: "np.random.Generator",
+) -> Dict[str, float]:
+    """Return a seed map where each free parameter is drawn uniformly from its bounds."""
+    fixed_keys = set(dict(fixed_params or {}).keys())
+    result: Dict[str, float] = dict(seed_map)
+    for name, bounds in bounds_map.items():
+        if name in fixed_keys:
+            continue
+        try:
+            low = float(min(bounds[0], bounds[1]))
+            high = float(max(bounds[0], bounds[1]))
+        except Exception:
+            continue
+        if not (np.isfinite(low) and np.isfinite(high)):
+            continue
+        if np.isclose(low, high):
+            result[name] = float(low)
+        else:
+            result[name] = float(rng.uniform(low, high))
+    return result
+
+
 def _run_initial_fit_stage(
     x_arr: np.ndarray,
     y_arr: np.ndarray,
@@ -709,6 +735,8 @@ def run_piecewise_fit_pipeline(
     boundary_seed: Optional[np.ndarray] = None,
     cancel_check: Optional[Callable[[], bool]] = None,
     fixed_params: Optional[Mapping[str, float]] = None,
+    n_random_restarts: int = 0,
+    rng_seed: Optional[int] = None,
 ) -> Dict[str, Any]:
     x_arr = np.asarray(x_data, dtype=float).reshape(-1)
     y_arr = np.asarray(y_data, dtype=float).reshape(-1)
@@ -978,7 +1006,7 @@ def run_piecewise_fit_pipeline(
         except Exception:
             pass
 
-    return {
+    best_result = {
         "params_by_key": {
             name: float(best_shared[idx]) for idx, name in enumerate(global_names)
         },
@@ -990,6 +1018,49 @@ def run_piecewise_fit_pipeline(
         "r2": compute_r2(y_arr, best_pred["y_hat"]),
     }
 
+    # ── Random restarts: try N additional random starting points ──────
+    n_restarts = int(n_random_restarts)
+    if n_restarts > 0:
+        rng = np.random.default_rng(rng_seed)
+        best_r2 = best_result.get("r2")
+        for _ in range(n_restarts):
+            if is_cancelled():
+                break
+            restart_seed = _random_seed_within_bounds(
+                seed_map, bounds_map, fixed_params, rng
+            )
+            restart_boundary: Optional[np.ndarray] = (
+                np.asarray(
+                    rng.uniform(0.0, 1.0, size=int(n_boundaries)), dtype=float
+                )
+                if n_boundaries > 0
+                else np.asarray([], dtype=float)
+            )
+            try:
+                candidate = run_piecewise_fit_pipeline(
+                    x_arr,
+                    y_arr,
+                    model_def,
+                    restart_seed,
+                    bounds_map,
+                    boundary_seed=restart_boundary,
+                    cancel_check=cancel_check,
+                    fixed_params=fixed_params,
+                    n_random_restarts=0,
+                )
+            except FitCancelledError:
+                raise
+            except Exception:
+                continue
+            candidate_r2 = candidate.get("r2")
+            if candidate_r2 is not None and (
+                best_r2 is None or float(candidate_r2) > float(best_r2)
+            ):
+                best_result = candidate
+                best_r2 = float(candidate_r2)
+
+    return best_result
+
 
 def run_multi_channel_fit_pipeline(
     x_data: np.ndarray,
@@ -1000,6 +1071,8 @@ def run_multi_channel_fit_pipeline(
     boundary_seeds: Optional[Mapping[str, np.ndarray]] = None,
     cancel_check: Optional[Callable[[], bool]] = None,
     fixed_params: Optional[Mapping[str, float]] = None,
+    n_random_restarts: int = 0,
+    rng_seed: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Fit shared parameters across multiple channel equations simultaneously.
 
@@ -1346,7 +1419,7 @@ def run_multi_channel_fit_pipeline(
             "r2": compute_r2(ch["y_arr"], pred["y_hat"]),
         }
 
-    return {
+    best_result = {
         "params_by_key": {
             name: float(best_shared[idx]) for idx, name in enumerate(global_names)
         },
@@ -1354,6 +1427,52 @@ def run_multi_channel_fit_pipeline(
         "channel_results": results_by_channel,
         "r2": _combine_channel_r2(results_by_channel),
     }
+
+    # ── Random restarts: try N additional random starting points ──────
+    n_restarts = int(n_random_restarts)
+    if n_restarts > 0:
+        rng = np.random.default_rng(rng_seed)
+        best_r2 = best_result.get("r2")
+        for _ in range(n_restarts):
+            if is_cancelled():
+                break
+            restart_seed = _random_seed_within_bounds(
+                seed_map, bounds_map, fixed_params, rng
+            )
+            restart_boundary_seeds: Dict[str, np.ndarray] = {}
+            for ch in channel_info:
+                n_b = ch["n_boundaries"]
+                restart_boundary_seeds[ch["target"]] = (
+                    np.asarray(
+                        rng.uniform(0.0, 1.0, size=n_b), dtype=float
+                    )
+                    if n_b > 0
+                    else np.asarray([], dtype=float)
+                )
+            try:
+                candidate = run_multi_channel_fit_pipeline(
+                    x_arr,
+                    y_data_by_channel,
+                    multi_model,
+                    restart_seed,
+                    bounds_map,
+                    boundary_seeds=restart_boundary_seeds,
+                    cancel_check=cancel_check,
+                    fixed_params=fixed_params,
+                    n_random_restarts=0,
+                )
+            except FitCancelledError:
+                raise
+            except Exception:
+                continue
+            candidate_r2 = candidate.get("r2")
+            if candidate_r2 is not None and (
+                best_r2 is None or float(candidate_r2) > float(best_r2)
+            ):
+                best_result = candidate
+                best_r2 = float(candidate_r2)
+
+    return best_result
 
 
 def _combine_channel_r2(results_by_channel: Mapping[str, Any]) -> Optional[float]:
@@ -1382,6 +1501,8 @@ def run_procedure_pipeline(
     cancel_check: Optional[Callable[[], bool]] = None,
     step_callback: Optional[Callable[[int, Dict[str, Any]], None]] = None,
     bound_values: Optional[Mapping[str, float]] = None,
+    n_random_restarts: int = 0,
+    rng_seed: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Execute a multi-step fitting procedure, feeding results forward.
 
@@ -1515,6 +1636,8 @@ def run_procedure_pipeline(
                 boundary_seeds=step_boundary_seeds,
                 cancel_check=cancel_check,
                 fixed_params=step_fixed_filtered,
+                n_random_restarts=int(n_random_restarts),
+                rng_seed=rng_seed,
             )
         else:
             # Single-channel path.
@@ -1530,6 +1653,8 @@ def run_procedure_pipeline(
                 boundary_seed=b_seed,
                 cancel_check=cancel_check,
                 fixed_params=step_fixed_filtered,
+                n_random_restarts=int(n_random_restarts),
+                rng_seed=rng_seed,
             )
 
         last_result = result

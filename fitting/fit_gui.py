@@ -5574,6 +5574,7 @@ class ManualFitGUI(QMainWindow):
             bounds_map=fit_context["bounds_map"],
             boundary_seeds=boundary_seeds,
             bound_values=bound_values,
+            random_restarts=int(getattr(self, "_batch_refit_random_restarts", 0)),
         )
         thread = QThread()
         worker.moveToThread(thread)
