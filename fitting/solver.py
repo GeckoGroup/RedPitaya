@@ -429,11 +429,34 @@ def _piecewise_bounds_and_p0(
     )
 
 
+def _auto_blend_width(x_sorted: np.ndarray) -> float:
+    """Compute a blend half-width for lerp transitions.
+
+    The width is large enough to span several data-point spacings so that
+    the optimizer sees a smooth gradient when moving a boundary, but small
+    enough not to distort the overall fit shape.
+    """
+    if x_sorted.size < 2:
+        return 0.0
+    span = float(x_sorted[-1] - x_sorted[0])
+    if span <= 0:
+        return 0.0
+    deltas = np.diff(x_sorted)
+    deltas = deltas[deltas > 0.0]
+    if deltas.size > 0:
+        median_dx = float(np.median(deltas))
+    else:
+        median_dx = span / max(1, x_sorted.size - 1)
+    # Use ~2% of range, but at least 4 data-point spacings
+    return float(max(0.02 * span, 4.0 * median_dx))
+
+
 def _predict_piecewise(
     segments: Sequence[SegmentSpec],
     x: ArrayLike,
     flat_params: ArrayLike,
     use_jit: bool = True,
+    blend_width: float = 0.0,
 ) -> Dict[str, np.ndarray]:
     x_arr = np.asarray(x, dtype=np.float64).reshape(-1)
     seg_params, ratios = _unpack_flat_params(segments, flat_params)
@@ -447,6 +470,55 @@ def _predict_piecewise(
         ratios, x_min, x_span, use_jit=bool(use_jit)
     )
 
+    n_seg = len(segments)
+    bw = float(blend_width)
+
+    if bw > 0.0 and boundaries.size > 0 and n_seg > 1:
+        # --- Lerp-blended prediction (smooth boundary transitions) ---
+        # Evaluate every segment over the full x range.  If any segment
+        # function cannot handle the full range we fall back to the hard
+        # boundary path.
+        seg_outputs: List[np.ndarray] = []
+        blend_ok = True
+        for seg_idx, (seg, p) in enumerate(zip(segments, seg_params)):
+            try:
+                y_seg = np.asarray(seg.model_func(x_arr, *p), dtype=float).reshape(-1)
+                if y_seg.size != x_arr.size:
+                    blend_ok = False
+                    break
+            except Exception:
+                blend_ok = False
+                break
+            seg_outputs.append(y_seg)
+
+        if blend_ok:
+            # Build per-boundary smooth step functions (0 → 1).
+            # Linear ramp clipped to [0, 1].
+            steps: List[np.ndarray] = []
+            for b in boundaries:
+                t = np.clip((x_arr - b) / bw + 0.5, 0.0, 1.0)
+                steps.append(t)
+
+            # Segment weights from the step functions:
+            #   seg 0       : (1 - step_0)
+            #   seg i (mid)  : step_{i-1} * (1 - step_i)
+            #   seg last     : step_{last-1}
+            y_hat = np.zeros_like(x_arr, dtype=float)
+            for seg_idx in range(n_seg):
+                if seg_idx == 0:
+                    w = 1.0 - steps[0]
+                elif seg_idx == n_seg - 1:
+                    w = steps[seg_idx - 1]
+                else:
+                    w = steps[seg_idx - 1] * (1.0 - steps[seg_idx])
+                y_hat += w * seg_outputs[seg_idx]
+
+            return {
+                "y_hat": np.asarray(y_hat, dtype=float),
+                "boundaries": np.asarray(boundaries, dtype=float),
+            }
+
+    # --- Hard boundary prediction (original behaviour) ---
     idx = np.searchsorted(boundaries, x_arr, side="right")
     y_hat = np.empty_like(x_arr, dtype=float)
     for seg_idx, (seg, p) in enumerate(zip(segments, seg_params)):
@@ -585,8 +657,19 @@ class _OrderedPiecewiseSolver:
             self.segments
         )
 
-    def _predict(self, x: ArrayLike, params: ArrayLike) -> Dict[str, np.ndarray]:
-        return _predict_piecewise(self.segments, x, params, use_jit=self._use_jit)
+    def _predict(
+        self,
+        x: ArrayLike,
+        params: ArrayLike,
+        blend_width: float = 0.0,
+    ) -> Dict[str, np.ndarray]:
+        return _predict_piecewise(
+            self.segments,
+            x,
+            params,
+            use_jit=self._use_jit,
+            blend_width=blend_width,
+        )
 
     def _fit_global_seed(
         self, x_sorted: np.ndarray, y_sorted: np.ndarray, seed: int = 0
@@ -687,8 +770,10 @@ class _OrderedPiecewiseSolver:
             p0 = np.asarray(self._base_p0, dtype=float)
         p0 = np.clip(p0, self._lower, self._upper)
 
+        bw = _auto_blend_width(x_sorted)
+
         def residuals(flat: np.ndarray) -> np.ndarray:
-            y_hat = self._predict(x_sorted, flat)["y_hat"]
+            y_hat = self._predict(x_sorted, flat, blend_width=bw)["y_hat"]
             return np.asarray(y_hat - y_sorted, dtype=float)
 
         diff_step = None
@@ -796,12 +881,14 @@ def predict_ordered_piecewise(
     segments: Sequence[SegmentSpec],
     params: ArrayLike,
     prefer_jit: bool = True,
+    blend_width: float = 0.0,
 ) -> Dict[str, np.ndarray]:
     return _predict_piecewise(
         segments=segments,
         x=x,
         flat_params=params,
         use_jit=bool(prefer_jit),
+        blend_width=float(blend_width),
     )
 
 

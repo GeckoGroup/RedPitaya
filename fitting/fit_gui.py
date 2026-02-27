@@ -83,6 +83,9 @@ from expression import (
 )
 from model import (
     ParameterSpec,
+    MultiChannelModelDefinition,
+    FitProcedure,
+    FitProcedureStep,
     DEFAULT_WINDOW_TITLE,
     FIT_DETAILS_FILENAME,
     DEFAULT_TARGET_CHANNEL,
@@ -99,6 +102,7 @@ from model import (
     pcts_to_boundary_ratios,
     extract_segment_parameter_names,
     build_piecewise_model_definition,
+    build_multi_channel_model_definition,
     make_segment_specs,
     shared_to_local_flat,
     compute_r2,
@@ -122,6 +126,7 @@ from batch import (
     resolve_fixed_params_from_captures,
     make_batch_result_row,
     BatchFitWorker,
+    ProcedureFitWorker,
     ThumbnailRenderWorker,
     _BATCH_PATTERN_MISMATCH_ERROR,
     _FIT_PARAM_RANGE_ERROR_PREFIX,
@@ -166,6 +171,33 @@ class ManualFitGUI(QMainWindow):
             )
         except Exception:
             self._piecewise_model = None
+        # Multi-channel model: wraps one or more PiecewiseModelDefinition objects.
+        # Parameters with the same name are shared across channels.
+        self._multi_channel_model = None
+        self._boundary_ratios_per_channel = {}  # {target_col: np.ndarray}
+        self._boundary_slider_mapping = None  # Used for multi-channel slider dispatch
+        self._boundary_handle_map = (
+            None  # list of [(target, idx), ...] per slider handle
+        )
+        self._boundary_name_map = {}  # {(target, idx): "X₀"/"X₁"/...} boundary name assignment
+        self._boundary_name_combos = {}  # {(target, idx): QComboBox} name selectors
+        self._manually_fixed_params = set()  # Param keys manually fixed by user
+        self.param_fix_checkboxes = {}  # key -> QCheckBox
+        self._fit_channel_enabled = {}  # {target_col: bool} per-equation fit toggles
+        self._fit_channel_checkboxes = {}  # {target_col: QCheckBox}
+        self._last_per_channel_r2 = {}  # {target_col: float|None}
+        try:
+            self._multi_channel_model = build_multi_channel_model_definition(
+                [
+                    (
+                        DEFAULT_TARGET_CHANNEL,
+                        [part.strip() for part in DEFAULT_EXPRESSION.split(";")],
+                    )
+                ],
+                channel_names=["TIME", "CH2", "CH3", "CH4"],
+            )
+        except Exception:
+            pass
 
         self.setWindowTitle(DEFAULT_WINDOW_TITLE)
         if APP_ICON_PATH.exists():
@@ -197,6 +229,7 @@ class ManualFitGUI(QMainWindow):
             else 2
         )
         self._last_r2 = None
+        self._last_per_channel_r2 = {}
         self.param_capture_map = {}
         self.param_capture_combos = {}
         self.fit_thread = None
@@ -268,6 +301,13 @@ class ManualFitGUI(QMainWindow):
         self._source_selected_paths = []
         self._fit_details_restore_in_progress = False
 
+        # ── Procedure state ──
+        self._procedure_steps = []  # list of FitProcedureStep
+        self._procedure_name = "Procedure"
+        self._procedure_worker = None
+        self._procedure_thread = None
+        self._procedure_running = False
+
         # Create central widget
         central_widget = QWidget()
         central_widget.setObjectName("root")
@@ -291,9 +331,11 @@ class ManualFitGUI(QMainWindow):
         self.manual_tab = QWidget()
         self.batch_tab = QWidget()
         self.analysis_tab = QWidget()
+        self.procedure_tab = QWidget()
         self.tabs.addTab(self.manual_tab, "Plot")
         self.tabs.addTab(self.batch_tab, "Batch Processing")
         self.tabs.addTab(self.analysis_tab, "Batch Analysis")
+        self.tabs.addTab(self.procedure_tab, "Procedures")
         self.tabs.currentChanged.connect(self._on_tab_changed)
         self._attach_tab_corner_controls()
 
@@ -314,6 +356,12 @@ class ManualFitGUI(QMainWindow):
         analysis_layout.setSpacing(6)
         self.create_batch_analysis_frame(analysis_layout)
         analysis_layout.addStretch()
+
+        procedure_layout = QVBoxLayout(self.procedure_tab)
+        procedure_layout.setContentsMargins(6, 6, 6, 6)
+        procedure_layout.setSpacing(6)
+        self.create_procedure_frame(procedure_layout)
+        procedure_layout.addStretch()
 
         # Defer initial file discovery/load until the UI has painted once.
         self.stats_text.setText("Loading data sources...")
@@ -1225,6 +1273,64 @@ class ManualFitGUI(QMainWindow):
             self.canvas.draw_idle()
         self._autosave_fit_details()
 
+    def _rebuild_equation_toggles(self):
+        """Rebuild per-equation checkboxes and R² labels in the fit group."""
+        layout = getattr(self, "equation_toggles_layout", None)
+        if layout is None:
+            return
+        clear_layout(layout)
+        self._fit_channel_checkboxes.clear()
+        self._equation_r2_labels = {}
+
+        multi_model = getattr(self, "_multi_channel_model", None)
+        if multi_model is None:
+            return
+
+        targets = list(multi_model.target_channels)
+        if not targets:
+            return
+
+        for target in targets:
+            row_layout = QHBoxLayout()
+            row_layout.setSpacing(4)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+
+            cb = QCheckBox(target)
+            cb.setToolTip(f"Include {target} equation in fitting")
+            enabled = self._fit_channel_enabled.get(target, True)
+            cb.setChecked(enabled)
+            cb.toggled.connect(
+                lambda checked, t=target: self._on_equation_toggle_changed(t, checked)
+            )
+            row_layout.addWidget(cb)
+            self._fit_channel_checkboxes[target] = cb
+
+            r2_label = self._new_label(
+                "R²: N/A",
+                object_name="statusLabel",
+                style_sheet="color: #64748b; font-size: 11px; padding: 0px 2px;",
+            )
+            r2_label.setMinimumWidth(90)
+            row_layout.addWidget(r2_label)
+            self._equation_r2_labels[target] = r2_label
+
+            row_layout.addStretch(1)
+            layout.addLayout(row_layout)
+
+    def _on_equation_toggle_changed(self, target, checked):
+        """Handle toggling of a per-equation fit checkbox."""
+        self._fit_channel_enabled[target] = checked
+        self.update_plot(fast=False)
+
+    def _get_enabled_fit_channels(self):
+        """Return list of target channel names that are enabled for fitting."""
+        multi_model = getattr(self, "_multi_channel_model", None)
+        if multi_model is None:
+            return [self.y_channel]
+        targets = list(multi_model.target_channels)
+        enabled = [t for t in targets if self._fit_channel_enabled.get(t, True)]
+        return enabled if enabled else targets  # fallback: keep all if none checked
+
     def _sync_fit_panel_top_spacing(self):
         spacer = getattr(self, "fit_panel_top_spacer", None)
         header_widget = getattr(self, "param_header_widget", None)
@@ -1305,6 +1411,71 @@ class ManualFitGUI(QMainWindow):
     def _ordered_parameter_sections(self):
         ordered_keys = self._ordered_param_keys()
         model_def = self._piecewise_model
+        multi_model = getattr(self, "_multi_channel_model", None)
+
+        # Multi-channel: show sections for each channel, then truly shared at the end.
+        if multi_model is not None and multi_model.is_multi_channel:
+            sections = []
+            seen = set()
+            truly_shared = set()
+            # Identify parameters that appear in more than one channel.
+            param_channel_count = {}
+            for ch_model in multi_model.channel_models:
+                for seg_names in ch_model.segment_param_names:
+                    for name in seg_names:
+                        param_channel_count[name] = param_channel_count.get(name, 0) + 1
+            for name, count in param_channel_count.items():
+                if count > 1:
+                    truly_shared.add(name)
+
+            for ch_idx, ch_model in enumerate(multi_model.channel_models):
+                target = ch_model.target_col
+                seg_param_names = list(ch_model.segment_param_names)
+                total_segs = len(seg_param_names)
+                sections.append(
+                    {
+                        "kind": "channel_header",
+                        "index": ch_idx,
+                        "target": target,
+                        "keys": [],
+                    }
+                )
+                for seg_idx, seg_names in enumerate(seg_param_names, start=1):
+                    unique_keys = []
+                    for raw_name in seg_names:
+                        key = str(raw_name)
+                        if key in seen or key not in ordered_keys:
+                            continue
+                        # Show shared params in their FIRST occurrence.
+                        unique_keys.append(key)
+                        seen.add(key)
+                    label_idx = seg_idx
+                    sections.append(
+                        {
+                            "kind": "segment",
+                            "index": label_idx,
+                            "keys": unique_keys,
+                            "target": target,
+                        }
+                    )
+                    if seg_idx < total_segs:
+                        sections.append(
+                            {
+                                "kind": "boundary",
+                                "index": seg_idx,
+                                "keys": [],
+                                "target": target,
+                            }
+                        )
+
+            # Catch any remaining keys not yet listed.
+            trailing = [key for key in ordered_keys if key not in seen]
+            if trailing:
+                sections.append({"kind": "shared", "index": 0, "keys": trailing})
+                for key in trailing:
+                    seen.add(key)
+            return sections
+
         if (
             model_def is None
             or not getattr(model_def, "segment_param_names", None)
@@ -1359,10 +1530,7 @@ class ManualFitGUI(QMainWindow):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(2)
 
-        row = QHBoxLayout()
-        row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(6)
-
+        # Single-channel slider row (used when only one channel).
         min_label = self._new_label(
             "Start",
             object_name="paramInline",
@@ -1370,13 +1538,11 @@ class ManualFitGUI(QMainWindow):
             alignment=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
             style_sheet="color: #64748b;",
         )
-        row.addWidget(min_label)
 
         slider = MultiHandleSlider()
         slider.valuesChanged.connect(self._on_breakpoint_values_changed)
         slider.sliderPressed.connect(self._on_breakpoint_slider_pressed)
         slider.sliderReleased.connect(self._on_breakpoint_slider_released)
-        row.addWidget(slider, 1)
 
         max_label = self._new_label(
             "End",
@@ -1385,14 +1551,255 @@ class ManualFitGUI(QMainWindow):
             alignment=Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
             style_sheet="color: #64748b;",
         )
-        row.addWidget(max_label)
-        outer.addLayout(row)
+
+        self._single_channel_slider_row = QWidget()
+        sr_layout = QHBoxLayout(self._single_channel_slider_row)
+        sr_layout.setContentsMargins(0, 0, 0, 0)
+        sr_layout.setSpacing(6)
+        sr_layout.addWidget(min_label)
+        sr_layout.addWidget(slider, 1)
+        sr_layout.addWidget(max_label)
+        outer.addWidget(self._single_channel_slider_row)
+
+        # Multi-channel slider area: dynamically populated per channel.
+        self._multi_channel_slider_panel = QWidget()
+        self._multi_channel_slider_panel.setVisible(False)
+        self._multi_channel_slider_layout = QVBoxLayout(
+            self._multi_channel_slider_panel
+        )
+        self._multi_channel_slider_layout.setContentsMargins(0, 0, 0, 0)
+        self._multi_channel_slider_layout.setSpacing(2)
+        outer.addWidget(self._multi_channel_slider_panel)
+
+        # Per-channel slider registry: {target_col: MultiHandleSlider}
+        self._per_channel_sliders = {}
+
+        # Boundary name assignment panel (replaces old link combos).
+        self._boundary_name_panel = QWidget()
+        self._boundary_name_panel.setVisible(False)
+        self._boundary_name_panel_layout = QVBoxLayout(self._boundary_name_panel)
+        self._boundary_name_panel_layout.setContentsMargins(0, 4, 0, 0)
+        self._boundary_name_panel_layout.setSpacing(2)
+        outer.addWidget(self._boundary_name_panel)
 
         self.breakpoint_controls = {
             "slider": slider,
             "container": container,
         }
         return container
+
+    def _boundary_links_from_map(self):
+        """Convert the boundary name map to link groups for the model.
+
+        Boundaries sharing the same assigned name are linked together.
+        """
+        name_map = getattr(self, "_boundary_name_map", {})
+        if not name_map:
+            return ()
+        groups_by_name: Dict[str, List[Tuple[str, int]]] = {}
+        for bid, name in name_map.items():
+            if name not in (None, ""):
+                groups_by_name.setdefault(str(name), []).append(bid)
+        result = []
+        for _name, members in sorted(groups_by_name.items()):
+            if len(members) >= 2:
+                result.append(tuple(sorted(members)))
+        return tuple(result)
+
+    def _default_boundary_name(self, boundary_idx: int) -> str:
+        """Return the default name for a boundary at the given local index."""
+        return format_boundary_display_name(boundary_idx)
+
+    def _ensure_boundary_names(self):
+        """Ensure every boundary has an assigned name in _boundary_name_map.
+
+        New boundaries get their default name (X₀, X₁, ...) while existing
+        assignments are preserved.
+        """
+        multi_model = getattr(self, "_multi_channel_model", None)
+        if multi_model is None or not multi_model.is_multi_channel:
+            return
+        name_map = getattr(self, "_boundary_name_map", {})
+        for bid in multi_model.all_boundary_ids:
+            if bid not in name_map:
+                target, idx = bid
+                name_map[bid] = self._default_boundary_name(idx)
+        # Prune entries that no longer exist.
+        valid = set(multi_model.all_boundary_ids)
+        self._boundary_name_map = {
+            bid: name for bid, name in name_map.items() if bid in valid
+        }
+        # Links are derived on-the-fly from _boundary_name_map via
+        # _boundary_links_from_map(), so no extra sync is needed.
+
+    def _available_boundary_names(self, max_count=10):
+        """Return a list of candidate boundary names: X₀, X₁, X₂, ..."""
+        return [format_boundary_display_name(i) for i in range(max_count)]
+
+    def _rebuild_boundary_name_panel(self):
+        """Rebuild the interactive boundary-name assignment panel."""
+        panel = getattr(self, "_boundary_name_panel", None)
+        layout = getattr(self, "_boundary_name_panel_layout", None)
+        if panel is None or layout is None:
+            return
+        # Clear old widgets.
+        clear_layout(layout)
+        self._boundary_name_combos.clear()
+
+        multi_model = getattr(self, "_multi_channel_model", None)
+        if multi_model is None or not multi_model.is_multi_channel:
+            panel.setVisible(False)
+            return
+
+        # Collect channels with boundaries.
+        channels_with_boundaries = []
+        for ch_model in multi_model.channel_models:
+            n_b = max(0, len(ch_model.segment_exprs) - 1)
+            if n_b > 0:
+                channels_with_boundaries.append(ch_model)
+        if not channels_with_boundaries:
+            panel.setVisible(False)
+            return
+
+        self._ensure_boundary_names()
+        name_map = self._boundary_name_map
+
+        # Count maximum boundaries to size the name list.
+        max_b = max(
+            max(0, len(ch.segment_exprs) - 1) for ch in channels_with_boundaries
+        )
+        available_names = self._available_boundary_names(max(max_b + 3, 6))
+
+        # Build one row per channel: "CH2: [X₀ ▼] [X₁ ▼]"
+        for ch_model in channels_with_boundaries:
+            target = ch_model.target_col
+            n_b = max(0, len(ch_model.segment_exprs) - 1)
+            row = QHBoxLayout()
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(3)
+
+            ch_label = self._new_label(
+                target,
+                object_name="paramInline",
+                width=56,
+                alignment=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                style_sheet="color: #64748b; font-weight: 600; font-size: 10px;",
+            )
+            row.addWidget(ch_label)
+
+            for bidx in range(n_b):
+                bid = (target, bidx)
+                combo = QComboBox()
+                combo.setFixedWidth(52)
+                combo.setFixedHeight(20)
+                combo.setStyleSheet("font-size: 10px;")
+                combo.setToolTip(
+                    f"Assign a boundary name for {target} boundary {bidx + 1}.\n"
+                    "Boundaries with the same name across channels are linked."
+                )
+                for aname in available_names:
+                    combo.addItem(aname, aname)
+                current_name = name_map.get(bid, self._default_boundary_name(bidx))
+                idx_in = combo.findData(current_name)
+                if idx_in >= 0:
+                    combo.setCurrentIndex(idx_in)
+                else:
+                    # Name not in list — add and select it.
+                    combo.addItem(current_name, current_name)
+                    combo.setCurrentIndex(combo.count() - 1)
+
+                combo.currentIndexChanged.connect(
+                    lambda _i, t=target, bi=bidx: self._on_boundary_name_changed(t, bi)
+                )
+                row.addWidget(combo)
+                self._boundary_name_combos[bid] = combo
+
+            row.addStretch(1)
+            layout.addLayout(row)
+
+        panel.setVisible(True)
+
+    def _on_boundary_name_changed(self, target: str, boundary_idx: int):
+        """Handle boundary name combo change."""
+        bid = (target, boundary_idx)
+        combo = self._boundary_name_combos.get(bid)
+        if combo is None:
+            return
+        new_name = combo.currentData()
+        if new_name in (None, ""):
+            return
+
+        self._boundary_name_map.get(bid, "")
+        self._boundary_name_map[bid] = str(new_name)
+
+        # Sync ratios: if this boundary is now linked with others that have the
+        # same name, average their positions.
+        self._apply_boundary_links_to_model()
+
+        links = self._boundary_links_from_map()
+        stored = getattr(self, "_boundary_ratios_per_channel", {})
+        for group in links:
+            if bid in group:
+                ratios_in_group = []
+                for gt, gi in group:
+                    ch_ratios = stored.get(gt)
+                    if ch_ratios is not None and gi < len(ch_ratios):
+                        ratios_in_group.append(float(ch_ratios[gi]))
+                if ratios_in_group:
+                    avg = float(np.clip(np.mean(ratios_in_group), 0.0, 1.0))
+                    for gt, gi in group:
+                        ch_ratios = stored.get(gt)
+                        if ch_ratios is not None and gi < len(ch_ratios):
+                            ch_ratios[gi] = avg
+                break
+        self._boundary_ratios_per_channel = stored
+        self._sync_breakpoint_sliders_from_state()
+        self.update_plot()
+        self._autosave_fit_details()
+
+    def _apply_boundary_links_to_model(self):
+        """Rebuild the multi-channel model with current boundary link groups."""
+        multi_model = getattr(self, "_multi_channel_model", None)
+        if multi_model is None or not multi_model.is_multi_channel:
+            return
+        try:
+            channel_equations = [
+                (m.target_col, list(m.segment_exprs))
+                for m in multi_model.channel_models
+            ]
+            links = self._boundary_links_from_map()
+            self._multi_channel_model = build_multi_channel_model_definition(
+                channel_equations,
+                channel_names=list(self.channels.keys()),
+                boundary_links=links,
+            )
+        except Exception:
+            pass
+
+    def _total_boundary_count_all_channels(self):
+        """Return total number of slider handles across all channel models.
+
+        When boundaries are linked, linked groups count as one handle each.
+        """
+        multi_model = getattr(self, "_multi_channel_model", None)
+        if multi_model is not None and multi_model.is_multi_channel:
+            all_bids = list(multi_model.all_boundary_ids)
+            if not all_bids:
+                return 0
+            if multi_model.has_boundary_links:
+                linked = set()
+                n_groups = 0
+                for group in multi_model.boundary_links:
+                    valid = [b for b in group if b in set(all_bids)]
+                    if len(valid) >= 2:
+                        n_groups += 1
+                        linked.update(valid)
+                return n_groups + sum(1 for b in all_bids if b not in linked)
+            return len(all_bids)
+        model_def = getattr(self, "_piecewise_model", None)
+        if model_def is None:
+            return 0
+        return max(0, len(model_def.segment_exprs) - 1)
 
     def _current_segment_boundary_count(self):
         model_def = getattr(self, "_piecewise_model", None)
@@ -1437,13 +1844,164 @@ class ManualFitGUI(QMainWindow):
         return f"{numeric:.6g}"
 
     def _sync_breakpoint_sliders_from_state(self):
-        n_boundaries = self._current_segment_boundary_count()
+        multi_model = getattr(self, "_multi_channel_model", None)
         control = (
             self.breakpoint_controls
             if isinstance(self.breakpoint_controls, dict)
             else {}
         )
         slider = control.get("slider")
+
+        # Multi-channel: build per-channel sliders.
+        if multi_model is not None and multi_model.is_multi_channel:
+            # Hide the single-channel slider row.
+            single_row = getattr(self, "_single_channel_slider_row", None)
+            if single_row is not None:
+                single_row.setVisible(False)
+
+            self._rebuild_boundary_name_panel()
+            stored = getattr(self, "_boundary_ratios_per_channel", {})
+
+            # Ensure every channel has ratios in the stored map.
+            for ch_model in multi_model.channel_models:
+                target = ch_model.target_col
+                n_b = max(0, len(ch_model.segment_exprs) - 1)
+                if n_b <= 0:
+                    continue
+                ch_ratios = np.asarray(
+                    stored.get(target, default_boundary_ratios(n_b)),
+                    dtype=float,
+                ).reshape(-1)
+                if ch_ratios.size != n_b:
+                    ch_ratios = default_boundary_ratios(n_b)
+                ch_ratios = np.clip(ch_ratios, 0.0, 1.0)
+                stored[target] = ch_ratios
+            self._boundary_ratios_per_channel = stored
+
+            # Build linked boundary lookup for painting linked handles.
+            linked_groups = {}  # bid -> set of linked bids
+            for group in multi_model.boundary_links:
+                group_set = set(group)
+                for bid in group:
+                    linked_groups[bid] = group_set
+
+            # Build / update per-channel slider panel.
+            mc_panel = getattr(self, "_multi_channel_slider_panel", None)
+            mc_layout = getattr(self, "_multi_channel_slider_layout", None)
+            per_ch_sliders = getattr(self, "_per_channel_sliders", {})
+
+            # Determine which channels need sliders (those with boundaries).
+            channels_with_boundaries = []
+            for ch_model in multi_model.channel_models:
+                n_b = max(0, len(ch_model.segment_exprs) - 1)
+                if n_b > 0:
+                    channels_with_boundaries.append(ch_model)
+
+            # Rebuild slider widgets if channel set changed.
+            existing_targets = set(per_ch_sliders.keys())
+            needed_targets = {ch.target_col for ch in channels_with_boundaries}
+            if existing_targets != needed_targets:
+                # Clear old.
+                if mc_layout is not None:
+                    clear_layout(mc_layout)
+                per_ch_sliders.clear()
+
+                for ch_model in channels_with_boundaries:
+                    target = ch_model.target_col
+                    row = QHBoxLayout()
+                    row.setContentsMargins(0, 0, 0, 0)
+                    row.setSpacing(4)
+
+                    ch_label = self._new_label(
+                        target,
+                        object_name="paramInline",
+                        width=56,
+                        alignment=Qt.AlignmentFlag.AlignRight
+                        | Qt.AlignmentFlag.AlignVCenter,
+                        style_sheet="color: #64748b; font-weight: 600; font-size: 11px;",
+                    )
+                    row.addWidget(ch_label)
+
+                    ch_slider = MultiHandleSlider()
+                    ch_slider.setMinimumHeight(28)
+                    ch_slider.setMaximumHeight(28)
+                    ch_slider.valuesChanged.connect(
+                        lambda pos, t=target: self._on_channel_breakpoint_changed(
+                            t, pos
+                        )
+                    )
+                    ch_slider.sliderPressed.connect(self._on_breakpoint_slider_pressed)
+                    ch_slider.sliderReleased.connect(
+                        self._on_breakpoint_slider_released
+                    )
+                    row.addWidget(ch_slider, 1)
+                    per_ch_sliders[target] = ch_slider
+
+                    if mc_layout is not None:
+                        mc_layout.addLayout(row)
+
+                self._per_channel_sliders = per_ch_sliders
+
+            # Update slider values and labels.
+            for ch_model in channels_with_boundaries:
+                target = ch_model.target_col
+                ch_slider = per_ch_sliders.get(target)
+                if ch_slider is None:
+                    continue
+                n_b = max(0, len(ch_model.segment_exprs) - 1)
+                ch_ratios = stored.get(target, default_boundary_ratios(n_b))
+                positions = boundary_ratios_to_positions(ch_ratios, n_b)
+
+                labels = []
+                linked_idx_set = set()
+                name_map = getattr(self, "_boundary_name_map", {})
+                for bidx in range(n_b):
+                    bid = (target, bidx)
+                    bnd_name = name_map.get(bid, format_boundary_display_name(bidx))
+                    labels.append(bnd_name)
+                    if bid in linked_groups and len(linked_groups[bid]) >= 2:
+                        linked_idx_set.add(bidx)
+
+                ch_slider.blockSignals(True)
+                ch_slider.set_values(positions.tolist())
+                ch_slider.set_labels(labels)
+                ch_slider.set_linked_indices(linked_idx_set)
+                ch_slider.blockSignals(False)
+                ch_slider.setEnabled(True)
+
+            # Also keep primary channel ratios in sync.
+            primary_target = multi_model.primary.target_col
+            primary_n = max(0, len(multi_model.primary.segment_exprs) - 1)
+            self.current_boundary_ratios = np.asarray(
+                stored.get(primary_target, default_boundary_ratios(primary_n)),
+                dtype=float,
+            ).reshape(-1)
+
+            if mc_panel is not None:
+                mc_panel.setVisible(bool(channels_with_boundaries))
+
+            # Keep handle map for backward compat (not used by per-channel sliders).
+            self._boundary_handle_map = None
+
+            if hasattr(self, "formula_label") and not getattr(
+                self, "_expression_edit_mode", False
+            ):
+                self._set_formula_label()
+            return
+
+        # Single-channel: show single slider, hide multi-channel panel.
+        single_row = getattr(self, "_single_channel_slider_row", None)
+        if single_row is not None:
+            single_row.setVisible(True)
+        mc_panel = getattr(self, "_multi_channel_slider_panel", None)
+        if mc_panel is not None:
+            mc_panel.setVisible(False)
+        panel = getattr(self, "_boundary_name_panel", None)
+        if panel is not None:
+            panel.setVisible(False)
+        self._boundary_handle_map = None
+
+        n_boundaries = self._current_segment_boundary_count()
 
         if n_boundaries <= 0:
             self.current_boundary_ratios = np.asarray([], dtype=float)
@@ -1467,6 +2025,7 @@ class ManualFitGUI(QMainWindow):
         positions = boundary_ratios_to_positions(ratios, n_boundaries)
         x_min, x_max = self._x_axis_range_for_boundary_controls()
         axis_label = self._channel_axis_label(self.x_channel)
+        self._boundary_slider_mapping = None
         if slider is not None:
             slider.blockSignals(True)
             slider.set_values(positions.tolist())
@@ -1481,7 +2040,88 @@ class ManualFitGUI(QMainWindow):
         ):
             self._set_formula_label()
 
+    def _on_channel_breakpoint_changed(self, target: str, positions):
+        """Handle boundary slider change for a specific channel."""
+        multi_model = getattr(self, "_multi_channel_model", None)
+        if multi_model is None or not multi_model.is_multi_channel:
+            return
+        stored = getattr(self, "_boundary_ratios_per_channel", {})
+        ch_ratios = stored.get(target)
+        if ch_ratios is None:
+            return
+        n_b = len(ch_ratios)
+        pos_arr = np.asarray(positions, dtype=float).reshape(-1)
+        if pos_arr.size != n_b:
+            return
+        pos_arr = np.clip(pos_arr, 0.0, 1.0)
+        pos_arr = np.maximum.accumulate(pos_arr)
+        new_ratios = self._boundary_positions_to_ratios(pos_arr, n_b)
+        stored[target] = new_ratios
+
+        # Propagate linked boundaries to other channels.
+        links = self._boundary_links_from_map()
+        for bidx in range(n_b):
+            bid = (target, bidx)
+            for group in links:
+                if bid in group:
+                    new_pos = float(pos_arr[bidx])
+                    for gt, gi in group:
+                        if gt == target and gi == bidx:
+                            continue
+                        other_ratios = stored.get(gt)
+                        if other_ratios is None:
+                            continue
+                        other_n = len(other_ratios)
+                        if gi >= other_n:
+                            continue
+                        other_positions = boundary_ratios_to_positions(
+                            other_ratios, other_n
+                        )
+                        other_positions[gi] = new_pos
+                        other_positions = np.clip(other_positions, 0.0, 1.0)
+                        other_positions = np.maximum.accumulate(other_positions)
+                        stored[gt] = self._boundary_positions_to_ratios(
+                            other_positions, other_n
+                        )
+                    break
+
+        self._boundary_ratios_per_channel = stored
+        # Update primary channel.
+        primary_target = multi_model.primary.target_col
+        primary_n = max(0, len(multi_model.primary.segment_exprs) - 1)
+        self.current_boundary_ratios = np.asarray(
+            stored.get(primary_target, default_boundary_ratios(primary_n)),
+            dtype=float,
+        ).reshape(-1)
+
+        # Update other channel sliders that were affected by link propagation.
+        per_ch_sliders = getattr(self, "_per_channel_sliders", {})
+        for ch_model in multi_model.channel_models:
+            t = ch_model.target_col
+            if t == target:
+                continue  # skip the slider being dragged
+            ch_slider = per_ch_sliders.get(t)
+            if ch_slider is None:
+                continue
+            ch_r = stored.get(t)
+            if ch_r is None:
+                continue
+            ch_n = len(ch_r)
+            ch_pos = boundary_ratios_to_positions(ch_r, ch_n)
+            ch_slider.blockSignals(True)
+            ch_slider.set_values(ch_pos.tolist())
+            ch_slider.blockSignals(False)
+
+        self.update_plot(fast=True)
+
     def _on_breakpoint_values_changed(self, positions):
+        multi_model = getattr(self, "_multi_channel_model", None)
+
+        # Multi-channel uses per-channel sliders now, but handle legacy path.
+        if multi_model is not None and multi_model.is_multi_channel:
+            # Per-channel sliders handle this via _on_channel_breakpoint_changed.
+            return
+
         n_boundaries = self._current_segment_boundary_count()
         if n_boundaries <= 0:
             return
@@ -1510,6 +2150,26 @@ class ManualFitGUI(QMainWindow):
     def _on_breakpoint_slider_released(self):
         self.slider_active = False
         self.do_full_update()
+        self._autosave_fit_details()
+
+    def _on_param_fix_toggled(self, key: str, checked: bool):
+        """Handle the per-parameter fix checkbox toggle."""
+        fixed = getattr(self, "_manually_fixed_params", set())
+        if checked:
+            fixed.add(key)
+        else:
+            fixed.discard(key)
+        self._manually_fixed_params = fixed
+        # Visually dim slider/bounds when fixed.
+        slider = self.param_sliders.get(key)
+        min_box = self.param_min_spinboxes.get(key)
+        max_box = self.param_max_spinboxes.get(key)
+        if slider is not None:
+            slider.setEnabled(not checked)
+        if min_box is not None:
+            min_box.setEnabled(not checked)
+        if max_box is not None:
+            max_box.setEnabled(not checked)
         self._autosave_fit_details()
 
     def _create_param_label(self, spec, width):
@@ -1643,34 +2303,38 @@ class ManualFitGUI(QMainWindow):
     def _sync_param_slider_lock_state(self):
         param_capture_map = self._current_param_capture_map()
         mapped_values = self._parsed_numeric_param_values_from_mapping()
+        manually_fixed = getattr(self, "_manually_fixed_params", set())
         any_value_changed = False
         for key, slider in self.param_sliders.items():
             if slider is None:
                 continue
             capture_key = param_capture_map.get(str(key))
-            is_locked = capture_key not in (None, "")
+            is_capture_locked = capture_key not in (None, "")
+            is_manually_fixed = key in manually_fixed
             min_box = self.param_min_spinboxes.get(key)
             max_box = self.param_max_spinboxes.get(key)
             value_box = self.param_spinboxes.get(key)
             lock_status_label = self.param_lock_status_labels.get(key)
             tail_spacer = self.param_tail_spacers_by_key.get(key)
+            fix_cb = self.param_fix_checkboxes.get(key)
 
-            for widget in (slider, min_box, max_box, value_box, tail_spacer):
-                if widget is None:
-                    continue
-                widget.setVisible(not is_locked)
-                widget.setEnabled(not is_locked)
-
-            if is_locked and str(key) in mapped_values and value_box is not None:
-                locked_value = float(mapped_values[str(key)])
-                low = float(value_box.minimum())
-                high = float(value_box.maximum())
-                if not np.isclose(float(value_box.value()), locked_value):
-                    value_box.blockSignals(True)
-                    value_box.setValue(float(np.clip(locked_value, low, high)))
-                    value_box.blockSignals(False)
-                    any_value_changed = True
-            if is_locked:
+            if is_capture_locked:
+                # Capture lock: hide slider, bounds, value, tail, and fix checkbox.
+                for widget in (slider, min_box, max_box, value_box, tail_spacer):
+                    if widget is not None:
+                        widget.setVisible(False)
+                        widget.setEnabled(False)
+                if fix_cb is not None:
+                    fix_cb.setVisible(False)
+                if str(key) in mapped_values and value_box is not None:
+                    locked_value = float(mapped_values[str(key)])
+                    low = float(value_box.minimum())
+                    high = float(value_box.maximum())
+                    if not np.isclose(float(value_box.value()), locked_value):
+                        value_box.blockSignals(True)
+                        value_box.setValue(float(np.clip(locked_value, low, high)))
+                        value_box.blockSignals(False)
+                        any_value_changed = True
                 if lock_status_label is not None:
                     lock_status_label.setText(f'Bound to field "{capture_key}"')
                     lock_status_label.setToolTip(
@@ -1678,15 +2342,38 @@ class ManualFitGUI(QMainWindow):
                     )
                     lock_status_label.show()
             else:
-                slider.setToolTip("Sweep value across active bounds")
+                # Not capture-locked: show everything, fix checkbox visible.
+                for widget in (slider, min_box, max_box, value_box, tail_spacer):
+                    if widget is not None:
+                        widget.setVisible(True)
+                if fix_cb is not None:
+                    fix_cb.setVisible(True)
                 if lock_status_label is not None:
                     lock_status_label.hide()
-                if value_box is not None:
-                    value_box.setToolTip("Current value")
-                if min_box is not None:
-                    min_box.setToolTip("Lower bound")
-                if max_box is not None:
-                    max_box.setToolTip("Upper bound")
+                # When manually fixed, disable slider and bounds but keep value editable.
+                if is_manually_fixed:
+                    if slider is not None:
+                        slider.setEnabled(False)
+                    if min_box is not None:
+                        min_box.setEnabled(False)
+                    if max_box is not None:
+                        max_box.setEnabled(False)
+                    if value_box is not None:
+                        value_box.setEnabled(True)
+                        value_box.setToolTip("Fixed value (uncheck pin to unlock)")
+                else:
+                    if slider is not None:
+                        slider.setEnabled(True)
+                        slider.setToolTip("Sweep value across active bounds")
+                    if min_box is not None:
+                        min_box.setEnabled(True)
+                        min_box.setToolTip("Lower bound")
+                    if max_box is not None:
+                        max_box.setEnabled(True)
+                        max_box.setToolTip("Upper bound")
+                    if value_box is not None:
+                        value_box.setEnabled(True)
+                        value_box.setToolTip("Current value")
         if any_value_changed:
             self.update_plot(fast=False)
 
@@ -2012,7 +2699,15 @@ class ManualFitGUI(QMainWindow):
         model_def = self._piecewise_model
         if model_def is None:
             raise ValueError("No compiled piecewise model is available.")
-        ordered_keys = list(model_def.global_param_names)
+        # Use the multi-channel model's global param names when available so
+        # that the worker's ordered_keys covers ALL channels, not just the
+        # primary one.  param_specs is built from multi_model.global_param_names
+        # so the two must agree for _apply_batch_params_for_file to succeed.
+        multi_model = getattr(self, "_multi_channel_model", None)
+        if multi_model is not None and multi_model.is_multi_channel:
+            ordered_keys = list(multi_model.global_param_names)
+        else:
+            ordered_keys = list(model_def.global_param_names)
         if not ordered_keys:
             raise ValueError("No parameters are available for fitting.")
         fixed_map = {
@@ -2021,7 +2716,15 @@ class ManualFitGUI(QMainWindow):
             if str(key).strip()
         }
 
+        # Merge manually fixed parameters from UI checkboxes.
+        manually_fixed = getattr(self, "_manually_fixed_params", set())
         current_values = self.get_current_param_map()
+        for key in manually_fixed:
+            if key not in fixed_map and key in current_values:
+                try:
+                    fixed_map[key] = float(current_values[key])
+                except (TypeError, ValueError):
+                    pass
         spec_by_key = {spec.key: spec for spec in self.param_specs}
         bounds_by_key = {}
         seed_map = {}
@@ -2084,12 +2787,66 @@ class ManualFitGUI(QMainWindow):
         if boundary_seed.size != n_boundaries:
             boundary_seed = default_boundary_ratios(n_boundaries)
 
+        # Per-channel boundary seeds for multi-channel fitting.
+        boundary_seeds_per_channel = {}
+
+        # Filter multi-channel model to only include enabled channels.
+        fit_multi_model = multi_model
+        if multi_model is not None and multi_model.is_multi_channel:
+            enabled_channels = self._get_enabled_fit_channels()
+            enabled_ch_models = [
+                m
+                for m in multi_model.channel_models
+                if m.target_col in enabled_channels
+            ]
+            if enabled_ch_models and len(enabled_ch_models) < len(
+                multi_model.channel_models
+            ):
+                enabled_targets = {m.target_col for m in enabled_ch_models}
+                filtered_links = []
+                for group in multi_model.boundary_links:
+                    filtered = tuple(bid for bid in group if bid[0] in enabled_targets)
+                    if len(filtered) >= 2:
+                        filtered_links.append(filtered)
+                # Recompute global param names for the enabled subset.
+                filtered_global: list = []
+                filtered_seen: set = set()
+                for m in enabled_ch_models:
+                    for n in m.global_param_names:
+                        if n not in filtered_seen:
+                            filtered_seen.add(n)
+                            filtered_global.append(n)
+                fit_multi_model = MultiChannelModelDefinition(
+                    channel_models=tuple(enabled_ch_models),
+                    global_param_names=tuple(filtered_global),
+                    boundary_links=tuple(filtered_links),
+                )
+            elif not enabled_ch_models:
+                # All disabled — fallback to full model.
+                fit_multi_model = multi_model
+
+        if fit_multi_model is not None:
+            stored = getattr(self, "_boundary_ratios_per_channel", {})
+            for ch_model in fit_multi_model.channel_models:
+                ch_target = ch_model.target_col
+                ch_n_b = max(0, len(ch_model.segment_exprs) - 1)
+                ch_seed = stored.get(ch_target)
+                if ch_seed is not None:
+                    ch_seed = np.asarray(ch_seed, dtype=float).reshape(-1)
+                    if ch_seed.size != ch_n_b:
+                        ch_seed = default_boundary_ratios(ch_n_b)
+                else:
+                    ch_seed = default_boundary_ratios(ch_n_b)
+                boundary_seeds_per_channel[ch_target] = ch_seed
+
         return {
             "ordered_keys": ordered_keys,
             "seed_map": seed_map,
             "bounds_map": bounds_by_key,
             "model_def": model_def,
+            "multi_channel_model": fit_multi_model,
             "boundary_seed": boundary_seed,
+            "boundary_seeds_per_channel": boundary_seeds_per_channel,
             "fixed_params": fixed_map,
         }
 
@@ -2163,6 +2920,69 @@ class ManualFitGUI(QMainWindow):
         )
         return np.asarray(pred["y_hat"], dtype=float)
 
+    def evaluate_channel_model(
+        self, channel_model, x_data, param_values, boundary_ratios=None
+    ):
+        """Evaluate a specific channel's piecewise model with shared parameters."""
+        spec_by_key = {spec.key: spec for spec in self.param_specs}
+        bounds_map = {
+            key: (
+                float(min(spec.min_value, spec.max_value)),
+                float(max(spec.min_value, spec.max_value)),
+            )
+            for key, spec in spec_by_key.items()
+        }
+        seed_map = {}
+        current_values = self.get_current_param_map()
+        for key in channel_model.global_param_names:
+            if key in param_values:
+                seed_map[key] = float(param_values[key])
+            elif key in current_values:
+                seed_map[key] = float(current_values[key])
+            else:
+                raise ValueError(f"Missing parameter '{key}'.")
+        segments = make_segment_specs(channel_model, seed_map, bounds_map)
+        shared = np.asarray(
+            [seed_map[key] for key in channel_model.global_param_names], dtype=float
+        )
+        n_boundaries = max(0, len(segments) - 1)
+        if boundary_ratios is None:
+            stored = getattr(self, "_boundary_ratios_per_channel", {})
+            b = np.asarray(
+                stored.get(
+                    channel_model.target_col, default_boundary_ratios(n_boundaries)
+                ),
+                dtype=float,
+            )
+        else:
+            b = np.asarray(boundary_ratios, dtype=float)
+        if b.size != n_boundaries:
+            b = default_boundary_ratios(n_boundaries)
+        local_flat = shared_to_local_flat(channel_model, shared, np.clip(b, 0.0, 1.0))
+        pred = predict_ordered_piecewise(
+            np.asarray(x_data, dtype=float).reshape(-1),
+            segments,
+            local_flat,
+            prefer_jit=True,
+        )
+        return np.asarray(pred["y_hat"], dtype=float)
+
+    def evaluate_all_channels(self, x_data, param_values):
+        """Evaluate all channel models and return {target_col: y_hat} dict."""
+        multi_model = getattr(self, "_multi_channel_model", None)
+        if multi_model is None or not multi_model.is_multi_channel:
+            # Single-channel fallback.
+            primary_hat = self.evaluate_model_map(x_data, param_values)
+            return {self.y_channel: primary_hat}
+        results = {}
+        for ch_model in multi_model.channel_models:
+            try:
+                y_hat = self.evaluate_channel_model(ch_model, x_data, param_values)
+                results[ch_model.target_col] = y_hat
+            except Exception:
+                pass
+        return results
+
     def evaluate_model(self, x_data, params, channel_data=None, boundary_ratios=None):
         """Evaluate active piecewise model from ordered list or key-value map."""
         ordered_keys = self._ordered_param_keys()
@@ -2224,7 +3044,9 @@ class ManualFitGUI(QMainWindow):
         values = x_min + span * positions
         return {f"break{idx + 1}": float(val) for idx, val in enumerate(values)}
 
-    def _piecewise_boundary_conditions(self, segment_count, include_break_values=False):
+    def _piecewise_boundary_conditions(
+        self, segment_count, include_break_values=False, target=None
+    ):
         n_segments = int(max(0, segment_count))
         if n_segments <= 0:
             return []
@@ -2234,6 +3056,7 @@ class ManualFitGUI(QMainWindow):
         value_map = (
             self._breakpoint_value_map(n_boundaries) if include_break_values else {}
         )
+        name_map = getattr(self, "_boundary_name_map", {})
 
         def break_display_name(name):
             text = str(name)
@@ -2244,6 +3067,12 @@ class ManualFitGUI(QMainWindow):
                 index = int(match.group(1)) - 1
             except Exception:
                 index = 0
+            # Use assigned name from _boundary_name_map if target is given.
+            if target is not None:
+                bid = (target, max(0, index))
+                assigned = name_map.get(bid)
+                if assigned:
+                    return str(assigned)
             return format_boundary_display_name(max(0, index))
 
         def break_token(name):
@@ -2285,6 +3114,74 @@ class ManualFitGUI(QMainWindow):
             else:
                 out.append("⎪")
         return out
+
+    def _build_multi_channel_formula_html(self, channel_equations):
+        """Build a single unified table for all channels so domain columns align."""
+        symbol_map = self._parameter_symbol_map()
+        brace_cell_style = (
+            "padding:0 4px 1px 2px; font-family:serif; font-size:18px; "
+            "font-weight:700; line-height:1.0; color:#111827;"
+        )
+        pipe_cell_style = (
+            "padding:0 4px 1px 8px; font-family:serif; font-size:18px; "
+            "font-weight:700; line-height:1.0; color:#111827;"
+        )
+        all_rows = []
+        for ch_idx, (ch_target, ch_seg_exprs) in enumerate(channel_equations):
+            conditions = self._piecewise_boundary_conditions(
+                len(ch_seg_exprs), target=ch_target
+            )
+            brace_rows = self._piecewise_left_brace_rows(len(ch_seg_exprs))
+            n_segs = len(ch_seg_exprs)
+            # Add a small gap row between channels.
+            if ch_idx > 0:
+                all_rows.append(
+                    "<tr><td colspan='5' style='padding:4px 0 0 0;'></td></tr>"
+                )
+            for seg_i, (expr_text, cond_text) in enumerate(
+                zip(ch_seg_exprs, conditions)
+            ):
+                pretty_expr = format_expression_pretty(expr_text, name_map=symbol_map)
+                colored_expr = self._colorize_formula_text_html(
+                    pretty_expr,
+                    target_col=ch_target,
+                    rhs_expression=expr_text,
+                )
+                # First row of each channel shows the "target(x) =" label.
+                if seg_i == 0:
+                    label_cell = (
+                        f"<td rowspan='{n_segs}' style='font-family:serif; font-size:15px; "
+                        f"color:#111827; white-space:nowrap; vertical-align:middle; "
+                        f"padding:0 2px 0 0;'>{html.escape(str(ch_target))}(x) =</td>"
+                    )
+                    brace_inner = "".join(
+                        f"<tr><td style='{brace_cell_style}'>{html.escape(str(b))}</td></tr>"
+                        for b in brace_rows
+                    )
+                    brace_cell = (
+                        f"<td rowspan='{n_segs}' style='vertical-align:middle;'>"
+                        f"<table style='border-collapse:collapse;'>{brace_inner}</table></td>"
+                    )
+                else:
+                    label_cell = ""
+                    brace_cell = ""
+
+                all_rows.append(
+                    f"<tr>"
+                    f"{label_cell}"
+                    f"{brace_cell}"
+                    f"<td style='padding:0 0 1px 0;'>{colored_expr}</td>"
+                    f"<td style='{pipe_cell_style}'>|</td>"
+                    f"<td style='padding:0 0 1px 0; color:#334155; white-space:nowrap;'>"
+                    f"{html.escape(str(cond_text))}</td>"
+                    f"</tr>"
+                )
+        rows_html = "".join(all_rows)
+        return (
+            "<table style='margin:0 auto; border-collapse:collapse;'>"
+            f"{rows_html}"
+            "</table>"
+        )
 
     def _build_piecewise_formula_html(self, target_col, segment_exprs):
         symbol_map = self._parameter_symbol_map()
@@ -2342,6 +3239,41 @@ class ManualFitGUI(QMainWindow):
 
     def _set_formula_label(self):
         """Populate the formula label from the active expression."""
+        # Multi-channel: show stacked formula tables for each channel.
+        multi = getattr(self, "_multi_channel_model", None)
+        if multi is not None and multi.is_multi_channel:
+            try:
+                channel_equations = self._parse_multi_equation_text(
+                    self.current_expression,
+                    strict=False,
+                )
+            except Exception:
+                channel_equations = []
+            if channel_equations:
+                combined_html = self._build_multi_channel_formula_html(
+                    channel_equations
+                )
+                tooltip_parts = []
+                for ch_target, ch_seg_exprs in channel_equations:
+                    boundary_help = "\n".join(
+                        f"  Segment {idx}: {cond}"
+                        for idx, cond in enumerate(
+                            self._piecewise_boundary_conditions(
+                                len(ch_seg_exprs), target=ch_target
+                            ),
+                            start=1,
+                        )
+                    )
+                    tooltip_parts.append(
+                        f"{ch_target} = {' ; '.join(ch_seg_exprs)}\n{boundary_help}"
+                    )
+                self.formula_label.setTextFormat(Qt.TextFormat.RichText)
+                self.formula_label.setText(combined_html)
+                self.formula_label.setToolTip(
+                    "\n\n".join(tooltip_parts) + "\n\nClick equation to edit."
+                )
+                return
+
         target_col = None
         rhs_expression = None
         segment_exprs = None
@@ -2678,11 +3610,6 @@ class ManualFitGUI(QMainWindow):
             current_index_changed=self._on_x_channel_changed
         )
         channel_layout.addWidget(self.x_channel_combo, 1)
-        channel_layout.addWidget(self._make_param_header_label("Y", width=20))
-        self.y_channel_combo = self._new_combobox(
-            current_index_changed=self._on_y_channel_changed
-        )
-        channel_layout.addWidget(self.y_channel_combo, 1)
         source_file_layout.addLayout(channel_layout)
 
         fit_widget = QWidget()
@@ -2747,6 +3674,14 @@ class ManualFitGUI(QMainWindow):
         fit_actions_row.addWidget(self.reset_from_batch_btn)
         fit_actions_row.addStretch(1)
         fit_group_layout.addLayout(fit_actions_row)
+
+        # --- Per-equation fit toggles and R² display ---
+        self.equation_toggles_widget = QWidget()
+        self.equation_toggles_layout = QVBoxLayout(self.equation_toggles_widget)
+        self.equation_toggles_layout.setContentsMargins(0, 0, 0, 0)
+        self.equation_toggles_layout.setSpacing(2)
+        fit_group_layout.addWidget(self.equation_toggles_widget)
+        self._rebuild_equation_toggles()
 
         fit_view_row = QHBoxLayout()
         fit_view_row.setSpacing(4)
@@ -2918,7 +3853,8 @@ class ManualFitGUI(QMainWindow):
             return ""
         raw = self.function_input.toPlainText()
         lines = [line.strip() for line in raw.splitlines() if line.strip()]
-        return " ".join(lines).strip()
+        # Preserve newlines between lines to support multi-channel equations.
+        return "\n".join(lines).strip()
 
     def _set_expression_editor_text(self, text):
         if not hasattr(self, "function_input"):
@@ -2972,6 +3908,39 @@ class ManualFitGUI(QMainWindow):
             raise ValueError("Each segment expression must be non-empty.")
         return target_col, segments
 
+    def _parse_multi_equation_text(self, text, strict=False):
+        """Parse multi-line expression text into a list of (target_col, segments) tuples.
+
+        Each line is a separate channel equation: ``TARGET = seg1 ; seg2``.
+        If only a single line is present, falls back to single-channel behaviour.
+        Returns a list of ``(target_col, [seg1, seg2, ...])`` tuples.
+        """
+        raw = str(text).strip()
+        if not raw:
+            raise ValueError("Expression is empty.")
+
+        # Split on newlines (each line is a separate channel equation).
+        lines = [line.strip() for line in raw.splitlines() if line.strip()]
+        if len(lines) == 0:
+            raise ValueError("Expression is empty.")
+
+        equations = []
+        seen_targets = set()
+        for line_num, line in enumerate(lines, start=1):
+            try:
+                target_col, segments = self._parse_equation_text(line, strict=strict)
+            except ValueError as exc:
+                if len(lines) > 1:
+                    raise ValueError(f"Line {line_num}: {exc}") from exc
+                raise
+            if target_col in seen_targets:
+                raise ValueError(
+                    f"Line {line_num}: duplicate target channel '{target_col}'."
+                )
+            seen_targets.add(target_col)
+            equations.append((target_col, segments))
+        return equations
+
     def _on_expression_text_changed(self):
         self._refresh_expression_highlighting()
 
@@ -3022,17 +3991,18 @@ class ManualFitGUI(QMainWindow):
             params = []
             if expression_text:
                 try:
-                    _target, seg_exprs = self._parse_equation_text(
+                    channel_equations = self._parse_multi_equation_text(
                         expression_text,
                         strict=False,
                     )
                     seen = set()
-                    for seg_expr in seg_exprs:
-                        seg_params = extract_segment_parameter_names(seg_expr)
-                        for name in seg_params:
-                            if name not in seen:
-                                seen.add(name)
-                                params.append(name)
+                    for _target, seg_exprs in channel_equations:
+                        for seg_expr in seg_exprs:
+                            seg_params = extract_segment_parameter_names(seg_expr)
+                            for name in seg_params:
+                                if name not in seen:
+                                    seen.add(name)
+                                    params.append(name)
                 except Exception:
                     params = []
             self.expression_highlighter.set_context(columns, params)
@@ -3081,9 +4051,12 @@ class ManualFitGUI(QMainWindow):
             current_values = self.get_current_param_map()
 
             try:
-                target_col, segment_exprs = self._parse_equation_text(
+                channel_equations = self._parse_multi_equation_text(
                     expression_text, strict=True
                 )
+                # Primary target is the first channel equation.
+                target_col = channel_equations[0][0]
+                segment_exprs = channel_equations[0][1]
                 self.y_channel = target_col
                 if self.x_channel == self.y_channel:
                     available = [
@@ -3099,7 +4072,14 @@ class ManualFitGUI(QMainWindow):
                     segment_exprs=segment_exprs,
                     channel_names=self._available_channel_names(),
                 )
-                param_names = list(model_def.global_param_names)
+                # Build multi-channel model wrapping all channel equations.
+                links = self._boundary_links_from_map()
+                multi_model = build_multi_channel_model_definition(
+                    channel_equations,
+                    channel_names=self._available_channel_names(),
+                    boundary_links=links,
+                )
+                param_names = list(multi_model.global_param_names)
                 new_specs = []
                 new_defaults = []
                 for key in param_names:
@@ -3142,16 +4122,127 @@ class ManualFitGUI(QMainWindow):
 
             self.param_specs = new_specs
             self.defaults = new_defaults
-            self.current_expression = f"{target_col} = {' ; '.join(segment_exprs)}"
+            # Store expression as multi-line text for multi-channel.
+            self.current_expression = "\n".join(
+                f"{tc} = {' ; '.join(segs)}" for tc, segs in channel_equations
+            )
             self._set_expression_editor_text(self.current_expression)
             self._piecewise_model = model_def
+            self._multi_channel_model = multi_model
+            # Prune manually fixed params that no longer exist.
+            valid_keys = set(multi_model.global_param_names)
+            self._manually_fixed_params = (
+                getattr(self, "_manually_fixed_params", set()) & valid_keys
+            )
+            # Prune procedure steps for removed params/channels.
+            self._proc_prune_invalid_params()
+            # Prune boundary name map for IDs that no longer exist.
+            valid_bids = set(multi_model.all_boundary_ids)
+            # Capture old boundary ratios before they get overwritten below.
+            _old_primary_ratios = getattr(self, "current_boundary_ratios", None)
+            if _old_primary_ratios is not None:
+                _old_primary_ratios = np.asarray(
+                    _old_primary_ratios, dtype=float
+                ).copy()
+            self._boundary_name_map = {
+                bid: name
+                for bid, name in getattr(self, "_boundary_name_map", {}).items()
+                if bid in valid_bids
+            }
+            self._ensure_boundary_names()
+
+            # Rebuild multi-channel model with links derived from boundary names.
+            # _ensure_boundary_names assigns default names (X₀, X₁, ...) so
+            # boundaries at the same index across channels share a name and
+            # become linked.  The model built earlier may lack these links.
+            updated_links = self._boundary_links_from_map()
+            if updated_links != tuple(multi_model.boundary_links):
+                try:
+                    multi_model = build_multi_channel_model_definition(
+                        channel_equations,
+                        channel_names=self._available_channel_names(),
+                        boundary_links=updated_links,
+                    )
+                    self._multi_channel_model = multi_model
+                except Exception:
+                    pass
+
             self.current_boundary_ratios = default_boundary_ratios(
                 max(0, len(model_def.segment_exprs) - 1)
             )
+            # Per-channel boundary ratios – preserve existing if boundary count unchanged.
+            # Also seed from current_boundary_ratios for the primary channel when
+            # transitioning from single-channel to multi-channel (since single-
+            # channel mode only stores ratios in self.current_boundary_ratios).
+            old_per_channel = dict(getattr(self, "_boundary_ratios_per_channel", {}))
+            primary_target = channel_equations[0][0]
+            if (
+                primary_target not in old_per_channel
+                and _old_primary_ratios is not None
+            ):
+                old_arr = np.asarray(_old_primary_ratios, dtype=float).reshape(-1)
+                if old_arr.size > 0:
+                    old_per_channel[primary_target] = old_arr
+
+            new_per_channel = {}
+            for ch_model in multi_model.channel_models:
+                n_b = max(0, len(ch_model.segment_exprs) - 1)
+                old_ratios = old_per_channel.get(ch_model.target_col)
+                if old_ratios is not None and len(old_ratios) == n_b:
+                    new_per_channel[ch_model.target_col] = list(old_ratios)
+                else:
+                    new_per_channel[ch_model.target_col] = list(
+                        default_boundary_ratios(n_b)
+                    )
+
+            # Synchronize linked boundaries so they share the same ratio value.
+            # Use the first existing channel's value as the reference for each
+            # link group, so new channels inherit the boundary positions from
+            # existing ones rather than resetting to defaults.
+            for group in updated_links or []:
+                ref_value = None
+                for gt, gi in group:
+                    ch_ratios = new_per_channel.get(gt)
+                    if ch_ratios is not None and gi < len(ch_ratios):
+                        # Prefer a value from a channel that existed before.
+                        if gt in old_per_channel:
+                            ref_value = float(ch_ratios[gi])
+                            break
+                if ref_value is None:
+                    # Fall back to first available value in the group.
+                    for gt, gi in group:
+                        ch_ratios = new_per_channel.get(gt)
+                        if ch_ratios is not None and gi < len(ch_ratios):
+                            ref_value = float(ch_ratios[gi])
+                            break
+                if ref_value is not None:
+                    for gt, gi in group:
+                        ch_ratios = new_per_channel.get(gt)
+                        if ch_ratios is not None and gi < len(ch_ratios):
+                            ch_ratios[gi] = ref_value
+
+            self._boundary_ratios_per_channel = new_per_channel
+            # Update primary channel ratios from the new per-channel map.
+            primary_n = max(0, len(model_def.segment_exprs) - 1)
+            self.current_boundary_ratios = np.asarray(
+                new_per_channel.get(primary_target, default_boundary_ratios(primary_n)),
+                dtype=float,
+            )
             self.last_popt = None
             self._last_r2 = None
+            self._last_per_channel_r2 = {}
             self._last_fit_active_keys = []
+            # Sync per-equation enable state: default new channels to True.
+            multi_targets = list(multi_model.target_channels)
+            for t in multi_targets:
+                if t not in self._fit_channel_enabled:
+                    self._fit_channel_enabled[t] = True
+            # Remove stale entries.
+            self._fit_channel_enabled = {
+                t: v for t, v in self._fit_channel_enabled.items() if t in multi_targets
+            }
             self.rebuild_manual_param_controls()
+            self._rebuild_equation_toggles()
             self._refresh_channel_combos()
             self._set_formula_label()
             self._set_function_status("", is_error=False)
@@ -3209,9 +4300,12 @@ class ManualFitGUI(QMainWindow):
         lock_status_label.hide()
         layout.addWidget(lock_status_label, 1)
 
+        _bound_range = 1e12
         min_box = self._new_compact_param_spinbox(
             spec,
             spec.min_value,
+            minimum=-_bound_range,
+            maximum=_bound_range,
             width=self._param_bound_width,
             object_name="paramBoundBox",
             tooltip="Lower bound",
@@ -3232,6 +4326,8 @@ class ManualFitGUI(QMainWindow):
         max_box = self._new_compact_param_spinbox(
             spec,
             spec.max_value,
+            minimum=-_bound_range,
+            maximum=_bound_range,
             width=self._param_bound_width,
             object_name="paramBoundBox",
             tooltip="Upper bound",
@@ -3258,6 +4354,17 @@ class ManualFitGUI(QMainWindow):
         )
         value_box.valueChanged.connect(lambda: self._autosave_fit_details())
         layout.addWidget(value_box)
+
+        fix_checkbox = QCheckBox()
+        fix_checkbox.setToolTip(
+            "Fix this parameter at its current value during fitting"
+        )
+        fix_checkbox.setFixedWidth(20)
+        fix_checkbox.setChecked(key in getattr(self, "_manually_fixed_params", set()))
+        fix_checkbox.toggled.connect(
+            lambda checked, name=key: self._on_param_fix_toggled(name, checked)
+        )
+        layout.addWidget(fix_checkbox)
 
         tail_spacer = QWidget()
         tail_spacer.setFixedWidth(max(0, int(self._param_tail_placeholder_width)))
@@ -3296,6 +4403,7 @@ class ManualFitGUI(QMainWindow):
             max_box,
             lock_status_label,
             tail_spacer,
+            fix_checkbox,
         )
 
     def _sync_param_row_tail_spacers(self):
@@ -3330,6 +4438,7 @@ class ManualFitGUI(QMainWindow):
         self.param_lock_status_labels.clear()
         self.param_tail_spacers_by_key.clear()
         self.param_row_tail_spacers.clear()
+        self.param_fix_checkboxes.clear()
 
         spec_by_key = {spec.key: spec for spec in self.param_specs}
         default_by_key = {
@@ -3341,28 +4450,41 @@ class ManualFitGUI(QMainWindow):
             kind = str(section.get("kind"))
             keys = [str(key) for key in (section.get("keys") or [])]
 
-            if kind == "segment":
+            if kind == "channel_header":
+                target = str(section.get("target", ""))
+                self.param_controls_layout.addWidget(
+                    self._build_param_section_header(
+                        f"Channel: {target}",
+                        tooltip=f"Parameters for {target} equation",
+                    )
+                )
+            elif kind == "segment":
                 seg_idx = int(section.get("index", 0))
+                target = section.get("target")
                 tooltip = ""
-                model_def = self._piecewise_model
-                if model_def is not None and 1 <= seg_idx <= len(
-                    model_def.segment_exprs
-                ):
-                    tooltip = str(model_def.segment_exprs[seg_idx - 1])
+                # Resolve tooltip from the correct channel model.
+                if target is not None:
+                    multi_model = getattr(self, "_multi_channel_model", None)
+                    if multi_model is not None:
+                        for ch_m in multi_model.channel_models:
+                            if ch_m.target_col == target and 1 <= seg_idx <= len(
+                                ch_m.segment_exprs
+                            ):
+                                tooltip = str(ch_m.segment_exprs[seg_idx - 1])
+                                break
+                else:
+                    model_def = self._piecewise_model
+                    if model_def is not None and 1 <= seg_idx <= len(
+                        model_def.segment_exprs
+                    ):
+                        tooltip = str(model_def.segment_exprs[seg_idx - 1])
                 self.param_controls_layout.addWidget(
                     self._build_param_section_header(
                         f"Segment {seg_idx}",
                         tooltip=tooltip,
                     )
                 )
-                if not keys:
-                    self.param_controls_layout.addWidget(
-                        self._new_label(
-                            "Shared parameters are listed in earlier segments.",
-                            object_name="statusLabel",
-                            style_sheet="color: #64748b; font-style: italic;",
-                        )
-                    )
+
             elif kind == "boundary":
                 self.param_controls_layout.addWidget(
                     self._build_param_boundary_marker(section.get("index", 0))
@@ -3385,6 +4507,7 @@ class ManualFitGUI(QMainWindow):
                     max_box,
                     lock_status_label,
                     tail_spacer,
+                    fix_checkbox,
                 ) = self.create_param_control(spec, default_val)
                 self.param_spinboxes[spec.key] = spinbox
                 self.param_sliders[spec.key] = slider
@@ -3393,6 +4516,7 @@ class ManualFitGUI(QMainWindow):
                 self.param_lock_status_labels[spec.key] = lock_status_label
                 self.param_tail_spacers_by_key[spec.key] = tail_spacer
                 self.param_row_tail_spacers.append(tail_spacer)
+                self.param_fix_checkboxes[spec.key] = fix_checkbox
                 self.param_controls_layout.addLayout(control_layout)
                 self._sync_slider_from_spinbox(spec.key)
 
@@ -3583,15 +4707,6 @@ class ManualFitGUI(QMainWindow):
                 if x_idx >= 0:
                     self.x_channel_combo.setCurrentIndex(x_idx)
                 self.x_channel_combo.blockSignals(False)
-            if hasattr(self, "y_channel_combo"):
-                self.y_channel_combo.blockSignals(True)
-                self.y_channel_combo.clear()
-                for col in channel_columns:
-                    self.y_channel_combo.addItem(col, col)
-                y_idx = self.y_channel_combo.findData(self.y_channel)
-                if y_idx >= 0:
-                    self.y_channel_combo.setCurrentIndex(y_idx)
-                self.y_channel_combo.blockSignals(False)
             self._sync_breakpoint_sliders_from_state()
             self._rebuild_channel_token_buttons()
         finally:
@@ -3611,34 +4726,6 @@ class ManualFitGUI(QMainWindow):
                 if col != self.x_channel:
                     self.y_channel = col
                     break
-        self._sync_breakpoint_sliders_from_state()
-        self.update_plot(fast=False, preserve_view=False)
-
-    def _on_y_channel_changed(self, _index):
-        if self._channel_sync_in_progress:
-            return
-        if not hasattr(self, "y_channel_combo"):
-            return
-        data = self.y_channel_combo.currentData()
-        if not data:
-            return
-        self.y_channel = str(data)
-        if self.x_channel == self.y_channel and self.current_data is not None:
-            for col in self._available_channel_names():
-                if col != self.y_channel:
-                    self.x_channel = col
-                    break
-        try:
-            _old_target, seg_exprs = self._parse_equation_text(
-                self._expression_editor_text(),
-                strict=False,
-            )
-            normalized = f"{self.y_channel} = {' ; '.join(seg_exprs)}"
-            self.current_expression = normalized
-            self._set_expression_editor_text(normalized)
-            self._set_formula_label()
-        except Exception:
-            pass
         self._sync_breakpoint_sliders_from_state()
         self.update_plot(fast=False, preserve_view=False)
 
@@ -3941,6 +5028,661 @@ class ManualFitGUI(QMainWindow):
 
         group.setLayout(layout)
         parent_layout.addWidget(group)
+
+    # ── Procedure tab ───────────────────────────────────────────────
+
+    def create_procedure_frame(self, parent_layout):
+        """Build the Procedures tab UI for multi-step fitting."""
+        # --- Header row: name + action buttons ---
+        header = QHBoxLayout()
+        header.setSpacing(6)
+        header.addWidget(
+            self._new_label(
+                "Procedure name:",
+                object_name="paramHeader",
+            )
+        )
+        self._proc_name_edit = QLineEdit(self._procedure_name)
+        self._proc_name_edit.setMaximumWidth(260)
+        self._proc_name_edit.setPlaceholderText("Procedure")
+        self._proc_name_edit.textChanged.connect(self._on_proc_name_changed)
+        header.addWidget(self._proc_name_edit)
+        header.addStretch()
+
+        self._proc_add_btn = self._new_button(
+            "+ Add Step",
+            handler=self._proc_add_step,
+            primary=True,
+        )
+        header.addWidget(self._proc_add_btn)
+        parent_layout.addLayout(header)
+
+        # --- Step list scroll area ---
+        self._proc_step_scroll = QScrollArea()
+        self._proc_step_scroll.setWidgetResizable(True)
+        self._proc_step_scroll.setMinimumHeight(200)
+        self._proc_step_scroll.setStyleSheet(
+            "QScrollArea { border: 1px solid #e3e8ef; border-radius: 8px; background: #f8fafc; }"
+        )
+        self._proc_step_container = QWidget()
+        self._proc_step_container.setStyleSheet("background: transparent;")
+        self._proc_step_layout = QVBoxLayout(self._proc_step_container)
+        self._proc_step_layout.setContentsMargins(6, 6, 6, 6)
+        self._proc_step_layout.setSpacing(8)
+        self._proc_step_layout.addStretch()
+        self._proc_step_scroll.setWidget(self._proc_step_container)
+        parent_layout.addWidget(self._proc_step_scroll, 1)
+
+        # --- Run / Cancel ---
+        run_row = QHBoxLayout()
+        run_row.setSpacing(6)
+        self._proc_run_btn = self._new_button(
+            "▶  Run Procedure",
+            handler=self._run_procedure,
+            primary=True,
+        )
+        run_row.addWidget(self._proc_run_btn)
+        self._proc_cancel_btn = self._new_button(
+            "Cancel",
+            handler=self._cancel_procedure,
+            enabled=False,
+        )
+        run_row.addWidget(self._proc_cancel_btn)
+        run_row.addStretch()
+        parent_layout.addLayout(run_row)
+
+        # --- Status ---
+        self._proc_status_label = self._new_label(
+            "",
+            object_name="statusLabel",
+        )
+        parent_layout.addWidget(self._proc_status_label)
+
+        # Populate from current _procedure_steps.
+        self._proc_rebuild_step_cards()
+
+    def _on_proc_name_changed(self, text):
+        self._procedure_name = str(text).strip() or "Procedure"
+        self._autosave_fit_details()
+
+    def _proc_available_params(self):
+        """Return list of currently available parameter keys."""
+        multi = getattr(self, "_multi_channel_model", None)
+        if multi is not None:
+            return list(multi.global_param_names)
+        model = getattr(self, "_piecewise_model", None)
+        if model is not None:
+            return list(model.global_param_names)
+        return [spec.key for spec in self.param_specs]
+
+    def _proc_available_channels(self):
+        """Return list of currently available target channels."""
+        multi = getattr(self, "_multi_channel_model", None)
+        if multi is not None:
+            return list(multi.target_channels)
+        model = getattr(self, "_piecewise_model", None)
+        if model is not None:
+            return [model.target_col]
+        return [self.y_channel]
+
+    def _proc_rebuild_step_cards(self):
+        """Rebuild step card widgets from self._procedure_steps."""
+        layout = self._proc_step_layout
+        # Clear everything (cards + stretch), then rebuild.
+        while layout.count():
+            item = layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+
+        for idx, step in enumerate(self._procedure_steps):
+            card = self._proc_make_step_card(idx, step)
+            layout.addWidget(card)
+        layout.addStretch()
+
+    def _proc_make_step_card(self, idx, step):
+        """Create a styled card widget for a single procedure step."""
+        all_params = self._proc_available_params()
+        all_channels = self._proc_available_channels()
+        capture_keys = self._available_capture_keys()
+        bound_map = dict(step.bound_params)  # param_key -> field_name
+
+        card = QGroupBox()
+        card.setObjectName("procStepCard")
+        card.setStyleSheet(
+            """
+            QGroupBox#procStepCard {
+                background: #ffffff;
+                border: 1px solid #d3dae3;
+                border-radius: 10px;
+                padding: 10px 10px 8px 10px;
+                margin: 0px;
+            }
+            QGroupBox#procStepCard QCheckBox {
+                spacing: 4px;
+            }
+            QGroupBox#procStepCard QCheckBox::indicator {
+                width: 14px;
+                height: 14px;
+                border: 2px solid #9ca3af;
+                border-radius: 3px;
+                background: #ffffff;
+            }
+            QGroupBox#procStepCard QCheckBox::indicator:checked {
+                background: #2563eb;
+                border-color: #2563eb;
+            }
+            QGroupBox#procStepCard QCheckBox::indicator:hover {
+                border-color: #6b7280;
+            }
+            """
+        )
+        vlayout = QVBoxLayout()
+        vlayout.setContentsMargins(8, 6, 8, 6)
+        vlayout.setSpacing(6)
+
+        # ── Title row: step number, label edit, reorder / remove ──
+        title_row = QHBoxLayout()
+        title_row.setSpacing(6)
+        step_number_label = self._new_label(
+            f"<b style='color:#2563eb;'>Step {idx + 1}</b>",
+            object_name="statusLabel",
+        )
+        step_number_label.setTextFormat(Qt.TextFormat.RichText)
+        title_row.addWidget(step_number_label)
+        label_edit = QLineEdit(step.label)
+        label_edit.setPlaceholderText(f"Step {idx + 1}")
+        label_edit.setMaximumWidth(200)
+        label_edit.setProperty("_proc_step_idx", idx)
+        label_edit.textChanged.connect(self._proc_on_step_label_changed)
+        title_row.addWidget(label_edit)
+        title_row.addStretch()
+
+        for icon_text, delta in [("▲", -1), ("▼", 1)]:
+            btn = self._new_button(
+                icon_text,
+                handler=lambda checked, i=idx, d=delta: self._proc_move_step(i, d),
+                fixed_width=26,
+                tooltip="Move step",
+            )
+            title_row.addWidget(btn)
+        remove_btn = self._new_button(
+            "✕",
+            handler=lambda checked, i=idx: self._proc_remove_step(i),
+            fixed_width=26,
+            tooltip="Remove step",
+            style_sheet="QPushButton { color: #dc2626; } QPushButton:hover { background: #fee2e2; }",
+        )
+        title_row.addWidget(remove_btn)
+        vlayout.addLayout(title_row)
+
+        # ── Separator ──
+        sep = QWidget()
+        sep.setFixedHeight(1)
+        sep.setStyleSheet("background: #e5e7eb;")
+        vlayout.addWidget(sep)
+
+        # ── Channels (only shown for multi-channel) ──
+        if len(all_channels) > 1:
+            ch_row = QHBoxLayout()
+            ch_row.setSpacing(6)
+            ch_row.addWidget(
+                self._new_label(
+                    "Channels:",
+                    object_name="paramHeader",
+                )
+            )
+            for ch in all_channels:
+                cb = QCheckBox(ch)
+                cb.setChecked(ch in step.channels or len(step.channels) == 0)
+                cb.setProperty("_proc_step_idx", idx)
+                cb.setProperty("_proc_channel", ch)
+                cb.stateChanged.connect(self._proc_on_channel_toggled)
+                ch_row.addWidget(cb)
+            ch_row.addStretch()
+            vlayout.addLayout(ch_row)
+
+        # ── Parameters grid: Free | Symbol | Bound to field ──
+        param_grid = QGridLayout()
+        param_grid.setSpacing(4)
+        param_grid.setContentsMargins(0, 2, 0, 2)
+        param_grid.setColumnStretch(0, 0)  # Free checkbox — fixed
+        param_grid.setColumnStretch(1, 0)  # Parameter label — fixed
+        param_grid.setColumnStretch(2, 0)  # Bound combo — fixed
+        param_grid.setColumnStretch(3, 1)  # Blank spacer eats leftover width
+
+        # Column headers
+        for col, (text, width) in enumerate(
+            [
+                ("Free", 36),
+                ("Parameter", 120),
+                ("Bound to field", 140),
+            ]
+        ):
+            hdr = self._new_label(text, object_name="paramHeader")
+            if width:
+                hdr.setMinimumWidth(width)
+            param_grid.addWidget(hdr, 0, col)
+
+        free_set = set(step.free_params)
+        for row, p in enumerate(all_params, start=1):
+            # Free checkbox
+            free_cb = QCheckBox()
+            free_cb.setChecked(p in free_set or len(free_set) == 0)
+            free_cb.setToolTip(f"Allow {p} to vary in this step")
+            free_cb.setProperty("_proc_step_idx", idx)
+            free_cb.setProperty("_proc_param", p)
+            free_cb.setProperty("_proc_role", "free")
+            free_cb.stateChanged.connect(self._proc_on_param_toggled)
+            param_grid.addWidget(free_cb, row, 0, Qt.AlignmentFlag.AlignCenter)
+
+            # Rich-text parameter label
+            symbol_html = self._display_symbol_for_param_html(p)
+            plabel = QLabel(symbol_html)
+            plabel.setTextFormat(Qt.TextFormat.RichText)
+            plabel.setObjectName("paramInline")
+            plabel.setToolTip(p)
+            param_grid.addWidget(plabel, row, 1)
+
+            # Bound-to-field combo
+            combo = self._new_combobox(minimum_width=130, rich_text=True)
+            if isinstance(combo, RichTextComboBox):
+                combo.add_rich_item("(none)", "", "(none)")
+                for ck in capture_keys:
+                    combo.add_rich_item(ck, ck, ck)
+            else:
+                combo.addItem("(none)", "")
+                for ck in capture_keys:
+                    combo.addItem(ck, ck)
+            current_field = bound_map.get(p, "")
+            target_idx = combo.findData(current_field)
+            if target_idx < 0:
+                target_idx = 0
+            combo.setCurrentIndex(target_idx)
+            combo.setProperty("_proc_step_idx", idx)
+            combo.setProperty("_proc_param", p)
+            combo.currentIndexChanged.connect(self._proc_on_bound_changed)
+            param_grid.addWidget(combo, row, 2)
+
+        param_wrapper = QHBoxLayout()
+        param_wrapper.setContentsMargins(0, 0, 0, 0)
+        param_wrapper.addLayout(param_grid)
+        param_wrapper.addStretch()
+        vlayout.addLayout(param_wrapper)
+
+        # ── R² threshold ──
+        r2_row = QHBoxLayout()
+        r2_row.setSpacing(6)
+        r2_label = QLabel("Min R²:")
+        r2_label.setObjectName("paramHeader")
+        r2_row.addWidget(r2_label)
+        r2_spin = QDoubleSpinBox()
+        r2_spin.setRange(-1.0, 1.0)
+        r2_spin.setDecimals(4)
+        r2_spin.setSingleStep(0.01)
+        r2_spin.setSpecialValueText("(always continue)")
+        r2_spin.setValue(step.min_r2 if step.min_r2 is not None else -1.0)
+        r2_spin.setMaximumWidth(130)
+        r2_spin.setProperty("_proc_step_idx", idx)
+        r2_spin.valueChanged.connect(self._proc_on_r2_changed)
+        r2_row.addWidget(r2_spin)
+        r2_row.addStretch()
+        vlayout.addLayout(r2_row)
+
+        card.setLayout(vlayout)
+        return card
+
+    # ── Step editing slots ──────────────────────────────────────────
+
+    def _proc_on_step_label_changed(self, text):
+        sender = self.sender()
+        if sender is None:
+            return
+        idx = sender.property("_proc_step_idx")
+        if idx is None or idx < 0 or idx >= len(self._procedure_steps):
+            return
+        old = self._procedure_steps[idx]
+        self._procedure_steps[idx] = FitProcedureStep(
+            channels=old.channels,
+            free_params=old.free_params,
+            fixed_params=old.fixed_params,
+            bound_params=old.bound_params,
+            min_r2=old.min_r2,
+            label=str(text).strip(),
+        )
+        self._autosave_fit_details()
+
+    def _proc_on_channel_toggled(self, _state):
+        sender = self.sender()
+        if sender is None:
+            return
+        idx = sender.property("_proc_step_idx")
+        ch = sender.property("_proc_channel")
+        if idx is None or ch is None or idx >= len(self._procedure_steps):
+            return
+        old = self._procedure_steps[idx]
+        current = (
+            set(old.channels) if old.channels else set(self._proc_available_channels())
+        )
+        if sender.isChecked():
+            current.add(ch)
+        else:
+            current.discard(ch)
+        all_ch = set(self._proc_available_channels())
+        channels = tuple(sorted(current)) if current != all_ch else ()
+        self._procedure_steps[idx] = FitProcedureStep(
+            channels=channels,
+            free_params=old.free_params,
+            fixed_params=old.fixed_params,
+            bound_params=old.bound_params,
+            min_r2=old.min_r2,
+            label=old.label,
+        )
+        self._autosave_fit_details()
+
+    def _proc_on_param_toggled(self, _state):
+        sender = self.sender()
+        if sender is None:
+            return
+        idx = sender.property("_proc_step_idx")
+        param = sender.property("_proc_param")
+        if idx is None or param is None or idx >= len(self._procedure_steps):
+            return
+        old = self._procedure_steps[idx]
+        all_params = set(self._proc_available_params())
+        current_free = set(old.free_params) if old.free_params else set(all_params)
+        if sender.isChecked():
+            current_free.add(param)
+        else:
+            current_free.discard(param)
+        # If all are free, store empty tuple (meaning "all free").
+        free = tuple(sorted(current_free)) if current_free != all_params else ()
+        fixed = tuple(sorted(all_params - current_free))
+        self._procedure_steps[idx] = FitProcedureStep(
+            channels=old.channels,
+            free_params=free,
+            fixed_params=fixed,
+            bound_params=old.bound_params,
+            min_r2=old.min_r2,
+            label=old.label,
+        )
+        self._autosave_fit_details()
+
+    def _proc_on_bound_changed(self, _index):
+        sender = self.sender()
+        if sender is None:
+            return
+        idx = sender.property("_proc_step_idx")
+        param = sender.property("_proc_param")
+        if idx is None or param is None or idx >= len(self._procedure_steps):
+            return
+        old = self._procedure_steps[idx]
+        # Rebuild bound_params tuple.
+        existing = dict(old.bound_params)
+        field = sender.currentData()
+        if field not in (None, ""):
+            existing[str(param)] = str(field)
+        else:
+            existing.pop(str(param), None)
+        new_bound = tuple((k, v) for k, v in existing.items() if v)
+        self._procedure_steps[idx] = FitProcedureStep(
+            channels=old.channels,
+            free_params=old.free_params,
+            fixed_params=old.fixed_params,
+            bound_params=new_bound,
+            min_r2=old.min_r2,
+            label=old.label,
+        )
+        self._autosave_fit_details()
+
+    def _proc_on_r2_changed(self, value):
+        sender = self.sender()
+        if sender is None:
+            return
+        idx = sender.property("_proc_step_idx")
+        if idx is None or idx >= len(self._procedure_steps):
+            return
+        old = self._procedure_steps[idx]
+        r2 = float(value) if value > -1.0 else None
+        self._procedure_steps[idx] = FitProcedureStep(
+            channels=old.channels,
+            free_params=old.free_params,
+            fixed_params=old.fixed_params,
+            bound_params=old.bound_params,
+            min_r2=r2,
+            label=old.label,
+        )
+        self._autosave_fit_details()
+
+    def _proc_add_step(self):
+        """Add a new default step to the procedure."""
+        step = FitProcedureStep(label=f"Step {len(self._procedure_steps) + 1}")
+        self._procedure_steps.append(step)
+        self._proc_rebuild_step_cards()
+        self._autosave_fit_details()
+
+    def _proc_remove_step(self, idx):
+        if idx < 0 or idx >= len(self._procedure_steps):
+            return
+        self._procedure_steps.pop(idx)
+        self._proc_rebuild_step_cards()
+        self._autosave_fit_details()
+
+    def _proc_move_step(self, idx, direction):
+        new_idx = idx + direction
+        if new_idx < 0 or new_idx >= len(self._procedure_steps):
+            return
+        steps = self._procedure_steps
+        steps[idx], steps[new_idx] = steps[new_idx], steps[idx]
+        self._proc_rebuild_step_cards()
+        self._autosave_fit_details()
+
+    # ── Procedure execution ─────────────────────────────────────────
+
+    def _build_procedure(self):
+        """Build a FitProcedure from current UI state."""
+        return FitProcedure(
+            name=self._procedure_name,
+            steps=tuple(self._procedure_steps),
+        )
+
+    def _proc_resolve_bound_values(self):
+        """Resolve bound field names → numeric values from current file captures."""
+        preview = self._capture_preview_values()
+        out: Dict[str, float] = {}
+        for key, raw in preview.items():
+            text = str(raw).strip()
+            if not text:
+                continue
+            try:
+                out[str(key)] = float(text)
+            except (TypeError, ValueError):
+                pass
+        return out
+
+    def _run_procedure(self):
+        """Start running the multi-step procedure on the current file."""
+        if self._procedure_running:
+            self.stats_text.append("Procedure already running.")
+            return
+        if not self._procedure_steps:
+            self.stats_text.append("No procedure steps defined.")
+            return
+        if self.current_data is None:
+            self.stats_text.append("No data loaded.")
+            return
+
+        multi_model = getattr(self, "_multi_channel_model", None)
+        piecewise_model = getattr(self, "_piecewise_model", None)
+        if multi_model is None and piecewise_model is None:
+            self.stats_text.append("No compiled model available.")
+            return
+
+        # Build effective multi_model (wrap single-channel if needed).
+        if multi_model is None:
+            multi_model = MultiChannelModelDefinition(
+                channel_models=(piecewise_model,),
+                global_param_names=piecewise_model.global_param_names,
+            )
+
+        procedure = self._build_procedure()
+
+        # Gather seeds and bounds from UI.
+        try:
+            fit_context = self._build_fit_context(fixed_params={})
+        except Exception as exc:
+            self.stats_text.append(f"Procedure setup error: {exc}")
+            return
+
+        # Gather y-data for all channels.
+        y_data_by_channel = {}
+        x_data = self.current_data[self.x_channel].to_numpy(dtype=float, copy=True)
+        if self.smoothing_enabled:
+            x_data = smooth_channel_array(x_data, self.smoothing_window)
+        for ch_model in multi_model.channel_models:
+            ch_col = ch_model.target_col
+            if ch_col in self.current_data.columns:
+                ch_y = self.current_data[ch_col].to_numpy(dtype=float, copy=True)
+                if self.smoothing_enabled:
+                    ch_y = smooth_channel_array(ch_y, self.smoothing_window)
+                y_data_by_channel[ch_col] = ch_y
+
+        if not y_data_by_channel:
+            self.stats_text.append("No channel data available for procedure.")
+            return
+
+        # Boundary seeds per channel.
+        boundary_seeds = {}
+        ratios_map = getattr(self, "_boundary_ratios_per_channel", {})
+        for ch_model in multi_model.channel_models:
+            ch_col = ch_model.target_col
+            n_b = max(0, len(ch_model.segment_exprs) - 1)
+            if ch_col in ratios_map:
+                boundary_seeds[ch_col] = np.asarray(ratios_map[ch_col], dtype=float)
+            else:
+                boundary_seeds[ch_col] = default_boundary_ratios(n_b)
+
+        # Resolve bound field values from current file captures.
+        bound_values = self._proc_resolve_bound_values()
+
+        worker = ProcedureFitWorker(
+            x_data=x_data,
+            y_data_by_channel=y_data_by_channel,
+            multi_model=multi_model,
+            procedure=procedure,
+            seed_map=fit_context["seed_map"],
+            bounds_map=fit_context["bounds_map"],
+            boundary_seeds=boundary_seeds,
+            bound_values=bound_values,
+        )
+        thread = QThread()
+        worker.moveToThread(thread)
+
+        worker.step_completed.connect(self._on_procedure_step_completed)
+        worker.finished.connect(self._on_procedure_finished)
+        worker.failed.connect(self._on_procedure_failed)
+        worker.cancelled.connect(self._on_procedure_cancelled)
+        thread.started.connect(worker.run)
+
+        self._procedure_worker = worker
+        self._procedure_thread = thread
+        self._procedure_running = True
+        self._proc_run_btn.setEnabled(False)
+        self._proc_cancel_btn.setEnabled(True)
+        self._proc_status_label.setText("Running procedure...")
+
+        thread.start()
+        self.stats_text.append(
+            f"Procedure '{procedure.name}' started ({len(procedure.steps)} steps)."
+        )
+
+    def _cancel_procedure(self):
+        worker = self._procedure_worker
+        if worker is not None:
+            worker.request_cancel()
+        self._proc_status_label.setText("Cancelling...")
+
+    def _on_procedure_step_completed(self, step_idx, step_result):
+        label = step_result.get("label", f"Step {step_idx + 1}")
+        r2 = step_result.get("r2")
+        r2_text = f"R²={r2:.6f}" if r2 is not None else "R²=N/A"
+        self._proc_status_label.setText(f"Completed {label}: {r2_text}")
+        self.stats_text.append(f"  {label}: {r2_text}")
+
+    def _on_procedure_finished(self, result):
+        self._procedure_running = False
+        self._proc_run_btn.setEnabled(True)
+        self._proc_cancel_btn.setEnabled(False)
+        self._cleanup_procedure_thread()
+
+        stopped = result.get("stopped_at_step")
+        if stopped is not None:
+            self._proc_status_label.setText(
+                f"Procedure stopped early at step {stopped + 1} (R² threshold)."
+            )
+            self.stats_text.append(
+                f"Procedure stopped early at step {stopped + 1} (R² below threshold)."
+            )
+        else:
+            r2 = result.get("r2")
+            r2_text = f"R²={r2:.6f}" if r2 is not None else ""
+            self._proc_status_label.setText(f"Procedure complete. {r2_text}")
+            self.stats_text.append(f"Procedure complete. {r2_text}")
+
+        # Apply final parameters to UI.
+        self.on_fit_finished(result)
+
+    def _on_procedure_failed(self, error_msg):
+        self._procedure_running = False
+        self._proc_run_btn.setEnabled(True)
+        self._proc_cancel_btn.setEnabled(False)
+        self._cleanup_procedure_thread()
+        self._proc_status_label.setText(f"Procedure failed: {error_msg}")
+        self.stats_text.append(f"Procedure failed: {error_msg}")
+
+    def _on_procedure_cancelled(self):
+        self._procedure_running = False
+        self._proc_run_btn.setEnabled(True)
+        self._proc_cancel_btn.setEnabled(False)
+        self._cleanup_procedure_thread()
+        self._proc_status_label.setText("Procedure cancelled.")
+        self.stats_text.append("Procedure cancelled.")
+
+    def _cleanup_procedure_thread(self):
+        thread = self._procedure_thread
+        if thread is not None:
+            thread.quit()
+            thread.wait(2000)
+        self._procedure_thread = None
+        self._procedure_worker = None
+
+    def _proc_prune_invalid_params(self):
+        """Remove references to parameters / channels that no longer exist."""
+        valid_params = set(self._proc_available_params())
+        valid_channels = set(self._proc_available_channels())
+        changed = False
+        for idx, step in enumerate(self._procedure_steps):
+            new_free = tuple(p for p in step.free_params if p in valid_params)
+            new_fixed = tuple(p for p in step.fixed_params if p in valid_params)
+            new_channels = tuple(c for c in step.channels if c in valid_channels)
+            new_bound = tuple((k, v) for k, v in step.bound_params if k in valid_params)
+            if (
+                new_free != step.free_params
+                or new_fixed != step.fixed_params
+                or new_channels != step.channels
+                or new_bound != step.bound_params
+            ):
+                self._procedure_steps[idx] = FitProcedureStep(
+                    channels=new_channels,
+                    free_params=new_free,
+                    fixed_params=new_fixed,
+                    bound_params=new_bound,
+                    min_r2=step.min_r2,
+                    label=step.label,
+                )
+                changed = True
+        if changed:
+            self._proc_rebuild_step_cards()
 
     def _batch_row_error_text(self, row):
         pattern_error = str(row.get("pattern_error") or "").strip()
@@ -4632,6 +6374,7 @@ class ManualFitGUI(QMainWindow):
 
     def _serialize_fit_parameter_specs(self):
         serialized = []
+        manually_fixed = getattr(self, "_manually_fixed_params", set())
         for spec in self.param_specs:
             min_box = self.param_min_spinboxes.get(spec.key)
             max_box = self.param_max_spinboxes.get(spec.key)
@@ -4659,6 +6402,7 @@ class ManualFitGUI(QMainWindow):
                     "max_value": float(high),
                     "decimals": int(spec.decimals),
                     "value": float(np.clip(value, low, high)),
+                    "fixed": bool(spec.key in manually_fixed),
                 }
             )
         return serialized
@@ -4669,170 +6413,48 @@ class ManualFitGUI(QMainWindow):
             file_ref = str(row.get("file") or "").strip()
             if not file_ref:
                 continue
-            rows.append(
-                {
-                    "file": file_ref,
-                    "file_stem": stem_for_file_ref(file_ref),
-                    "captures": dict(row.get("captures") or {}),
-                    "params": self._float_list_or_none(row.get("params")),
-                    "r2": finite_float_or_none(row.get("r2")),
-                    "error": (
-                        str(row.get("error"))
-                        if row.get("error") not in (None, "")
-                        else None
-                    ),
-                    "x_channel": str(row.get("x_channel") or ""),
-                    "y_channel": str(row.get("y_channel") or ""),
-                    "boundary_ratios": self._float_list_or_none(
-                        row.get("boundary_ratios")
-                    ),
-                    "boundary_values": self._float_list_or_none(
-                        row.get("boundary_values")
-                    ),
-                    "pattern_error": (
-                        str(row.get("pattern_error"))
-                        if row.get("pattern_error") not in (None, "")
-                        else None
-                    ),
-                }
+            params = self._float_list_or_none(row.get("params"))
+            r2 = finite_float_or_none(row.get("r2"))
+            error = (
+                str(row.get("error")) if row.get("error") not in (None, "") else None
             )
-        return rows
-
-    def _batch_table_export_matrix(self):
-        """Return the same columns/rows used by Export CSV."""
-        param_columns = self._batch_parameter_column_items()
-        columns = (
-            ["File"]
-            + self.batch_capture_keys
-            + ["R2"]
-            + [str(item["key"]) for item in param_columns]
-            + ["Error"]
-        )
-        rows = []
-        for row in list(getattr(self, "batch_results", []) or []):
-            file_name = stem_for_file_ref(row.get("file", ""))
             captures = dict(row.get("captures") or {})
-            params = self._as_float_array(row.get("params"))
-            boundary_values = self._as_float_array(row.get("boundary_values"))
-            r2_val = row.get("r2")
-            error_text = self._batch_row_error_text(row)
-            param_values = []
-            for item in param_columns:
-                idx = int(item["index"])
-                if item["kind"] == "param":
-                    value = float(params[idx]) if params.size > idx else ""
-                else:
-                    value = (
-                        float(boundary_values[idx])
-                        if boundary_values.size > idx
-                        else ""
-                    )
-                if isinstance(value, (float, np.floating)):
-                    param_values.append(f"{float(value):.6f}")
-                else:
-                    param_values.append(value)
-            rows.append(
-                [file_name]
-                + [captures.get(key, "") for key in self.batch_capture_keys]
-                + [f"{r2_val:.6f}" if r2_val is not None else ""]
-                + param_values
-                + [error_text]
-            )
-        return columns, rows
-
-    def _table_export_rows_to_batch_results(self, payload):
-        """Convert exported CSV-style table payload back into batch row objects."""
-        table_payload = dict(payload.get("batch_table_export") or {})
-        columns = [str(col) for col in list(table_payload.get("columns") or [])]
-        rows = list(table_payload.get("rows") or [])
-        if not columns or not rows:
-            return []
-        if "File" not in columns or "R2" not in columns or "Error" not in columns:
-            return []
-        try:
-            file_idx = columns.index("File")
-            r2_idx = columns.index("R2")
-            error_idx = columns.index("Error")
-        except Exception:
-            return []
-
-        capture_keys = columns[file_idx + 1 : r2_idx]
-        param_key_to_item = {
-            str(item["key"]): dict(item)
-            for item in self._batch_parameter_column_items()
-        }
-        param_cols = columns[r2_idx + 1 : error_idx]
-        current_params = list(self.get_current_params())
-        imported = []
-        for row_values in rows:
-            values = list(row_values) if isinstance(row_values, (list, tuple)) else []
-            if len(values) < len(columns):
-                values += [""] * (len(columns) - len(values))
-            file_stem = str(values[file_idx]).strip()
-            if not file_stem:
+            boundary_ratios = self._float_list_or_none(row.get("boundary_ratios"))
+            # Skip rows with no meaningful saved data.
+            if params is None and r2 is None and error is None:
                 continue
-            captures = {
-                str(capture_key): str(values[file_idx + 1 + idx]).strip()
-                for idx, capture_key in enumerate(capture_keys)
+            entry = {
+                "file": file_ref,
+                "file_stem": stem_for_file_ref(file_ref),
             }
-            params_map = {}
-            boundaries_map = {}
-            for idx, col_name in enumerate(param_cols, start=r2_idx + 1):
-                item = param_key_to_item.get(str(col_name))
-                if item is None:
-                    continue
-                numeric = finite_float_or_none(values[idx])
-                if numeric is None:
-                    continue
-                if item.get("kind") == "param":
-                    params_map[int(item["index"])] = float(numeric)
-                else:
-                    boundaries_map[int(item["index"])] = float(numeric)
-
-            param_values = []
-            for i in range(len(self.param_specs)):
-                if i in params_map:
-                    param_values.append(float(params_map[i]))
-                else:
-                    fallback = current_params[i] if i < len(current_params) else 0.0
-                    param_values.append(float(fallback))
-
-            expected_boundaries = max(
-                0,
-                len(self._piecewise_model.segment_exprs) - 1
-                if self._piecewise_model is not None
-                else 0,
-            )
-            boundary_values = []
-            for i in range(expected_boundaries):
-                if i in boundaries_map:
-                    boundary_values.append(float(boundaries_map[i]))
-
-            error_text = (
-                str(values[error_idx]).strip() if error_idx < len(values) else ""
-            )
-            imported.append(
-                {
-                    "file_stem": file_stem,
-                    "captures": captures,
-                    "params": param_values,
-                    "r2": finite_float_or_none(values[r2_idx]),
-                    "error": error_text if error_text else None,
-                    "boundary_values": (
-                        boundary_values
-                        if len(boundary_values) == expected_boundaries
-                        else None
-                    ),
-                }
-            )
-        return imported
+            if captures:
+                entry["captures"] = captures
+            if params is not None:
+                entry["params"] = params
+            if r2 is not None:
+                entry["r2"] = r2
+            if error is not None:
+                entry["error"] = error
+            if boundary_ratios is not None:
+                entry["boundary_ratios"] = boundary_ratios
+            rows.append(entry)
+        return rows
 
     def _collect_fit_details_payload(self):
         ratios = self._float_list_or_none(getattr(self, "current_boundary_ratios", []))
-        table_columns, table_rows = self._batch_table_export_matrix()
+        # Multi-channel boundary ratios (per channel).
+        boundary_ratios_per_channel = {}
+        multi = getattr(self, "_multi_channel_model", None)
+        if multi is not None and multi.is_multi_channel:
+            raw = getattr(self, "_boundary_ratios_per_channel", {})
+            for ch_target, ch_ratios in raw.items():
+                boundary_ratios_per_channel[str(ch_target)] = (
+                    self._float_list_or_none(ch_ratios) or []
+                )
+        batch_rows = self._serialize_fit_batch_rows()
         payload = {
             "format": "manual_fit_gui_details",
-            "version": 1,
+            "version": 3,
             "saved_at_utc": datetime.now(timezone.utc).isoformat(),
             "gui": {
                 "equation": str(getattr(self, "current_expression", "")).strip(),
@@ -4858,13 +6480,19 @@ class ManualFitGUI(QMainWindow):
                     ).items()
                 },
                 "boundary_ratios": ratios if ratios is not None else [],
+                "boundary_ratios_per_channel": boundary_ratios_per_channel,
+                "boundary_name_map": {
+                    f"{t}:{i}": str(name)
+                    for (t, i), name in getattr(self, "_boundary_name_map", {}).items()
+                    if name not in (None, "")
+                },
+                "manually_fixed_params": sorted(
+                    str(k) for k in getattr(self, "_manually_fixed_params", set())
+                ),
+                "procedure": self._build_procedure().serialize(),
             },
             "parameters": self._serialize_fit_parameter_specs(),
-            "batch_results": self._serialize_fit_batch_rows(),
-            "batch_table_export": {
-                "columns": table_columns,
-                "rows": table_rows,
-            },
+            "batch_results": batch_rows,
         }
         return payload
 
@@ -4928,10 +6556,6 @@ class ManualFitGUI(QMainWindow):
 
     def _apply_imported_batch_rows(self, payload):
         imported_rows = list(payload.get("batch_results") or [])
-        if not imported_rows and isinstance(payload.get("batch"), Mapping):
-            imported_rows = list(payload.get("batch", {}).get("results") or [])
-        if not imported_rows:
-            imported_rows = self._table_export_rows_to_batch_results(payload)
         if not imported_rows:
             return (0, 0)
         if not self.data_files:
@@ -5042,8 +6666,6 @@ class ManualFitGUI(QMainWindow):
             raise ValueError("Fit details file must contain a JSON object.")
 
         gui = dict(payload.get("gui") or {})
-        if not gui and isinstance(payload.get("settings"), Mapping):
-            gui = dict(payload.get("settings") or {})
         expression_text = str(
             gui.get("equation")
             or gui.get("expression")
@@ -5143,14 +6765,8 @@ class ManualFitGUI(QMainWindow):
                 idx = self.x_channel_combo.findData(x_channel)
                 if idx >= 0:
                     self.x_channel_combo.setCurrentIndex(idx)
-            if (
-                (not expression_applied)
-                and y_channel in channel_names
-                and hasattr(self, "y_channel_combo")
-            ):
-                idx = self.y_channel_combo.findData(y_channel)
-                if idx >= 0:
-                    self.y_channel_combo.setCurrentIndex(idx)
+            if (not expression_applied) and y_channel in channel_names:
+                self.y_channel = y_channel
 
             if hasattr(self, "smoothing_toggle_btn"):
                 self.smoothing_toggle_btn.setChecked(
@@ -5186,6 +6802,83 @@ class ManualFitGUI(QMainWindow):
                 if ratios.size == expected:
                     self.current_boundary_ratios = np.clip(ratios, 0.0, 1.0)
                     self._sync_breakpoint_sliders_from_state()
+
+            # Restore per-channel boundary ratios for multi-channel.
+            saved_per_channel = gui.get("boundary_ratios_per_channel")
+            if isinstance(saved_per_channel, Mapping):
+                multi = getattr(self, "_multi_channel_model", None)
+                if multi is not None and multi.is_multi_channel:
+                    restored = {}
+                    for ch_model in multi.channel_models:
+                        ch_target = ch_model.target_col
+                        ch_ratios_raw = saved_per_channel.get(ch_target)
+                        if ch_ratios_raw is not None:
+                            ch_ratios = self._as_float_array(ch_ratios_raw)
+                            n_expected = max(0, len(ch_model.segment_exprs) - 1)
+                            if ch_ratios.size == n_expected:
+                                restored[ch_target] = np.clip(ch_ratios, 0.0, 1.0)
+                    if restored:
+                        self._boundary_ratios_per_channel.update(restored)
+
+            # Restore boundary name map.
+            saved_name_map = gui.get("boundary_name_map")
+            if isinstance(saved_name_map, Mapping) and saved_name_map:
+                restored_names: Dict[Tuple[str, int], str] = {}
+                for key_str, name in saved_name_map.items():
+                    parts = str(key_str).rsplit(":", 1)
+                    if len(parts) == 2:
+                        try:
+                            restored_names[(parts[0], int(parts[1]))] = str(name)
+                        except (TypeError, ValueError):
+                            pass
+                self._boundary_name_map = restored_names
+            else:
+                self._boundary_name_map = {}
+            self._apply_boundary_links_to_model()
+
+            # Restore manually fixed parameters.
+            saved_fixed = gui.get("manually_fixed_params")
+            if isinstance(saved_fixed, list):
+                self._manually_fixed_params = set(str(k) for k in saved_fixed)
+            else:
+                # Also restore from per-parameter 'fixed' flag.
+                fixed_from_params = set()
+                for entry in list(payload.get("parameters") or []):
+                    if isinstance(entry, Mapping) and entry.get("fixed"):
+                        key = str(entry.get("key") or "").strip()
+                        if key:
+                            fixed_from_params.add(key)
+                self._manually_fixed_params = fixed_from_params
+            # Sync fix checkbox states.
+            for key, cb in self.param_fix_checkboxes.items():
+                cb.blockSignals(True)
+                cb.setChecked(key in self._manually_fixed_params)
+                cb.blockSignals(False)
+
+            # Restore fitting procedure.
+            saved_procedure = gui.get("procedure")
+            if isinstance(saved_procedure, Mapping) and saved_procedure:
+                try:
+                    proc = FitProcedure.deserialize(saved_procedure)
+                    self._procedure_name = proc.name
+                    self._procedure_steps = list(proc.steps)
+                    if hasattr(self, "_proc_name_edit"):
+                        self._proc_name_edit.setText(proc.name)
+                    self._proc_prune_invalid_params()
+                except Exception:
+                    pass
+            else:
+                # No saved procedure — clear any in-memory steps.
+                self._procedure_steps = []
+                if hasattr(self, "_proc_name_edit"):
+                    self._proc_name_edit.setText("Procedure")
+                self._procedure_name = "Procedure"
+            # Always sync the step card widgets to the (possibly changed) list.
+            if hasattr(self, "_proc_step_layout"):
+                self._proc_rebuild_step_cards()
+
+            self._sync_param_slider_lock_state()
+            self._sync_breakpoint_sliders_from_state()
 
             applied_rows, skipped_rows = self._apply_imported_batch_rows(payload)
 
@@ -5738,6 +7431,7 @@ class ManualFitGUI(QMainWindow):
                 self.file_combo.blockSignals(False)
             self.last_popt = None
             self._last_r2 = None
+            self._last_per_channel_r2 = {}
 
             try:
                 file_path = self.data_files[idx]
@@ -5887,6 +7581,20 @@ class ManualFitGUI(QMainWindow):
                 ):
                     boundary_changed = True
                 self.current_boundary_ratios = new_boundary
+        # Restore per-channel boundary ratios from batch row (multi-channel).
+        channel_results = matched_row.get("channel_results")
+        multi = getattr(self, "_multi_channel_model", None)
+        if (
+            isinstance(channel_results, dict)
+            and multi is not None
+            and multi.is_multi_channel
+        ):
+            for ch_target, ch_result in channel_results.items():
+                ch_ratios = ch_result.get("boundary_ratios")
+                if ch_ratios is not None:
+                    self._boundary_ratios_per_channel[ch_target] = np.asarray(
+                        ch_ratios, dtype=float
+                    )
         self._sync_breakpoint_sliders_from_state()
         self._refresh_param_value_error_highlighting()
         return bool(changed or boundary_changed)
@@ -6058,7 +7766,12 @@ class ManualFitGUI(QMainWindow):
         if model_def is None:
             self.on_fit_failed("No compiled piecewise model.")
             return
-        ordered_keys = list(model_def.global_param_names)
+        multi_model = getattr(self, "_multi_channel_model", None)
+        ordered_keys = list(
+            multi_model.global_param_names
+            if multi_model is not None
+            else model_def.global_param_names
+        )
         params_by_key = dict((fit_result or {}).get("params_by_key") or {})
         best_params = np.asarray(
             [float(params_by_key.get(key, 0.0)) for key in ordered_keys], dtype=float
@@ -6070,7 +7783,34 @@ class ManualFitGUI(QMainWindow):
             if fit_result is not None and fit_result.get("r2") is not None
             else None
         )
-        if (
+        # Handle per-channel boundary ratios from multi-channel fit results.
+        channel_results = (fit_result or {}).get("channel_results")
+        if isinstance(channel_results, dict) and channel_results:
+            for ch_target, ch_result in channel_results.items():
+                ch_ratios = ch_result.get("boundary_ratios")
+                if ch_ratios is not None:
+                    self._boundary_ratios_per_channel[ch_target] = np.asarray(
+                        ch_ratios, dtype=float
+                    )
+            # Update primary channel boundary ratios.
+            primary_ratios = channel_results.get(self.y_channel, {}).get(
+                "boundary_ratios"
+            )
+            if primary_ratios is not None:
+                self.current_boundary_ratios = np.asarray(primary_ratios, dtype=float)
+            # Report per-channel R² for multi-channel fits.
+            if multi_model is not None and multi_model.is_multi_channel:
+                ch_r2_parts = []
+                per_ch_r2 = {}
+                for ch_target, ch_result in channel_results.items():
+                    ch_r2 = ch_result.get("r2")
+                    per_ch_r2[ch_target] = ch_r2
+                    if ch_r2 is not None:
+                        ch_r2_parts.append(f"{ch_target}: {ch_r2:.6f}")
+                self._last_per_channel_r2 = per_ch_r2
+                if ch_r2_parts:
+                    self.stats_text.append(f"Per-channel R²: {', '.join(ch_r2_parts)}")
+        elif (
             isinstance(fit_result, dict)
             and fit_result.get("boundary_ratios") is not None
         ):
@@ -6287,8 +8027,15 @@ class ManualFitGUI(QMainWindow):
         y_display = y_data[display_idx]
         channel_data_display = self._slice_channel_data(channel_data_full, display_idx)
 
+        # Determine which channel targets are being fitted.
+        multi_model = getattr(self, "_multi_channel_model", None)
+        fit_target_channels = [self.y_channel]
+        if multi_model is not None and multi_model.is_multi_channel:
+            fit_target_channels = list(multi_model.target_channels)
+
         plot_channel_names = []
-        for name in [self.y_channel]:
+        # Prioritize fitted target channels.
+        for name in fit_target_channels:
             key = str(name).strip()
             if not key or key in plot_channel_names:
                 continue
@@ -6330,6 +8077,7 @@ class ManualFitGUI(QMainWindow):
             "y_display": y_display,
             "channel_data_display": channel_data_display,
             "plot_channel_displays": plot_channel_displays,
+            "fit_target_channels": fit_target_channels,
         }
 
     def _compute_display_series(self, context):
@@ -6340,9 +8088,40 @@ class ManualFitGUI(QMainWindow):
         )
         residuals_display = context["y_display"] - fitted_display
 
+        # Per-channel fitted curves for multi-channel models.
+        multi_model = getattr(self, "_multi_channel_model", None)
+        channel_fitted = {}
+        channel_residuals = {}
+        if multi_model is not None and multi_model.is_multi_channel:
+            param_map = (
+                context["params"]
+                if isinstance(context["params"], dict)
+                else {
+                    key: float(context["params"][idx])
+                    for idx, key in enumerate(self._ordered_param_keys())
+                    if idx < len(context["params"])
+                }
+            )
+            for ch_model in multi_model.channel_models:
+                target = ch_model.target_col
+                try:
+                    ch_fitted = self.evaluate_channel_model(
+                        ch_model, context["x_display"], param_map
+                    )
+                    channel_fitted[target] = ch_fitted
+                    ch_data = context["channel_data_display"].get(target)
+                    if ch_data is not None:
+                        channel_residuals[target] = (
+                            np.asarray(ch_data, dtype=float) - ch_fitted
+                        )
+                except Exception:
+                    pass
+
         return {
             "fitted_display": fitted_display,
             "residuals_display": residuals_display,
+            "channel_fitted": channel_fitted,
+            "channel_residuals": channel_residuals,
         }
 
     def _try_fast_plot_update(self, context, series, show_residuals):
@@ -6356,8 +8135,29 @@ class ManualFitGUI(QMainWindow):
         if "residuals" in self._plot_lines and show_residuals:
             self._plot_lines["residuals"].set_ydata(series["residuals_display"])
 
+        # Update per-channel fit curves for multi-channel.
+        channel_fitted = series.get("channel_fitted", {})
+        for ch_target, ch_fitted_data in channel_fitted.items():
+            line_key = f"fitted_{ch_target}"
+            if line_key in self._plot_lines:
+                self._plot_lines[line_key].set_ydata(ch_fitted_data)
+
+        # Update per-channel residuals.
+        if show_residuals:
+            channel_residuals = series.get("channel_residuals", {})
+            for ch_target, ch_resid in channel_residuals.items():
+                res_key = f"residuals_{ch_target}"
+                if res_key in self._plot_lines:
+                    self._plot_lines[res_key].set_ydata(ch_resid)
+
+        # Compute y-limits including all fit curves.
         channel_arrays = list(context.get("plot_channel_displays", {}).values())
-        y_min, y_max = self._finite_min_max(*channel_arrays, series["fitted_display"])
+        fit_arrays = (
+            list(channel_fitted.values())
+            if channel_fitted
+            else [series["fitted_display"]]
+        )
+        y_min, y_max = self._finite_min_max(*channel_arrays, *fit_arrays)
         self.ax.set_ylim(y_min, y_max)
         x_vals = np.asarray(context["x_display"], dtype=float)
         x_finite = x_vals[np.isfinite(x_vals)]
@@ -6370,15 +8170,49 @@ class ManualFitGUI(QMainWindow):
                 x_max += pad
             self.ax.set_xlim(x_min, x_max)
         if show_residuals and self.ax_residual is not None:
-            r_min, r_max = self._finite_min_max(series["residuals_display"])
+            resid_arrays = list(series.get("channel_residuals", {}).values())
+            if not resid_arrays:
+                resid_arrays = [series["residuals_display"]]
+            r_min, r_max = self._finite_min_max(*resid_arrays)
             self.ax_residual.set_ylim(r_min, r_max)
         self.canvas.draw_idle()
         return True
 
-    def _update_stats_panel(self, r2_value):
-        text = f"{r2_value:.6f}" if r2_value is not None else "N/A"
+    def _update_stats_panel(self, r2_value, per_channel_r2=None):
+        """Update the R² display in the tab corner and per-equation labels."""
+        if per_channel_r2 is None:
+            per_channel_r2 = getattr(self, "_last_per_channel_r2", {})
+
+        # Tab corner: show per-channel R² summary for multi-channel.
+        multi_model = getattr(self, "_multi_channel_model", None)
+        if multi_model is not None and multi_model.is_multi_channel and per_channel_r2:
+            parts = []
+            for target in multi_model.target_channels:
+                ch_r2 = per_channel_r2.get(target)
+                if ch_r2 is not None:
+                    parts.append(f"{target}: {ch_r2:.4f}")
+                else:
+                    parts.append(f"{target}: N/A")
+            tab_text = "R² " + " | ".join(parts)
+        else:
+            tab_text = f"R²: {r2_value:.6f}" if r2_value is not None else "R²: N/A"
         if hasattr(self, "tab_r2_label"):
-            self.tab_r2_label.setText(f"R²: {text}")
+            self.tab_r2_label.setText(tab_text)
+
+        # Update per-equation R² labels.
+        labels = getattr(self, "_equation_r2_labels", {})
+        for target, label in labels.items():
+            ch_r2 = per_channel_r2.get(target)
+            if ch_r2 is not None:
+                label.setText(f"R²: {ch_r2:.6f}")
+                label.setStyleSheet(
+                    "color: #334155; font-size: 11px; font-weight: 600; padding: 0px 2px;"
+                )
+            else:
+                label.setText("R²: N/A")
+                label.setStyleSheet(
+                    "color: #64748b; font-size: 11px; padding: 0px 2px;"
+                )
         self._sync_param_row_tail_spacers()
 
     def update_plot(self, fast=False, preserve_view=True):
@@ -6456,39 +8290,85 @@ class ManualFitGUI(QMainWindow):
                 self.ax_residual.clear()
 
             self._plot_lines = {}
+            fit_target_channels = context.get("fit_target_channels", [self.y_channel])
             for idx, (channel_name, values) in enumerate(
                 context.get("plot_channel_displays", {}).items()
             ):
                 color = palette_color(idx)
                 channel_label = self._channel_legend_label(channel_name)
+                is_target = channel_name in fit_target_channels
                 self.ax.plot(
                     context["x_display"],
                     values,
                     label=channel_label,
                     color=color,
-                    linewidth=2.2 if channel_name == self.y_channel else 1.6,
-                    alpha=1.0 if channel_name == self.y_channel else 0.9,
+                    linewidth=2.2 if is_target else 1.6,
+                    alpha=1.0 if is_target else 0.9,
                 )
 
-            (fitted_line,) = self.ax.plot(
-                context["x_display"],
-                series["fitted_display"],
-                label="Fitted",
-                color=FIT_CURVE_COLOR,
-                linewidth=2,
-            )
-            self._plot_lines["fitted"] = fitted_line
+            # Plot fit curves for each channel.
+            channel_fitted = series.get("channel_fitted", {})
+            if channel_fitted and len(channel_fitted) > 1:
+                # Multi-channel: draw a fit curve per channel with matching shade.
+                fit_colors = ["#16a34a", "#dc2626", "#7c3aed", "#0891b2", "#ea580c"]
+                for fit_idx, (ch_target, ch_fitted_data) in enumerate(
+                    channel_fitted.items()
+                ):
+                    fit_color = fit_colors[fit_idx % len(fit_colors)]
+                    fit_label = f"Fit ({ch_target})"
+                    (fitted_line,) = self.ax.plot(
+                        context["x_display"],
+                        ch_fitted_data,
+                        label=fit_label,
+                        color=fit_color,
+                        linewidth=2,
+                        linestyle="-",
+                    )
+                    self._plot_lines[f"fitted_{ch_target}"] = fitted_line
+                # Still store primary fit line for backwards compat.
+                if self.y_channel in channel_fitted:
+                    self._plot_lines["fitted"] = self._plot_lines.get(
+                        f"fitted_{self.y_channel}"
+                    )
+            else:
+                # Single-channel: original behaviour.
+                (fitted_line,) = self.ax.plot(
+                    context["x_display"],
+                    series["fitted_display"],
+                    label="Fitted",
+                    color=FIT_CURVE_COLOR,
+                    linewidth=2,
+                )
+                self._plot_lines["fitted"] = fitted_line
 
             if show_residuals and self.ax_residual is not None:
-                (residuals_line,) = self.ax_residual.plot(
-                    context["x_display"],
-                    series["residuals_display"],
-                    label="Residuals",
-                    color="black",
-                    linestyle=":",
-                    linewidth=1.4,
-                )
-                self._plot_lines["residuals"] = residuals_line
+                # Plot residuals for all fitted channels.
+                channel_residuals = series.get("channel_residuals", {})
+                if channel_residuals and len(channel_residuals) > 1:
+                    res_colors = ["black", "#b91c1c", "#6d28d9", "#0e7490"]
+                    for res_idx, (ch_target, ch_resid) in enumerate(
+                        channel_residuals.items()
+                    ):
+                        res_color = res_colors[res_idx % len(res_colors)]
+                        (residuals_line,) = self.ax_residual.plot(
+                            context["x_display"],
+                            ch_resid,
+                            label=f"Residuals ({ch_target})",
+                            color=res_color,
+                            linestyle=":",
+                            linewidth=1.4,
+                        )
+                        self._plot_lines[f"residuals_{ch_target}"] = residuals_line
+                else:
+                    (residuals_line,) = self.ax_residual.plot(
+                        context["x_display"],
+                        series["residuals_display"],
+                        label="Residuals",
+                        color="black",
+                        linestyle=":",
+                        linewidth=1.4,
+                    )
+                    self._plot_lines["residuals"] = residuals_line
                 self.ax_residual.axhline(
                     0.0, color="#6b7280", linewidth=1.0, alpha=0.6, linestyle="--"
                 )
@@ -6501,19 +8381,63 @@ class ManualFitGUI(QMainWindow):
                 )
                 r2_value = compute_r2(context["y_data"], fitted_full)
                 self._last_r2 = r2_value
+
+                # Compute per-channel R² for all equations.
+                per_channel_r2 = {}
+                multi_model = getattr(self, "_multi_channel_model", None)
+                if multi_model is not None and multi_model.is_multi_channel:
+                    param_map = (
+                        params
+                        if isinstance(params, dict)
+                        else {
+                            key: float(params[idx])
+                            for idx, key in enumerate(self._ordered_param_keys())
+                            if idx < len(params)
+                        }
+                    )
+                    for ch_model in multi_model.channel_models:
+                        target = ch_model.target_col
+                        try:
+                            ch_fitted_full = self.evaluate_channel_model(
+                                ch_model, context["x_data"], param_map
+                            )
+                            ch_actual = context["channel_data_full"].get(target)
+                            if ch_actual is not None:
+                                ch_r2 = compute_r2(
+                                    np.asarray(ch_actual, dtype=float), ch_fitted_full
+                                )
+                                per_channel_r2[target] = ch_r2
+                        except Exception:
+                            per_channel_r2[target] = None
+                else:
+                    per_channel_r2[self.y_channel] = r2_value
+                self._last_per_channel_r2 = per_channel_r2
             else:
                 r2_value = self._last_r2
+                per_channel_r2 = getattr(self, "_last_per_channel_r2", {})
 
             channel_arrays = list(context.get("plot_channel_displays", {}).values())
-            y_min, y_max = self._finite_min_max(
-                *channel_arrays, series["fitted_display"]
+            # Include all fit curve arrays in the y-limits.
+            fit_arrays = (
+                list(channel_fitted.values())
+                if channel_fitted
+                else [series["fitted_display"]]
             )
+            y_min, y_max = self._finite_min_max(*channel_arrays, *fit_arrays)
             self.ax.set_ylim(y_min, y_max)
             self._apply_unique_legend(self.ax, loc="lower right")
             self.ax.set_xlabel(
                 "" if show_residuals else self._channel_axis_label(self.x_channel)
             )
-            self.ax.set_ylabel(self._channel_axis_label(self.y_channel))
+            # Multi-channel: show generic y-label.
+            multi_model = getattr(self, "_multi_channel_model", None)
+            if multi_model is not None and multi_model.is_multi_channel:
+                ch_labels = [
+                    self._channel_display_name(t) for t in multi_model.target_channels
+                ]
+                self.ax.set_ylabel(" / ".join(ch_labels))
+            else:
+                self.ax.set_ylabel(self._channel_axis_label(self.y_channel))
             x_vals = np.asarray(context["x_display"], dtype=float)
             x_finite = x_vals[np.isfinite(x_vals)]
             if x_finite.size > 0:
@@ -6528,7 +8452,10 @@ class ManualFitGUI(QMainWindow):
                 self.ax.set_xlim(x_min, x_max)
             self.ax.grid(True, alpha=0.3)
             if show_residuals and self.ax_residual is not None:
-                r_min, r_max = self._finite_min_max(series["residuals_display"])
+                resid_arrays = list(series.get("channel_residuals", {}).values())
+                if not resid_arrays:
+                    resid_arrays = [series["residuals_display"]]
+                r_min, r_max = self._finite_min_max(*resid_arrays)
                 self.ax_residual.set_ylim(r_min, r_max)
                 self.ax_residual.set_ylabel("Residual")
                 self.ax_residual.set_xlabel(self._channel_axis_label(self.x_channel))
@@ -6572,7 +8499,7 @@ class ManualFitGUI(QMainWindow):
             )
 
             self.canvas.draw_idle()
-            self._update_stats_panel(r2_value)
+            self._update_stats_panel(r2_value, per_channel_r2)
         except Exception as e:
             self.stats_text.setText(f"Error updating stats: {e}")
             print(f"Error updating stats: {type(e).__name__}: {e}", file=sys.stderr)
@@ -6752,6 +8679,8 @@ class ManualFitGUI(QMainWindow):
             existing_rows_by_file = {file_path: existing_row} if existing_row else {}
 
         thread = QThread(self)
+        multi_channel_model = fit_context.get("multi_channel_model")
+        boundary_seeds_per_channel = fit_context.get("boundary_seeds_per_channel", {})
         worker = BatchFitWorker(
             [file_path],
             [int(source_index)],
@@ -6774,6 +8703,8 @@ class ManualFitGUI(QMainWindow):
             ),
             smoothing_enabled=self.smoothing_enabled,
             smoothing_window=self._effective_smoothing_window(),
+            multi_channel_model=multi_channel_model,
+            boundary_seeds_per_channel=boundary_seeds_per_channel,
         )
         worker.moveToThread(thread)
         self.fit_tasks[task_id] = {

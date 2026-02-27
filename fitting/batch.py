@@ -26,6 +26,8 @@ from model import (
     has_nonempty_values,
     is_fit_row_improved,
     run_piecewise_fit_pipeline,
+    run_multi_channel_fit_pipeline,
+    run_procedure_pipeline,
     smooth_channel_array,
     finite_float_or_none,
     _row_has_error,
@@ -431,16 +433,49 @@ def render_batch_thumbnail(
         return pixmap
 
 
-class FitWorker(QObject):
+class ProcedureFitWorker(QObject):
+    """Run a multi-step fitting procedure on a single file.
+
+    Signals
+    -------
+    step_completed(int, dict)
+        Emitted after each step finishes — (step_index, step_result).
+    finished(dict)
+        Emitted when the full procedure completes.
+    failed(str)
+        Emitted on unrecoverable error.
+    cancelled()
+        Emitted when cancellation is requested.
+    """
+
+    step_completed = pyqtSignal(int, object)
     finished = pyqtSignal(object)
     failed = pyqtSignal(str)
     cancelled = pyqtSignal()
 
-    def __init__(self, x_data, y_data, fit_context):
+    def __init__(
+        self,
+        x_data,
+        y_data_by_channel,
+        multi_model,
+        procedure,
+        seed_map,
+        bounds_map,
+        boundary_seeds=None,
+        bound_values=None,
+    ):
         super().__init__()
         self.x_data = np.asarray(x_data, dtype=float)
-        self.y_data = np.asarray(y_data, dtype=float)
-        self.fit_context = dict(fit_context or {})
+        self.y_data_by_channel = {
+            str(k): np.asarray(v, dtype=float)
+            for k, v in dict(y_data_by_channel).items()
+        }
+        self.multi_model = multi_model
+        self.procedure = procedure
+        self.seed_map = dict(seed_map)
+        self.bounds_map = dict(bounds_map)
+        self.boundary_seeds = dict(boundary_seeds or {})
+        self.bound_values = dict(bound_values or {})
         self.cancel_requested = False
 
     def request_cancel(self):
@@ -453,15 +488,20 @@ class FitWorker(QObject):
                 self.cancelled.emit()
                 return
 
-            result = run_piecewise_fit_pipeline(
+            def _step_cb(step_idx, step_result):
+                self.step_completed.emit(step_idx, step_result)
+
+            result = run_procedure_pipeline(
                 self.x_data,
-                self.y_data,
-                self.fit_context["model_def"],
-                self.fit_context["seed_map"],
-                self.fit_context["bounds_map"],
-                boundary_seed=self.fit_context.get("boundary_seed"),
+                self.y_data_by_channel,
+                self.multi_model,
+                self.procedure,
+                self.seed_map,
+                self.bounds_map,
+                boundary_seeds=self.boundary_seeds,
                 cancel_check=lambda: self.cancel_requested,
-                fixed_params=self.fit_context.get("fixed_params"),
+                step_callback=_step_cb,
+                bound_values=self.bound_values,
             )
             if self.cancel_requested:
                 self.cancelled.emit()
@@ -501,6 +541,8 @@ class BatchFitWorker(QObject):
         random_restarts=0,
         smoothing_enabled=False,
         smoothing_window=1,
+        multi_channel_model=None,
+        boundary_seeds_per_channel=None,
     ):
         super().__init__()
         self.file_paths = list(file_paths)
@@ -543,6 +585,8 @@ class BatchFitWorker(QObject):
         self._rng = np.random.default_rng()
         self.smoothing_enabled = bool(smoothing_enabled)
         self.smoothing_window = int(smoothing_window)
+        self.multi_channel_model = multi_channel_model
+        self.boundary_seeds_per_channel = dict(boundary_seeds_per_channel or {})
         self.cancel_requested = False
 
     def request_cancel(self):
@@ -920,16 +964,48 @@ class BatchFitWorker(QObject):
                             seed_map[key] = float(value)
 
                 try:
-                    result = run_piecewise_fit_pipeline(
-                        x_data,
-                        y_data,
-                        self.model_def,
-                        seed_map,
-                        self.bounds_map,
-                        boundary_seed=boundary_candidate,
-                        cancel_check=lambda: self.cancel_requested,
-                        fixed_params=fixed_params,
-                    )
+                    # Use multi-channel fitting when available.
+                    if (
+                        self.multi_channel_model is not None
+                        and self.multi_channel_model.is_multi_channel
+                    ):
+                        # Gather y-data for each target channel.
+                        channel_y_data = {}
+                        for ch_model in self.multi_channel_model.channel_models:
+                            ch_col = ch_model.target_col
+                            if ch_col in data.columns:
+                                ch_y = data[ch_col].to_numpy(dtype=float, copy=True)
+                                if self.smoothing_enabled:
+                                    ch_y = smooth_channel_array(
+                                        ch_y, self.smoothing_window
+                                    )
+                                channel_y_data[ch_col] = ch_y
+                        ch_boundary_seeds = {}
+                        for ch_col, b_seed in self.boundary_seeds_per_channel.items():
+                            ch_boundary_seeds[ch_col] = np.asarray(
+                                b_seed, dtype=float
+                            ).reshape(-1)
+                        result = run_multi_channel_fit_pipeline(
+                            x_data,
+                            channel_y_data,
+                            self.multi_channel_model,
+                            seed_map,
+                            self.bounds_map,
+                            boundary_seeds=ch_boundary_seeds,
+                            cancel_check=lambda: self.cancel_requested,
+                            fixed_params=fixed_params,
+                        )
+                    else:
+                        result = run_piecewise_fit_pipeline(
+                            x_data,
+                            y_data,
+                            self.model_def,
+                            seed_map,
+                            self.bounds_map,
+                            boundary_seed=boundary_candidate,
+                            cancel_check=lambda: self.cancel_requested,
+                            fixed_params=fixed_params,
+                        )
                 except FitCancelledError:
                     return None
                 except Exception as exc:
@@ -945,13 +1021,35 @@ class BatchFitWorker(QObject):
                 candidate_row["r2"] = (
                     float(result["r2"]) if result.get("r2") is not None else None
                 )
-                boundary_values = result.get("boundary_ratios")
-                if boundary_values is None:
-                    boundary_values = []
-                candidate_row["boundary_ratios"] = np.asarray(
-                    boundary_values, dtype=float
-                )
-                n_boundaries = max(0, len(self.model_def.segment_exprs) - 1)
+                # Extract boundary ratios -- multi-channel stores them per-channel.
+                channel_results = result.get("channel_results")
+                if (
+                    channel_results is not None
+                    and self.multi_channel_model is not None
+                    and self.multi_channel_model.is_multi_channel
+                ):
+                    # For multi-channel, store the primary channel boundaries in the row
+                    # and store full channel_results for downstream use.
+                    primary_target = self.multi_channel_model.primary.target_col
+                    primary_ch = channel_results.get(primary_target, {})
+                    boundary_values = primary_ch.get("boundary_ratios")
+                    if boundary_values is None:
+                        boundary_values = []
+                    candidate_row["boundary_ratios"] = np.asarray(
+                        boundary_values, dtype=float
+                    )
+                    n_boundaries = max(
+                        0, len(self.multi_channel_model.primary.segment_exprs) - 1
+                    )
+                    candidate_row["channel_results"] = channel_results
+                else:
+                    boundary_values = result.get("boundary_ratios")
+                    if boundary_values is None:
+                        boundary_values = []
+                    candidate_row["boundary_ratios"] = np.asarray(
+                        boundary_values, dtype=float
+                    )
+                    n_boundaries = max(0, len(self.model_def.segment_exprs) - 1)
                 candidate_row["boundary_values"] = boundary_ratios_to_x_values(
                     candidate_row["boundary_ratios"],
                     x_data,

@@ -29,9 +29,11 @@ from solver import (
     OrderedPiecewiseConfig,
     SegmentSpec,
     predict_ordered_piecewise,
+    fit_ordered_piecewise,
     refit_ordered_piecewise_from_seed,
     pcts_to_boundary_ratios,
     _boundary_ratio_diff_step_from_x,
+    _auto_blend_width,
 )
 
 
@@ -197,6 +199,127 @@ class PiecewiseModelDefinition:
     segment_param_names: Tuple[Tuple[str, ...], ...]
     segment_evaluators: Tuple[Callable[..., np.ndarray], ...]
     global_param_names: Tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class MultiChannelModelDefinition:
+    """Multi-channel model with shared parameters across channel equations."""
+
+    channel_models: Tuple[PiecewiseModelDefinition, ...]
+    global_param_names: Tuple[str, ...]
+    boundary_links: Tuple[Tuple[Tuple[str, int], ...], ...] = ()
+    # boundary_links: tuple of link groups.  Each group is a tuple of
+    # (target_col, boundary_index) pairs that share the same ratio value
+    # during optimisation.  Only groups with >=2 members are meaningful.
+
+    @property
+    def primary(self) -> PiecewiseModelDefinition:
+        return self.channel_models[0]
+
+    @property
+    def target_channels(self) -> Tuple[str, ...]:
+        return tuple(m.target_col for m in self.channel_models)
+
+    @property
+    def is_multi_channel(self) -> bool:
+        return len(self.channel_models) > 1
+
+    @property
+    def all_boundary_ids(self) -> Tuple[Tuple[str, int], ...]:
+        """All (target_col, boundary_index) pairs across channels."""
+        ids: list = []
+        for m in self.channel_models:
+            for i in range(max(0, len(m.segment_exprs) - 1)):
+                ids.append((m.target_col, i))
+        return tuple(ids)
+
+    @property
+    def has_boundary_links(self) -> bool:
+        return len(self.boundary_links) > 0
+
+
+# ── Fitting procedure data classes ──────────────────────────────────
+
+
+@dataclass(frozen=True)
+class FitProcedureStep:
+    """One step in a multi-step fitting procedure.
+
+    *channels*  – target channel names to fit in this step (empty → all).
+    *free_params* – parameter keys to optimise (empty → all non-fixed).
+    *fixed_params* – parameter keys to hold at their current values.
+    *bound_params* – mapping of param_key → capture_field_name.
+                     Bound params are fixed at the value extracted from the
+                     filename pattern, like the main GUI's field-binding.
+    *min_r2*   – minimum R² required to continue to the next step.
+                 ``None`` means always continue.
+    *label*    – optional human-readable label for this step.
+    """
+
+    channels: Tuple[str, ...] = ()
+    free_params: Tuple[str, ...] = ()
+    fixed_params: Tuple[str, ...] = ()
+    bound_params: Tuple[Tuple[str, str], ...] = ()  # ((param_key, field_name), ...)
+    min_r2: Optional[float] = None
+    label: str = ""
+
+    def serialize(self) -> Dict[str, Any]:
+        d: Dict[str, Any] = {}
+        if self.channels:
+            d["channels"] = list(self.channels)
+        if self.free_params:
+            d["free_params"] = list(self.free_params)
+        if self.fixed_params:
+            d["fixed_params"] = list(self.fixed_params)
+        if self.bound_params:
+            d["bound_params"] = {str(k): str(v) for k, v in self.bound_params}
+        if self.min_r2 is not None:
+            d["min_r2"] = float(self.min_r2)
+        if self.label:
+            d["label"] = str(self.label)
+        return d
+
+    @classmethod
+    def deserialize(cls, data: Mapping[str, Any]) -> "FitProcedureStep":
+        raw_bound = data.get("bound_params")
+        bound: Tuple[Tuple[str, str], ...] = ()
+        if isinstance(raw_bound, Mapping):
+            bound = tuple(
+                (str(k), str(v)) for k, v in raw_bound.items() if v not in (None, "")
+            )
+        return cls(
+            channels=tuple(str(c) for c in (data.get("channels") or ())),
+            free_params=tuple(str(p) for p in (data.get("free_params") or ())),
+            fixed_params=tuple(str(p) for p in (data.get("fixed_params") or ())),
+            bound_params=bound,
+            min_r2=finite_float_or_none(data.get("min_r2")),
+            label=str(data.get("label") or ""),
+        )
+
+
+@dataclass(frozen=True)
+class FitProcedure:
+    """An ordered sequence of :class:`FitProcedureStep` instances."""
+
+    name: str = "Procedure"
+    steps: Tuple[FitProcedureStep, ...] = ()
+
+    def serialize(self) -> Dict[str, Any]:
+        return {
+            "name": str(self.name),
+            "steps": [s.serialize() for s in self.steps],
+        }
+
+    @classmethod
+    def deserialize(cls, data: Mapping[str, Any]) -> "FitProcedure":
+        return cls(
+            name=str(data.get("name") or "Procedure"),
+            steps=tuple(
+                FitProcedureStep.deserialize(s)
+                for s in (data.get("steps") or ())
+                if isinstance(s, Mapping)
+            ),
+        )
 
 
 class FitCancelledError(RuntimeError):
@@ -418,6 +541,42 @@ def build_piecewise_model_definition(
     )
 
 
+def build_multi_channel_model_definition(
+    channel_equations: Sequence[Tuple[str, Sequence[str]]],
+    channel_names: Sequence[str],
+    boundary_links: Sequence[Sequence[Tuple[str, int]]] = (),
+) -> MultiChannelModelDefinition:
+    """Build a multi-channel model from a list of (target_col, segment_exprs) tuples.
+
+    Parameters with the same name across channels are shared.
+    *boundary_links* is a sequence of link groups.  Each group is a sequence of
+    ``(target_col, boundary_index)`` pairs that should share the same boundary
+    ratio value during fitting.
+    """
+    if not channel_equations:
+        raise ValueError("At least one channel equation is required.")
+    models: List[PiecewiseModelDefinition] = []
+    global_names: List[str] = []
+    seen: set = set()
+    for target_col, seg_exprs in channel_equations:
+        model = build_piecewise_model_definition(target_col, seg_exprs, channel_names)
+        models.append(model)
+        for name in model.global_param_names:
+            if name not in seen:
+                seen.add(name)
+                global_names.append(name)
+    normalised_links: List[Tuple[Tuple[str, int], ...]] = []
+    for group in boundary_links:
+        members = tuple(sorted(set((str(t), int(i)) for t, i in group)))
+        if len(members) >= 2:
+            normalised_links.append(members)
+    return MultiChannelModelDefinition(
+        channel_models=tuple(models),
+        global_param_names=tuple(global_names),
+        boundary_links=tuple(normalised_links),
+    )
+
+
 def make_segment_specs(
     model_def: PiecewiseModelDefinition,
     seed_map: Mapping[str, float],
@@ -500,6 +659,45 @@ def shared_to_local_flat(
     if boundary_ratios.size > 0:
         parts.extend(np.asarray(boundary_ratios, dtype=float).reshape(-1).tolist())
     return np.asarray(parts, dtype=float)
+
+
+def _run_initial_fit_stage(
+    x_arr: np.ndarray,
+    y_arr: np.ndarray,
+    segments: Sequence[SegmentSpec],
+    local_seed_flat: np.ndarray,
+    n_boundaries: int,
+    max_nfev: int,
+) -> "OrderedPiecewiseResult":
+    """Run coarse grid search (when boundaries exist) or seed-based fit.
+
+    Falls back to seed-based refinement if grid search fails.
+    """
+    if n_boundaries > 0:
+        stride = max(12, x_arr.size // 150)
+        try:
+            return fit_ordered_piecewise(
+                x_arr,
+                y_arr,
+                segments,
+                config=OrderedPiecewiseConfig(
+                    grid_stride=stride,
+                    robust_max_nfev=max_nfev,
+                    prefer_jit=True,
+                ),
+            )
+        except Exception:
+            pass  # fall through to seed-based refinement
+    return refit_ordered_piecewise_from_seed(
+        x_arr,
+        y_arr,
+        segments,
+        seed_params=local_seed_flat,
+        config=OrderedPiecewiseConfig(
+            robust_max_nfev=max_nfev,
+            prefer_jit=True,
+        ),
+    )
 
 
 def run_piecewise_fit_pipeline(
@@ -638,15 +836,13 @@ def run_piecewise_fit_pipeline(
         }
 
     stage_a_nfev = int(np.clip(700 * max(1, local_seed_flat.size), 3000, 14000))
-    stage_a = refit_ordered_piecewise_from_seed(
+    stage_a = _run_initial_fit_stage(
         x_arr,
         y_arr,
         segments,
-        seed_params=local_seed_flat,
-        config=OrderedPiecewiseConfig(
-            robust_max_nfev=stage_a_nfev,
-            prefer_jit=True,
-        ),
+        local_seed_flat,
+        n_boundaries,
+        stage_a_nfev,
     )
     if is_cancelled():
         raise FitCancelledError("cancelled")
@@ -710,6 +906,8 @@ def run_piecewise_fit_pipeline(
             local_work[n_local_params:] = np.asarray(boundary_values, dtype=float)
         return local_work
 
+    _blend_w = _auto_blend_width(np.sort(x_arr)) if n_boundaries > 0 else 0.0
+
     def residuals(vals: np.ndarray) -> np.ndarray:
         if is_cancelled():
             raise FitCancelledError("cancelled")
@@ -721,6 +919,7 @@ def run_piecewise_fit_pipeline(
             segments,
             local_flat,
             prefer_jit=True,
+            blend_width=_blend_w,
         )
         return np.asarray(pred["y_hat"] - y_arr, dtype=float)
 
@@ -776,6 +975,8 @@ def run_piecewise_fit_pipeline(
 
         except FitCancelledError:
             raise
+        except Exception:
+            pass
 
     return {
         "params_by_key": {
@@ -787,4 +988,604 @@ def run_piecewise_fit_pipeline(
         "boundaries": np.asarray(best_pred["boundaries"], dtype=float),
         "y_hat": np.asarray(best_pred["y_hat"], dtype=float),
         "r2": compute_r2(y_arr, best_pred["y_hat"]),
+    }
+
+
+def run_multi_channel_fit_pipeline(
+    x_data: np.ndarray,
+    y_data_by_channel: Mapping[str, np.ndarray],
+    multi_model: MultiChannelModelDefinition,
+    seed_map: Mapping[str, float],
+    bounds_map: Mapping[str, Tuple[float, float]],
+    boundary_seeds: Optional[Mapping[str, np.ndarray]] = None,
+    cancel_check: Optional[Callable[[], bool]] = None,
+    fixed_params: Optional[Mapping[str, float]] = None,
+) -> Dict[str, Any]:
+    """Fit shared parameters across multiple channel equations simultaneously.
+
+    Each channel equation is a piecewise model with its own boundary ratios.
+    Parameters with the same name are shared across channels.
+    Returns per-channel results plus combined metrics.
+    """
+    x_arr = np.asarray(x_data, dtype=float).reshape(-1)
+    if x_arr.size < 8:
+        raise ValueError("Not enough points to run multi-channel fitting.")
+
+    global_names = list(multi_model.global_param_names)
+    global_index = {name: idx for idx, name in enumerate(global_names)}
+    boundary_seeds_map = dict(boundary_seeds or {})
+
+    fixed_by_key: Dict[str, float] = {}
+    for raw_key, raw_value in dict(fixed_params or {}).items():
+        key = str(raw_key).strip()
+        if not key or key not in global_index:
+            continue
+        try:
+            numeric = float(raw_value)
+        except Exception:
+            continue
+        if not np.isfinite(numeric):
+            continue
+        fixed_by_key[key] = float(numeric)
+
+    seed_by_key: Dict[str, float] = {}
+    for name in global_names:
+        if name not in seed_map:
+            raise ValueError(f"Missing seed for parameter '{name}'.")
+        value = float(seed_map[name])
+        if not np.isfinite(value):
+            raise ValueError(f"Seed for parameter '{name}' is not finite.")
+        seed_by_key[name] = float(value)
+    for key, value in fixed_by_key.items():
+        seed_by_key[key] = float(value)
+
+    def is_cancelled() -> bool:
+        if cancel_check is None:
+            return False
+        try:
+            return bool(cancel_check())
+        except Exception:
+            return False
+
+    if is_cancelled():
+        raise FitCancelledError("cancelled")
+
+    free_param_names = [name for name in global_names if name not in fixed_by_key]
+    free_param_indices = np.asarray(
+        [global_index[name] for name in free_param_names], dtype=int
+    )
+    fixed_index_values = [
+        (int(global_index[name]), float(value))
+        for name, value in fixed_by_key.items()
+        if name in global_index
+    ]
+
+    # Build per-channel segment specs and boundary info.
+    channel_info: List[Dict[str, Any]] = []
+    for ch_model in multi_model.channel_models:
+        target = ch_model.target_col
+        if target not in y_data_by_channel:
+            raise ValueError(f"Missing y-data for channel '{target}'.")
+        y_arr = np.asarray(y_data_by_channel[target], dtype=float).reshape(-1)
+        if y_arr.size != x_arr.size:
+            raise ValueError(
+                f"Channel '{target}' data length ({y_arr.size}) != x length ({x_arr.size})."
+            )
+        segments = make_segment_specs(
+            ch_model, seed_by_key, bounds_map, fixed_param_values=fixed_by_key
+        )
+        n_boundaries = max(0, len(segments) - 1)
+        b_seed = boundary_seeds_map.get(target)
+        if b_seed is None:
+            b_seed_arr = default_boundary_ratios(n_boundaries)
+        else:
+            b_seed_arr = np.clip(np.asarray(b_seed, dtype=float).reshape(-1), 0.0, 1.0)
+            if b_seed_arr.size != n_boundaries:
+                b_seed_arr = default_boundary_ratios(n_boundaries)
+
+        # Per-channel local-to-global index mapping.
+        local_to_global: List[int] = []
+        for seg_names in ch_model.segment_param_names:
+            for name in seg_names:
+                if name in fixed_by_key:
+                    continue
+                local_to_global.append(global_index[name])
+        local_to_global_arr = np.asarray(local_to_global, dtype=int)
+
+        channel_info.append(
+            {
+                "model": ch_model,
+                "target": target,
+                "y_arr": y_arr,
+                "segments": segments,
+                "n_boundaries": n_boundaries,
+                "boundary_seed": b_seed_arr,
+                "local_to_global": local_to_global_arr,
+                "n_local_params": int(local_to_global_arr.size),
+            }
+        )
+
+    # Build shared optimization vector: [free_params, boundary_ch1, boundary_ch2, ...]
+    shared_seed = np.asarray(
+        [float(seed_by_key[name]) for name in global_names], dtype=float
+    )
+    n_free = int(free_param_indices.size)
+
+    # Stage A: per-channel initial fit, then average to get shared seed.
+    for ch in channel_info:
+        if is_cancelled():
+            raise FitCancelledError("cancelled")
+        n_local = ch["n_local_params"]
+        n_b = ch["n_boundaries"]
+        local_seed = np.empty(n_local + n_b, dtype=float)
+        if n_local > 0:
+            local_seed[:n_local] = shared_seed[ch["local_to_global"]]
+        if n_b > 0:
+            local_seed[n_local:] = ch["boundary_seed"]
+        nfev = int(np.clip(700 * max(1, local_seed.size), 3000, 14000))
+        stage = _run_initial_fit_stage(
+            x_arr,
+            ch["y_arr"],
+            ch["segments"],
+            local_seed,
+            n_b,
+            nfev,
+        )
+        ch["stage_a_local"] = np.asarray(stage.params[:n_local], dtype=float)
+        ch["stage_a_boundary"] = np.asarray(stage.params[n_local:], dtype=float)
+
+    # Average per-channel stage A results for shared parameter seed.
+    shared_init = np.asarray(shared_seed, dtype=float)
+    sums = np.zeros(shared_init.size, dtype=float)
+    counts = np.zeros(shared_init.size, dtype=float)
+    for ch in channel_info:
+        n_local = ch["n_local_params"]
+        if n_local > 0:
+            np.add.at(sums, ch["local_to_global"], ch["stage_a_local"][:n_local])
+            np.add.at(counts, ch["local_to_global"], 1.0)
+    use_mask = counts > 0.0
+    shared_init[use_mask] = sums[use_mask] / counts[use_mask]
+    for idx, value in fixed_index_values:
+        shared_init[idx] = float(value)
+
+    # ---- Boundary variable mapping from link groups ----
+    all_bids: List[Tuple[str, int]] = []
+    for ch in channel_info:
+        for i in range(ch["n_boundaries"]):
+            all_bids.append((ch["target"], i))
+    all_bids_set = set(all_bids)
+    ch_info_by_target = {ch["target"]: ch for ch in channel_info}
+
+    bid_to_var: Dict[Tuple[str, int], int] = {}
+    linked_bids: set = set()
+    boundary_var_count = 0
+    for group in multi_model.boundary_links:
+        valid = [bid for bid in group if bid in all_bids_set]
+        if len(valid) < 2:
+            continue
+        for bid in valid:
+            bid_to_var[bid] = boundary_var_count
+            linked_bids.add(bid)
+        boundary_var_count += 1
+    for bid in all_bids:
+        if bid not in bid_to_var:
+            bid_to_var[bid] = boundary_var_count
+            boundary_var_count += 1
+    total_boundary = boundary_var_count
+
+    # Build combined optimization vector.
+    shared_lo = np.asarray(
+        [float(bounds_map[name][0]) for name in free_param_names], dtype=float
+    )
+    shared_hi = np.asarray(
+        [float(bounds_map[name][1]) for name in free_param_names], dtype=float
+    )
+    free_lower = np.minimum(shared_lo, shared_hi)
+    free_upper = np.maximum(shared_lo, shared_hi)
+
+    shared_init_free = (
+        np.asarray(shared_init[free_param_indices], dtype=float)
+        if free_param_indices.size > 0
+        else np.asarray([], dtype=float)
+    )
+
+    boundary_lo = np.zeros(total_boundary, dtype=float)
+    boundary_hi = np.ones(total_boundary, dtype=float)
+    boundary_init = np.zeros(total_boundary, dtype=float)
+
+    # Seed linked groups by averaging stage-A seeds of their members.
+    for group in multi_model.boundary_links:
+        valid = [bid for bid in group if bid in linked_bids]
+        if not valid:
+            continue
+        var_idx = bid_to_var[valid[0]]
+        seeds_for_group: List[float] = []
+        for target, bidx in valid:
+            ch = ch_info_by_target.get(target)
+            if ch is not None and bidx < ch["stage_a_boundary"].size:
+                seeds_for_group.append(float(ch["stage_a_boundary"][bidx]))
+        if seeds_for_group:
+            boundary_init[var_idx] = float(np.clip(np.mean(seeds_for_group), 0.0, 1.0))
+    # Seed unlinked boundaries from their own stage-A value.
+    for bid in all_bids:
+        if bid in linked_bids:
+            continue
+        var_idx = bid_to_var[bid]
+        target, bidx = bid
+        ch = ch_info_by_target.get(target)
+        if ch is not None and bidx < ch["stage_a_boundary"].size:
+            boundary_init[var_idx] = float(
+                np.clip(float(ch["stage_a_boundary"][bidx]), 0.0, 1.0)
+            )
+
+    lower = np.concatenate([free_lower, boundary_lo])
+    upper = np.concatenate([free_upper, boundary_hi])
+    x0 = np.concatenate(
+        [
+            np.clip(shared_init_free, free_lower, free_upper),
+            boundary_init,
+        ]
+    )
+
+    if x0.size == 0:
+        # All parameters are fixed. Just evaluate.
+        results_by_channel: Dict[str, Any] = {}
+        for ch in channel_info:
+            n_local = ch["n_local_params"]
+            n_b = ch["n_boundaries"]
+            local_flat = np.empty(n_local + n_b, dtype=float)
+            if n_local > 0:
+                local_flat[:n_local] = shared_init[ch["local_to_global"]]
+            if n_b > 0:
+                local_flat[n_local:] = ch["boundary_seed"]
+            pred = predict_ordered_piecewise(
+                x_arr, ch["segments"], local_flat, prefer_jit=True
+            )
+            results_by_channel[ch["target"]] = {
+                "y_hat": np.asarray(pred["y_hat"], dtype=float),
+                "boundary_ratios": np.asarray([], dtype=float),
+                "boundaries": np.asarray(pred["boundaries"], dtype=float),
+                "r2": compute_r2(ch["y_arr"], pred["y_hat"]),
+            }
+        return {
+            "params_by_key": {
+                name: float(shared_init[idx]) for idx, name in enumerate(global_names)
+            },
+            "params_vector": np.asarray(shared_init, dtype=float),
+            "channel_results": results_by_channel,
+            "r2": _combine_channel_r2(results_by_channel),
+        }
+
+    # Build template and work arrays for composing vectors.
+    shared_template = np.asarray(
+        [float(seed_by_key[name]) for name in global_names], dtype=float
+    ).copy()
+    for idx, value in fixed_index_values:
+        shared_template[idx] = float(value)
+    shared_work = shared_template.copy()
+
+    def _compose_shared(free_values: np.ndarray) -> np.ndarray:
+        np.copyto(shared_work, shared_template)
+        if n_free > 0:
+            shared_work[free_param_indices] = np.asarray(free_values, dtype=float)
+        return shared_work
+
+    _mc_blend_w = _auto_blend_width(np.sort(x_arr)) if total_boundary > 0 else 0.0
+
+    def residuals(vals: np.ndarray) -> np.ndarray:
+        if is_cancelled():
+            raise FitCancelledError("cancelled")
+        vals = np.asarray(vals, dtype=float).reshape(-1)
+        shared_vals = _compose_shared(vals[:n_free])
+        all_residuals: List[np.ndarray] = []
+        for ch in channel_info:
+            n_local = ch["n_local_params"]
+            n_b = ch["n_boundaries"]
+            local_flat = np.empty(n_local + n_b, dtype=float)
+            if n_local > 0:
+                local_flat[:n_local] = shared_vals[ch["local_to_global"]]
+            for i in range(n_b):
+                var_idx = bid_to_var[(ch["target"], i)]
+                local_flat[n_local + i] = vals[n_free + var_idx]
+            pred = predict_ordered_piecewise(
+                x_arr,
+                ch["segments"],
+                local_flat,
+                prefer_jit=True,
+                blend_width=_mc_blend_w,
+            )
+            all_residuals.append(np.asarray(pred["y_hat"] - ch["y_arr"], dtype=float))
+        return np.concatenate(all_residuals)
+
+    # Run combined least-squares optimization.
+    try:
+        diff_step = np.full(x0.size, 1e-6, dtype=float)
+        if total_boundary > 0:
+            diff_step[n_free:] = _boundary_ratio_diff_step_from_x(x_arr)
+        refine_nfev = int(np.clip(500 * max(1, x0.size), 2500, 20000))
+        ls = least_squares(
+            residuals,
+            x0,
+            bounds=(lower, upper),
+            method="trf",
+            loss="soft_l1",
+            f_scale=0.5,
+            max_nfev=refine_nfev,
+            diff_step=diff_step,
+            x_scale="jac",
+        )
+        refined_vals = np.asarray(ls.x, dtype=float)
+    except FitCancelledError:
+        raise
+    except Exception:
+        refined_vals = x0
+
+    best_shared = np.asarray(_compose_shared(refined_vals[:n_free]), dtype=float).copy()
+
+    # Extract per-channel results.
+    results_by_channel = {}
+    for ch in channel_info:
+        n_local = ch["n_local_params"]
+        n_b = ch["n_boundaries"]
+        local_flat = np.empty(n_local + n_b, dtype=float)
+        if n_local > 0:
+            local_flat[:n_local] = best_shared[ch["local_to_global"]]
+        ch_ratios = np.zeros(n_b, dtype=float)
+        for i in range(n_b):
+            var_idx = bid_to_var[(ch["target"], i)]
+            val = float(refined_vals[n_free + var_idx])
+            local_flat[n_local + i] = val
+            ch_ratios[i] = val
+        pred = predict_ordered_piecewise(
+            x_arr, ch["segments"], local_flat, prefer_jit=True
+        )
+        results_by_channel[ch["target"]] = {
+            "y_hat": np.asarray(pred["y_hat"], dtype=float),
+            "boundary_ratios": np.asarray(ch_ratios, dtype=float),
+            "boundaries": np.asarray(pred["boundaries"], dtype=float),
+            "r2": compute_r2(ch["y_arr"], pred["y_hat"]),
+        }
+
+    return {
+        "params_by_key": {
+            name: float(best_shared[idx]) for idx, name in enumerate(global_names)
+        },
+        "params_vector": np.asarray(best_shared, dtype=float),
+        "channel_results": results_by_channel,
+        "r2": _combine_channel_r2(results_by_channel),
+    }
+
+
+def _combine_channel_r2(results_by_channel: Mapping[str, Any]) -> Optional[float]:
+    """Average R² across channels, ignoring those without a value."""
+    r2_values = []
+    for ch_result in results_by_channel.values():
+        r2 = ch_result.get("r2")
+        if r2 is not None:
+            r2_values.append(float(r2))
+    if not r2_values:
+        return None
+    return float(np.mean(r2_values))
+
+
+# ── Procedure pipeline ──────────────────────────────────────────────
+
+
+def run_procedure_pipeline(
+    x_data: np.ndarray,
+    y_data_by_channel: Mapping[str, np.ndarray],
+    multi_model: MultiChannelModelDefinition,
+    procedure: FitProcedure,
+    seed_map: Mapping[str, float],
+    bounds_map: Mapping[str, Tuple[float, float]],
+    boundary_seeds: Optional[Mapping[str, np.ndarray]] = None,
+    cancel_check: Optional[Callable[[], bool]] = None,
+    step_callback: Optional[Callable[[int, Dict[str, Any]], None]] = None,
+    bound_values: Optional[Mapping[str, float]] = None,
+) -> Dict[str, Any]:
+    """Execute a multi-step fitting procedure, feeding results forward.
+
+    Parameters
+    ----------
+    step_callback : callable(step_index, step_result) or None
+        Called after each completed step so the GUI can report progress.
+
+    Returns
+    -------
+    dict with keys:
+        - ``step_results``: list of per-step result dicts
+        - ``params_by_key``: final merged parameter values
+        - ``r2``: final combined R²
+        - ``channel_results``: final per-channel breakdown
+        - ``stopped_at_step``: index of the step that caused early stop, or None
+    """
+    x_arr = np.asarray(x_data, dtype=float).reshape(-1)
+    running_seed = dict(seed_map)
+    running_boundary_seeds: Dict[str, np.ndarray] = dict(boundary_seeds or {})
+    step_results: List[Dict[str, Any]] = []
+    last_result: Optional[Dict[str, Any]] = None
+    stopped_at_step: Optional[int] = None
+
+    global_names = set(multi_model.global_param_names)
+
+    def _is_cancelled() -> bool:
+        if cancel_check is None:
+            return False
+        try:
+            return bool(cancel_check())
+        except Exception:
+            return False
+
+    for step_idx, step in enumerate(procedure.steps):
+        if _is_cancelled():
+            raise FitCancelledError("cancelled")
+
+        # --- Determine fixed params for this step ---
+        # If free_params is specified, everything else is fixed.
+        # If fixed_params is specified, everything else is free.
+        # If both are specified, free_params takes priority.
+        fixed_for_step: Dict[str, float] = {}
+
+        # Apply bound params first (param → capture field → numeric value).
+        _bound_vals = dict(bound_values or {})
+        for param_key, field_name in step.bound_params:
+            if param_key in global_names and field_name in _bound_vals:
+                fixed_for_step[param_key] = float(_bound_vals[field_name])
+                running_seed[param_key] = float(_bound_vals[field_name])
+
+        if step.free_params:
+            free_set = set(step.free_params) & global_names
+            for name in global_names:
+                if name not in free_set:
+                    fixed_for_step[name] = float(running_seed.get(name, 0.0))
+        elif step.fixed_params:
+            for name in step.fixed_params:
+                if name in global_names:
+                    fixed_for_step[name] = float(running_seed.get(name, 0.0))
+
+        # --- Filter to step channels ---
+        step_channels = set(step.channels) if step.channels else None
+        if step_channels:
+            enabled_models = tuple(
+                m for m in multi_model.channel_models if m.target_col in step_channels
+            )
+        else:
+            enabled_models = multi_model.channel_models
+
+        if not enabled_models:
+            # No matching channels; skip step but record it.
+            step_results.append({"skipped": True, "reason": "no matching channels"})
+            if step_callback is not None:
+                step_callback(step_idx, step_results[-1])
+            continue
+
+        # Build a filtered multi-model for this step's channels.
+        enabled_targets = {m.target_col for m in enabled_models}
+        filtered_links: List[Tuple[Tuple[str, int], ...]] = []
+        for group in multi_model.boundary_links:
+            filtered = tuple(bid for bid in group if bid[0] in enabled_targets)
+            if len(filtered) >= 2:
+                filtered_links.append(filtered)
+        filtered_global: List[str] = []
+        seen_global: set = set()
+        for m in enabled_models:
+            for seg_names in m.segment_param_names:
+                for name in seg_names:
+                    if name not in seen_global:
+                        seen_global.add(name)
+                        filtered_global.append(name)
+        step_multi = MultiChannelModelDefinition(
+            channel_models=enabled_models,
+            global_param_names=tuple(filtered_global),
+            boundary_links=tuple(filtered_links),
+        )
+
+        # Gather y-data for step channels.
+        step_y = {
+            ch: y_data_by_channel[ch]
+            for ch in enabled_targets
+            if ch in y_data_by_channel
+        }
+        if not step_y:
+            step_results.append({"skipped": True, "reason": "no y-data for channels"})
+            if step_callback is not None:
+                step_callback(step_idx, step_results[-1])
+            continue
+
+        # Filter boundary seeds to step channels.
+        step_boundary_seeds = {
+            ch: running_boundary_seeds[ch]
+            for ch in enabled_targets
+            if ch in running_boundary_seeds
+        }
+
+        # Filter fixed params to only those in the step model's global names.
+        step_fixed_filtered = {
+            k: v for k, v in fixed_for_step.items() if k in seen_global
+        }
+
+        # Run the fit.
+        if step_multi.is_multi_channel:
+            result = run_multi_channel_fit_pipeline(
+                x_arr,
+                step_y,
+                step_multi,
+                running_seed,
+                bounds_map,
+                boundary_seeds=step_boundary_seeds,
+                cancel_check=cancel_check,
+                fixed_params=step_fixed_filtered,
+            )
+        else:
+            # Single-channel path.
+            ch_model = enabled_models[0]
+            ch_target = ch_model.target_col
+            b_seed = step_boundary_seeds.get(ch_target)
+            result = run_piecewise_fit_pipeline(
+                x_arr,
+                step_y[ch_target],
+                ch_model,
+                running_seed,
+                bounds_map,
+                boundary_seed=b_seed,
+                cancel_check=cancel_check,
+                fixed_params=step_fixed_filtered,
+            )
+
+        last_result = result
+
+        # Feed results forward into the running seed.
+        params_by_key = dict(result.get("params_by_key") or {})
+        for key, value in params_by_key.items():
+            running_seed[key] = float(value)
+
+        # Update boundary seeds from channel results.
+        channel_results = result.get("channel_results")
+        if isinstance(channel_results, dict):
+            for ch_target, ch_result in channel_results.items():
+                ch_ratios = ch_result.get("boundary_ratios")
+                if ch_ratios is not None:
+                    running_boundary_seeds[ch_target] = np.asarray(
+                        ch_ratios, dtype=float
+                    )
+        elif result.get("boundary_ratios") is not None:
+            ch_target = enabled_models[0].target_col
+            running_boundary_seeds[ch_target] = np.asarray(
+                result["boundary_ratios"], dtype=float
+            )
+
+        step_r2 = result.get("r2")
+        step_result_entry = {
+            "step_index": step_idx,
+            "label": step.label or f"Step {step_idx + 1}",
+            "params_by_key": dict(params_by_key),
+            "r2": float(step_r2) if step_r2 is not None else None,
+            "channels": list(enabled_targets),
+            "free_params": list(step.free_params)
+            if step.free_params
+            else list(seen_global - set(fixed_for_step)),
+            "fixed_params": list(fixed_for_step.keys()),
+        }
+        step_results.append(step_result_entry)
+
+        if step_callback is not None:
+            step_callback(step_idx, step_result_entry)
+
+        # Check R² threshold.
+        if step.min_r2 is not None and step_r2 is not None:
+            if float(step_r2) < float(step.min_r2):
+                stopped_at_step = step_idx
+                break
+
+    # Build final output.
+    final_channel_results = {}
+    if last_result is not None:
+        final_channel_results = last_result.get("channel_results") or {}
+
+    return {
+        "step_results": step_results,
+        "params_by_key": dict(running_seed),
+        "r2": last_result.get("r2") if last_result is not None else None,
+        "channel_results": final_channel_results,
+        "stopped_at_step": stopped_at_step,
     }
