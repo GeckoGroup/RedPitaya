@@ -10,7 +10,6 @@ import sys
 import html
 import json
 import time
-import zipfile
 from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, Optional, Self, Set, Tuple
@@ -86,7 +85,12 @@ from matplotlib import colors as mcolors
 # use Qt5Agg backend for better performance
 from matplotlib.pyplot import switch_backend
 
-from data_io import read_measurement_csv, stem_for_file_ref
+from data_io import (
+    is_supported_archive_path,
+    list_archive_csv_members,
+    read_measurement_csv,
+    stem_for_file_ref,
+)
 from fit_results import canonicalize_fit_row, fit_get, fit_set
 from expression import (
     COLUMN_COLOR,
@@ -763,6 +767,12 @@ class ManualFitGUI(QMainWindow):
         self._analysis_hover_artists = []
         self._analysis_hover_annotations = {}
         self._analysis_scatter_files = {}
+        self._analysis_pending_pick = None
+        self._analysis_pick_load_timer = QTimer()
+        self._analysis_pick_load_timer.setSingleShot(True)
+        self._analysis_pick_load_timer.timeout.connect(
+            self._flush_pending_analysis_point_pick
+        )
         self.batch_row_height = 64
         self.batch_row_height_min = 40
         self.batch_row_height_max = 320
@@ -1613,7 +1623,7 @@ class ManualFitGUI(QMainWindow):
                 preview += f"\n... +{remaining} more"
             tooltip.append(f"Selected files ({len(selected_paths)}):\n{preview}")
         tooltip.append(
-            "Click to choose a folder, a ZIP archive, or one/more CSV files."
+            "Click to choose a folder, an archive, or one/more CSV files."
         )
         self.source_path_label.setToolTip("\n\n".join(tooltip))
 
@@ -7629,6 +7639,10 @@ class ManualFitGUI(QMainWindow):
 
     def _show_analysis_message(self, message) -> None:
         self._analysis_scatter_files = {}
+        self._analysis_pending_pick = None
+        timer = getattr(self, "_analysis_pick_load_timer", None)
+        if timer is not None and timer.isActive():
+            timer.stop()
         self._set_analysis_canvas_height(1)
         self.analysis_fig.clear()
         ax: Axes = self.analysis_fig.add_subplot(111)
@@ -8056,6 +8070,78 @@ class ManualFitGUI(QMainWindow):
     def _on_analysis_plot_leave(self, _event) -> None:
         self._hide_hover_annotations()
 
+    @staticmethod
+    def _analysis_pick_signature(mouse_event) -> Any:
+        if mouse_event is None:
+            return None
+        return id(mouse_event)
+
+    @staticmethod
+    def _analysis_pick_nearest_index(
+        artist,
+        picked_indices,
+        mouse_event,
+    ) -> Tuple[None | int, float]:
+        if picked_indices is None:
+            return (None, float("inf"))
+
+        try:
+            indices = np.asarray(list(picked_indices), dtype=int).reshape(-1)
+        except Exception:
+            return (None, float("inf"))
+        if indices.size == 0:
+            return (None, float("inf"))
+
+        if (
+            mouse_event is None
+            or not hasattr(mouse_event, "x")
+            or not hasattr(mouse_event, "y")
+            or not isinstance(artist, PathCollection)
+        ):
+            return (int(indices[0]), float("inf"))
+
+        try:
+            offsets: np.ndarray[Tuple[int, ...], np.dtype[Any]] = np.asarray(
+                artist.get_offsets(),
+                dtype=float,
+            )
+        except Exception:
+            return (int(indices[0]), float("inf"))
+        if offsets.ndim != 2 or offsets.shape[1] < 2:
+            return (int(indices[0]), float("inf"))
+
+        valid = indices[(indices >= 0) & (indices < offsets.shape[0])]
+        if valid.size == 0:
+            return (None, float("inf"))
+
+        axis: Axes | None = getattr(artist, "axes", None)
+        if axis is None:
+            return (int(valid[0]), float("inf"))
+
+        try:
+            display_xy: np.ndarray[Tuple[int, ...], np.dtype[Any]] = axis.transData.transform(
+                offsets[valid, :2]
+            )
+            ex = float(mouse_event.x)
+            ey = float(mouse_event.y)
+            d2: np.ndarray[Tuple[int, ...], np.dtype[Any]] = np.square(
+                display_xy[:, 0] - ex
+            ) + np.square(display_xy[:, 1] - ey)
+            best_local_idx: int = int(np.argmin(d2))
+            return (int(valid[best_local_idx]), float(d2[best_local_idx]))
+        except Exception:
+            return (int(valid[0]), float("inf"))
+
+    def _flush_pending_analysis_point_pick(self) -> None:
+        pending = getattr(self, "_analysis_pending_pick", None)
+        self._analysis_pending_pick = None
+        if not isinstance(pending, dict):
+            return
+        file_ref: str = str(pending.get("file_ref") or "").strip()
+        if not file_ref:
+            return
+        self._open_file_in_plot_tab(file_ref)
+
     def _on_analysis_point_picked(self, event) -> None:
         artist: Any | None = getattr(event, "artist", None)
         if artist is None:
@@ -8067,7 +8153,14 @@ class ManualFitGUI(QMainWindow):
         picked: Any | None = getattr(event, "ind", None)
         if picked is None or len(picked) == 0:
             return
-        point_idx = int(picked[0])
+        mouse_event = getattr(event, "mouseevent", None)
+        point_idx, distance2 = self._analysis_pick_nearest_index(
+            artist,
+            picked,
+            mouse_event,
+        )
+        if point_idx is None:
+            return
         if point_idx < 0 or point_idx >= len(file_refs):
             return
 
@@ -8077,7 +8170,28 @@ class ManualFitGUI(QMainWindow):
                 "Unable to resolve clicked point to a unique source file."
             )
             return
-        self._open_file_in_plot_tab(file_ref)
+        signature = self._analysis_pick_signature(mouse_event)
+        pending = getattr(self, "_analysis_pending_pick", None)
+        should_replace: bool = not isinstance(pending, dict)
+        if not should_replace:
+            if pending.get("signature") != signature:
+                should_replace = True
+            else:
+                prev_distance2 = float(pending.get("distance2", float("inf")))
+                should_replace = float(distance2) < prev_distance2
+
+        if should_replace:
+            self._analysis_pending_pick = {
+                "signature": signature,
+                "distance2": float(distance2),
+                "file_ref": str(file_ref),
+            }
+        timer = getattr(self, "_analysis_pick_load_timer", None)
+        if timer is None:
+            self._flush_pending_analysis_point_pick()
+            return
+        if not timer.isActive():
+            timer.start(20)
 
     def _linear_fit(self, x_data, y_data) -> None | Tuple[float, float]:
         if x_data.size < 2:
@@ -8095,6 +8209,10 @@ class ManualFitGUI(QMainWindow):
         if not hasattr(self, "analysis_fig"):
             return
         self._analysis_scatter_files = {}
+        self._analysis_pending_pick = None
+        timer = getattr(self, "_analysis_pick_load_timer", None)
+        if timer is not None and timer.isActive():
+            timer.stop()
         if not self.analysis_numeric_data:
             self._show_analysis_message("No numeric data available for analysis.")
             return
@@ -9891,7 +10009,7 @@ class ManualFitGUI(QMainWindow):
         return loaded_ok
 
     def load_files(self) -> None:
-        """Load CSV sources from a directory root, ZIP archive, or single CSV file."""
+        """Load CSV sources from a directory root, archive, or single CSV file."""
         source_path: Path = Path(self.current_dir).expanduser()
         files = []
         empty_message = "No CSV files found in selected source."
@@ -9901,38 +10019,34 @@ class ManualFitGUI(QMainWindow):
 
         if source_path.is_dir():
             csv_files = []
-            zip_paths = []
+            archive_paths = []
             for candidate in sorted(source_path.rglob("*")):
                 if not candidate.is_file():
                     continue
                 suffix: str = candidate.suffix.lower()
                 if suffix == ".csv":
                     csv_files.append(str(candidate))
-                elif suffix == ".zip":
-                    zip_paths.append(candidate)
+                elif is_supported_archive_path(candidate):
+                    archive_paths.append(candidate)
 
-            zip_members = []
-            for zip_path in zip_paths:
+            archive_members = []
+            for archive_path in archive_paths:
                 try:
-                    with zipfile.ZipFile(zip_path) as zf:
-                        for member in sorted(zf.namelist()):
-                            if member.lower().endswith(".csv") and not member.endswith(
-                                "/"
-                            ):
-                                zip_members.append(f"{zip_path}::{member}")
+                    members = list_archive_csv_members(archive_path)
                 except Exception:
                     continue
-            files = csv_files + zip_members
-        elif source_path.is_file() and source_path.suffix.lower() == ".zip":
+                archive_members.extend(
+                    f"{archive_path}::{member}" for member in members
+                )
+            files = csv_files + archive_members
+        elif source_path.is_file() and is_supported_archive_path(source_path):
             try:
-                with zipfile.ZipFile(source_path) as zf:
-                    files: List[str] = [
-                        f"{source_path}::{member}"
-                        for member in sorted(zf.namelist())
-                        if member.lower().endswith(".csv") and not member.endswith("/")
-                    ]
+                files = [
+                    f"{source_path}::{member}"
+                    for member in list_archive_csv_members(source_path)
+                ]
             except Exception as exc:
-                empty_message: str = f"Failed to read ZIP root: {exc}"
+                empty_message: str = f"Failed to read archive root: {exc}"
                 files = []
         elif source_path.is_file() and source_path.suffix.lower() == ".csv":
             files: List[str] = [str(source_path)]
@@ -10365,13 +10479,13 @@ class ManualFitGUI(QMainWindow):
         self.update_plot(fast=False)
 
     def browse_directory(self) -> None:
-        """Choose source mode and load from folder, ZIP, or selected CSV files."""
+        """Choose source mode and load from folder, archive, or selected CSV files."""
         start_dir: Path = self._source_dialog_start_dir()
 
         source_menu = QMenu(self)
         folder_action: QAction | None = source_menu.addAction("Load Folder...")
         csv_action: QAction | None = source_menu.addAction("Load CSV File(s)...")
-        zip_action: QAction | None = source_menu.addAction("Load ZIP Archive...")
+        archive_action: QAction | None = source_menu.addAction("Load Archive...")
 
         if hasattr(self, "source_path_label"):
             anchor: QPoint = self.source_path_label.mapToGlobal(
@@ -10382,7 +10496,7 @@ class ManualFitGUI(QMainWindow):
         selected_action: QAction | None = source_menu.exec(anchor)
         if selected_action is None:
             return
-        if selected_action not in {folder_action, csv_action, zip_action}:
+        if selected_action not in {folder_action, csv_action, archive_action}:
             return
 
         if selected_action == folder_action:
@@ -10401,20 +10515,23 @@ class ManualFitGUI(QMainWindow):
             self.load_files()
             return
 
-        if selected_action == zip_action:
-            selected_zip, _ = QFileDialog.getOpenFileName(
+        if selected_action == archive_action:
+            selected_archive, _ = QFileDialog.getOpenFileName(
                 self,
-                "Select ZIP Archive",
+                "Select Archive",
                 str(start_dir),
-                "ZIP Archives (*.zip);;All Files (*.*)",
+                "Archive Files (*.zip *.tar.xz);;ZIP Archives (*.zip);;"
+                "TAR.XZ Archives (*.tar.xz);;All Files (*.*)",
             )
-            if not selected_zip:
+            if not selected_archive:
                 return
-            chosen_zip: Path = Path(selected_zip).expanduser()
-            if not chosen_zip.exists():
-                self.stats_text.append(f"Selected path does not exist: {chosen_zip}")
+            chosen_archive: Path = Path(selected_archive).expanduser()
+            if not chosen_archive.exists():
+                self.stats_text.append(
+                    f"Selected path does not exist: {chosen_archive}"
+                )
                 return
-            self.current_dir = str(chosen_zip)
+            self.current_dir = str(chosen_archive)
             self._source_display_override = None
             self._source_selected_paths = []
             self._refresh_source_path_label()
@@ -13034,12 +13151,19 @@ class ManualFitGUI(QMainWindow):
         if not file_path:
             return False
 
-        if file_path not in self.data_files:
+        current_file = self._current_loaded_file_path()
+        if current_file is not None and str(current_file) == str(file_path):
+            self.tabs.setCurrentWidget(self.manual_tab)
+            return True
+
+        try:
+            file_idx: int = self.data_files.index(file_path)
+        except ValueError:
             self.data_files.append(file_path)
             self.file_combo.addItem(stem_for_file_ref(file_path), file_path)
             self._sync_batch_files_from_shared(sync_pattern=False)
+            file_idx = len(self.data_files) - 1
 
-        file_idx: int = self.data_files.index(file_path)
         self.load_file(file_idx)
         self.tabs.setCurrentWidget(self.manual_tab)
         return True

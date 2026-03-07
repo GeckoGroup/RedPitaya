@@ -1,7 +1,7 @@
 {
   "format": "manual_fit_gui_details",
   "version": 9,
-  "saved_at_utc": "2026-03-06T14:32:42.529537+00:00",
+  "saved_at_utc": "2026-03-06T19:31:15.698737+00:00",
   "gui": {
     "equation": "CH2 = V_0 ; abs(A_MI*sin(A_mod*sin(2*pi*f_mod*x+pi*(phi + phi_delta))+pi*phi_MI))**2+V_MI0 ; V_0\nCH3 = V_off ; V_on*sin(2*pi*f_mod*x+pi*phi) ; V_off\nCH4 = TTL_0 ; TTL_1",
     "x_channel": "TIME",
@@ -42,20 +42,20 @@
       "TTL_1": null
     },
     "boundary_ratios": [
-      0.1129372035907859,
-      0.4433632238571952
+      0.4658495899569825,
+      0.7011062921227946
     ],
     "boundary_ratios_per_channel": {
       "CH2": [
-        0.1129372035907859,
-        0.4433632238571952
+        0.4658495899569825,
+        0.7011062921227946
       ],
       "CH3": [
-        0.10935382791327913,
-        0.444876183433856
+        0.4652236369695575,
+        0.70145955179011
       ],
       "CH4": [
-        0.10777121443089431
+        0.4652372862305237
       ]
     },
     "boundary_name_map": {
@@ -294,6 +294,14 @@
           "step_type": "fit"
         }
       ],
+      "latest_key_changes": [
+        "R\u00b2=0.999752: TTL_0=0.124925, TTL_1=4.16352",
+        "R\u00b2=-0.000002: phi=1.99814, V_on=3.01602, V_off=-0.0102639, f_mod=3.39405e-06"
+      ],
+      "run_log": [
+        "R\u00b2=0.999752: TTL_0=0.124925, TTL_1=4.16352",
+        "R\u00b2=-0.000002: phi=1.99814, V_on=3.01602, V_off=-0.0102639, f_mod=3.39405e-06"
+      ],
       "last_status": "Procedure cancelled [379269.02Hz_SINE_AFG_v1]."
     }
   },
@@ -306,7 +314,7 @@
       "min_value": 0.0,
       "max_value": 10.0,
       "decimals": 4,
-      "value": 2.6986,
+      "value": 4.7278,
       "fixed": false
     },
     {
@@ -317,7 +325,7 @@
       "min_value": 0.0,
       "max_value": 10.0,
       "decimals": 4,
-      "value": 2.0793,
+      "value": 1.9836,
       "fixed": false
     },
     {
@@ -328,7 +336,7 @@
       "min_value": 0.0,
       "max_value": 10.0,
       "decimals": 4,
-      "value": 0.708,
+      "value": 1.8927,
       "fixed": false
     },
     {
@@ -339,7 +347,7 @@
       "min_value": 0.0,
       "max_value": 1100000.0,
       "decimals": 4,
-      "value": 378915.0564,
+      "value": 99.9817,
       "fixed": false
     },
     {
@@ -350,7 +358,7 @@
       "min_value": 0.0,
       "max_value": 2.0,
       "decimals": 6,
-      "value": 1.688561,
+      "value": 0.788241,
       "fixed": false
     },
     {
@@ -361,7 +369,7 @@
       "min_value": -0.5,
       "max_value": 0.0,
       "decimals": 6,
-      "value": -0.260099,
+      "value": -0.030788,
       "fixed": false
     },
     {
@@ -372,7 +380,7 @@
       "min_value": 0.0,
       "max_value": 2.0,
       "decimals": 4,
-      "value": 0.2027,
+      "value": 1.6111,
       "fixed": false
     },
     {
@@ -383,7 +391,7 @@
       "min_value": 0.0,
       "max_value": 7.0,
       "decimals": 6,
-      "value": 1.167463,
+      "value": 1.256772,
       "fixed": false
     },
     {
@@ -394,7 +402,7 @@
       "min_value": -1.0,
       "max_value": 1.0,
       "decimals": 6,
-      "value": -0.020132,
+      "value": -0.010261,
       "fixed": false
     },
     {
@@ -405,7 +413,7 @@
       "min_value": 3.0,
       "max_value": 8.0,
       "decimals": 6,
-      "value": 5.140668,
+      "value": 5.047977,
       "fixed": false
     },
     {
@@ -416,7 +424,7 @@
       "min_value": -1.0,
       "max_value": 1.0,
       "decimals": 6,
-      "value": 0.099725,
+      "value": 0.11597,
       "fixed": false
     },
     {
@@ -427,7 +435,7 @@
       "min_value": 4.0,
       "max_value": 6.0,
       "decimals": 6,
-      "value": 4.159132,
+      "value": 4.162514,
       "fixed": false
     }
   ],
