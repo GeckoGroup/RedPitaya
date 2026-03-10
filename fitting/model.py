@@ -3,6 +3,7 @@
 import ast
 import math
 import time
+import threading
 from dataclasses import dataclass
 from typing import (
     Any,
@@ -16,9 +17,9 @@ from typing import (
 )
 
 import numpy as np
-from scipy.optimize import least_squares
 
 from fit_results import fit_get
+from periodic_params import normalize_periodic_params
 
 from expression import (
     _ExpressionParameterCollector,
@@ -37,6 +38,17 @@ from solver import (
     _boundary_ratio_diff_step_from_x,
     _auto_blend_width,
 )
+
+_JAX_FIT_MANAGER: Any = None
+
+
+def _get_jax_fit_manager_cached():
+    global _JAX_FIT_MANAGER
+    if _JAX_FIT_MANAGER is None:
+        from jax_backend import get_jax_fit_manager
+
+        _JAX_FIT_MANAGER = get_jax_fit_manager()
+    return _JAX_FIT_MANAGER
 
 
 @dataclass(frozen=True)
@@ -505,88 +517,112 @@ def build_multi_channel_model_definition(
         boundary_links=tuple(normalised_links),
     )
 
+_JAX_SEGMENT_TEMPLATE_CACHE: Dict[Tuple[Any, ...], Tuple[Tuple[Any, ...], ...]] = {}
+_JAX_SEGMENT_TEMPLATE_CACHE_LOCK = threading.Lock()
+
+
+def _jax_segment_cache_key(
+    model_def: PiecewiseModelDefinition,
+    bounds_map: Mapping[str, Tuple[float, float]],
+    fixed_map: Mapping[str, float],
+) -> Tuple[Any, ...]:
+    bound_items: List[Tuple[str, float, float]] = []
+    for name in model_def.global_param_names:
+        low_raw, high_raw = bounds_map[name]
+        low = float(min(low_raw, high_raw))
+        high = float(max(low_raw, high_raw))
+        bound_items.append((str(name), low, high))
+    fixed_items = tuple(sorted((str(k), float(v)) for k, v in fixed_map.items()))
+    return (
+        tuple(model_def.segment_exprs),
+        tuple(tuple(seg) for seg in model_def.segment_param_names),
+        tuple(bound_items),
+        fixed_items,
+    )
+
+
+def _get_jax_segment_templates(
+    model_def: PiecewiseModelDefinition,
+    bounds_map: Mapping[str, Tuple[float, float]],
+    fixed_map: Mapping[str, float],
+) -> Tuple[Tuple[Any, ...], ...]:
+    cache_key = _jax_segment_cache_key(model_def, bounds_map, fixed_map)
+    with _JAX_SEGMENT_TEMPLATE_CACHE_LOCK:
+        cached = _JAX_SEGMENT_TEMPLATE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    from jax_backend import build_jax_model_func
+
+    templates: List[Tuple[Any, ...]] = []
+    for seg_names, expr in zip(model_def.segment_param_names, model_def.segment_exprs):
+        model_func, free_names = build_jax_model_func(expr, seg_names, fixed_map)
+        lo: List[float] = []
+        hi: List[float] = []
+        for name in free_names:
+            low_raw, high_raw = bounds_map[name]
+            low = float(min(low_raw, high_raw))
+            high = float(max(low_raw, high_raw))
+            lo.append(low)
+            hi.append(high)
+        templates.append(
+            (
+                model_func,
+                tuple(free_names),
+                np.asarray(lo, dtype=float),
+                np.asarray(hi, dtype=float),
+            )
+        )
+
+    out = tuple(templates)
+    with _JAX_SEGMENT_TEMPLATE_CACHE_LOCK:
+        _JAX_SEGMENT_TEMPLATE_CACHE[cache_key] = out
+    return out
 
 def make_segment_specs(
     model_def: PiecewiseModelDefinition,
     seed_map: Mapping[str, float],
     bounds_map: Mapping[str, Tuple[float, float]],
     fixed_param_values: Optional[Mapping[str, float]] = None,
-    use_jax: bool = False,
+    periodic_params: Optional[Mapping[str, Any]] = None,
 ) -> Sequence[SegmentSpec]:
-    # When JAX backend is enabled, build JAX-traceable model functions
-    # so that jaxfit can auto-differentiate through them on the GPU.
-    if use_jax:
-        try:
-            from jax_backend import make_jax_segment_specs
-
-            t0 = time.perf_counter()
-            specs, _, _ = make_jax_segment_specs(
-                model_def.segment_exprs,
-                model_def.segment_param_names,
-                seed_map,
-                bounds_map,
-                fixed_param_values,
-            )
-            _fit_log.detail(
-                f"jax segment specs: {len(specs)}seg {time.perf_counter() - t0:.4f}s"
-            )
-            return tuple(specs)
-        except Exception as _jax_exc:
-            _fit_log.detail(f"jax segment specs fallback: {_jax_exc}")
-            pass  # fall back to numpy path
-
+    # Reuse cached per-step model templates so repeated fits
+    # (GUI procedures/retries) avoid expression recompilation and
+    # reallocation overhead.
     fixed_map = {
         str(key): float(value)
         for key, value in dict(fixed_param_values or {}).items()
         if str(key).strip()
     }
-    segments: List[SegmentSpec] = []
-    for seg_names, seg_eval in zip(
-        model_def.segment_param_names, model_def.segment_evaluators
-    ):
-        lo: List[float] = []
-        hi: List[float] = []
-        p0: List[float] = []
-        free_names: List[str] = []
-        fixed_items: List[Tuple[str, float]] = []
-        for name in seg_names:
-            if name in fixed_map:
-                fixed_items.append((name, float(fixed_map[name])))
-                continue
-            low, high = bounds_map[name]
-            if low > high:
-                low, high = high, low
-            start = float(seed_map[name])
-            lo.append(float(low))
-            hi.append(float(high))
-            p0.append(float(np.clip(start, low, high)))
-            free_names.append(name)
-
-        # Pre-build fixed param template (values already float, skip per-call conversion).
-        _fixed_template = {key: float(value) for key, value in fixed_items}
-
-        def model_func(
-            x_vals,
-            *vals,
-            _free_names=tuple(free_names),
-            _template=_fixed_template,
-            _eval=seg_eval,
-        ):
-            local_map = dict(_template)
-            for idx, key in enumerate(_free_names):
-                local_map[key] = float(vals[idx])
-            return _eval(x_vals, local_map)
-
-        segments.append(
+    periodic_map = normalize_periodic_params(periodic_params)
+    t0 = time.perf_counter()
+    templates = _get_jax_segment_templates(model_def, bounds_map, fixed_map)
+    specs: List[SegmentSpec] = []
+    for model_func, free_names, lo_arr, hi_arr in templates:
+        p0 = [
+            float(np.clip(float(seed_map[name]), low, high))
+            for name, low, high in zip(free_names, lo_arr, hi_arr)
+        ]
+        periodic_mask, periodic_periods, periodic_offsets = (
+            _periodic_arrays_for_param_names(free_names, bounds_map, periodic_map)
+        )
+        specs.append(
             SegmentSpec(
                 model_func=model_func,
                 p0=p0,
-                bounds=(lo, hi),
+                bounds=(lo_arr.tolist(), hi_arr.tolist()),
+                periodic_mask=periodic_mask.tolist(),
+                periodic_periods=periodic_periods.tolist(),
+                periodic_offsets=periodic_offsets.tolist(),
                 n_starts=2,
                 maxfev=3000,
             )
         )
-    return tuple(segments)
+    _fit_log.detail(
+        f"jax segment specs (cached templates): {len(specs)}seg "
+        f"{time.perf_counter() - t0:.4f}s"
+    )
+    return tuple(specs)
 
 
 def shared_to_local_flat(
@@ -662,6 +698,95 @@ def _normalize_fixed_boundary_ratios(
     return out
 
 
+def _periodic_arrays_for_param_names(
+    param_names: Sequence[str],
+    bounds_map: Mapping[str, Tuple[float, float]],
+    periodic_params: Optional[Mapping[str, Any]],
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    names = [str(name) for name in list(param_names)]
+    n = len(names)
+    mask = np.zeros(n, dtype=bool)
+    periods = np.ones(n, dtype=float)
+    offsets = np.zeros(n, dtype=float)
+    periodic_map = normalize_periodic_params(periodic_params)
+    for idx, name in enumerate(names):
+        if not bool(periodic_map.get(name, False)):
+            continue
+        if name not in bounds_map:
+            raise ValueError(f"Missing bounds for periodic parameter '{name}'.")
+        low_raw, high_raw = bounds_map[name]
+        low = float(min(low_raw, high_raw))
+        high = float(max(low_raw, high_raw))
+        span = float(high - low)
+        if not (np.isfinite(low) and np.isfinite(high) and span > 0.0):
+            raise ValueError(
+                f"Periodic parameter '{name}' requires finite bounds with non-zero span."
+            )
+        mask[idx] = True
+        periods[idx] = span
+        offsets[idx] = low
+    return mask, periods, offsets
+
+
+def _uniform_downsample_indices(n_points: int, max_points: int) -> Optional[np.ndarray]:
+    """Return monotonic indices for uniform downsampling, or None when not needed."""
+    n = int(max(0, n_points))
+    cap = int(max(0, max_points))
+    if cap <= 0 or n <= cap:
+        return None
+    idx = np.linspace(0, n - 1, num=cap, dtype=int)
+    idx = np.unique(np.asarray(idx, dtype=int))
+    if idx.size >= n:
+        return None
+    return idx
+
+
+def _scaled_nfev(base_nfev: float, scale: float, lo: int, hi: int) -> int:
+    try:
+        numeric_scale = float(scale)
+    except Exception:
+        numeric_scale = 1.0
+    if not np.isfinite(numeric_scale) or numeric_scale <= 0.0:
+        numeric_scale = 1.0
+    return int(np.clip(float(base_nfev) * numeric_scale, int(lo), int(hi)))
+
+
+def _periodic_opt_vectors(
+    total_size: int,
+    free_size: int,
+    periodic_mask: np.ndarray,
+    periodic_periods: np.ndarray,
+    periodic_offsets: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Build optimizer-sized periodic arrays with periodic info in the free prefix."""
+    total = int(max(0, total_size))
+    n_free = int(max(0, free_size))
+    mask = np.zeros(total, dtype=bool)
+    periods = np.ones(total, dtype=float)
+    offsets = np.zeros(total, dtype=float)
+    if n_free <= 0:
+        return mask, periods, offsets
+    p_mask = np.asarray(periodic_mask, dtype=bool).reshape(-1)
+    if p_mask.size != n_free:
+        raise ValueError(
+            f"periodic_mask/free_size mismatch: {p_mask.size} != {n_free}."
+        )
+    p_periods = np.asarray(periodic_periods, dtype=float).reshape(-1)
+    if p_periods.size != n_free:
+        raise ValueError(
+            f"periodic_periods/free_size mismatch: {p_periods.size} != {n_free}."
+        )
+    p_offsets = np.asarray(periodic_offsets, dtype=float).reshape(-1)
+    if p_offsets.size != n_free:
+        raise ValueError(
+            f"periodic_offsets/free_size mismatch: {p_offsets.size} != {n_free}."
+        )
+    mask[:n_free] = p_mask
+    periods[:n_free] = p_periods
+    offsets[:n_free] = p_offsets
+    return mask, periods, offsets
+
+
 def _run_initial_fit_stage(
     x_arr: np.ndarray,
     y_arr: np.ndarray,
@@ -669,7 +794,6 @@ def _run_initial_fit_stage(
     local_seed_flat: np.ndarray,
     n_boundaries: int,
     max_nfev: int,
-    use_jax: bool = False,
 ) -> "OrderedPiecewiseResult":
     """Run seed-based refinement for stage-A initialisation."""
     _ = n_boundaries
@@ -681,7 +805,6 @@ def _run_initial_fit_stage(
         config=OrderedPiecewiseConfig(
             robust_max_nfev=max_nfev,
             prefer_jit=True,
-            use_jax=use_jax,
         ),
     )
 
@@ -692,13 +815,17 @@ def run_piecewise_fit_pipeline(
     model_def: PiecewiseModelDefinition,
     seed_map: Mapping[str, float],
     bounds_map: Mapping[str, Tuple[float, float]],
+    periodic_params: Optional[Mapping[str, Any]] = None,
     boundary_seed: Optional[np.ndarray] = None,
     cancel_check: Optional[Callable[[], bool]] = None,
     fixed_params: Optional[Mapping[str, float]] = None,
     fixed_boundary_ratios: Optional[Mapping[int, float]] = None,
     n_random_restarts: int = 0,
     rng_seed: Optional[int] = None,
-    use_jax: bool = False,
+    screening: bool = False,
+    max_points: Optional[int] = None,
+    stage_a_nfev_scale: float = 1.0,
+    stage_b_nfev_scale: float = 1.0,
 ) -> Dict[str, Any]:
     total_t0 = time.perf_counter()
     x_arr = np.asarray(x_data, dtype=float).reshape(-1)
@@ -707,10 +834,15 @@ def run_piecewise_fit_pipeline(
         raise ValueError("x and y must have equal length.")
     if x_arr.size < 8:
         raise ValueError("Not enough points to run piecewise fitting.")
+    downsample_idx = _uniform_downsample_indices(x_arr.size, int(max_points or 0))
+    if downsample_idx is not None and downsample_idx.size >= 8:
+        x_arr = np.asarray(x_arr[downsample_idx], dtype=float)
+        y_arr = np.asarray(y_arr[downsample_idx], dtype=float)
 
     global_names = list(model_def.global_param_names)
     allowed_names = set(global_names)
     global_index = {name: idx for idx, name in enumerate(global_names)}
+    periodic_by_key = normalize_periodic_params(periodic_params)
 
     seed_by_key: Dict[str, float] = {}
     for name in global_names:
@@ -722,6 +854,19 @@ def run_piecewise_fit_pipeline(
             raise ValueError(f"Seed for parameter '{name}' is non-numeric.") from exc
         if not np.isfinite(value):
             raise ValueError(f"Seed for parameter '{name}' is not finite.")
+        if name in bounds_map:
+            low_raw, high_raw = bounds_map[name]
+            low = float(min(low_raw, high_raw))
+            high = float(max(low_raw, high_raw))
+            if bool(periodic_by_key.get(name)):
+                span = float(high - low)
+                if not (np.isfinite(low) and np.isfinite(high) and span > 0.0):
+                    raise ValueError(
+                        f"Periodic parameter '{name}' requires finite bounds with non-zero span."
+                    )
+                value = float(low + np.mod(value - low, span))
+            else:
+                value = float(np.clip(value, low, high))
         seed_by_key[name] = float(value)
 
     fixed_by_key: Dict[str, float] = {}
@@ -743,11 +888,19 @@ def run_piecewise_fit_pipeline(
             low_raw, high_raw = bounds_map[key]
             low = float(min(low_raw, high_raw))
             high = float(max(low_raw, high_raw))
-            tolerance = 1e-12 * max(1.0, abs(low), abs(high))
-            if numeric < (low - tolerance) or numeric > (high + tolerance):
-                raise ValueError(
-                    f"Fixed value for parameter '{key}'={numeric:.6g} is outside [{low:.6g}, {high:.6g}]."
-                )
+            if bool(periodic_by_key.get(key)):
+                span = float(high - low)
+                if not (np.isfinite(low) and np.isfinite(high) and span > 0.0):
+                    raise ValueError(
+                        f"Periodic parameter '{key}' requires finite bounds with non-zero span."
+                    )
+                numeric = float(low + np.mod(float(numeric - low), span))
+            else:
+                tolerance = 1e-12 * max(1.0, abs(low), abs(high))
+                if numeric < (low - tolerance) or numeric > (high + tolerance):
+                    raise ValueError(
+                        f"Fixed value for parameter '{key}'={numeric:.6g} is outside [{low:.6g}, {high:.6g}]."
+                    )
         fixed_by_key[key] = float(numeric)
         seed_by_key[key] = float(numeric)
 
@@ -771,13 +924,21 @@ def run_piecewise_fit_pipeline(
         for name, value in fixed_by_key.items()
         if name in global_index
     ]
+    free_periodic_mask, free_periodic_periods, free_periodic_offsets = (
+        _periodic_arrays_for_param_names(
+            free_param_names,
+            bounds_map,
+            periodic_by_key,
+        )
+    )
+    has_free_periodic = bool(np.any(free_periodic_mask))
 
     segments = make_segment_specs(
         model_def,
         seed_by_key,
         bounds_map,
         fixed_param_values=fixed_by_key,
-        use_jax=use_jax,
+        periodic_params=periodic_by_key,
     )
     n_boundaries = max(0, len(segments) - 1)
     if boundary_seed is None:
@@ -826,7 +987,6 @@ def run_piecewise_fit_pipeline(
         boundaries=n_boundaries,
         free_boundaries=int(free_boundary_indices.size),
         restarts=int(max(0, n_random_restarts)),
-        use_jax=use_jax,
     )
 
     if n_local_params == 0 and free_boundary_indices.size == 0:
@@ -852,7 +1012,20 @@ def run_piecewise_fit_pipeline(
         )
         return fixed_result
 
-    stage_a_nfev = int(np.clip(700 * max(1, local_seed_flat.size), 3000, 14000))
+    if screening:
+        stage_a_nfev = _scaled_nfev(
+            700 * max(1, local_seed_flat.size),
+            stage_a_nfev_scale,
+            1200,
+            5000,
+        )
+    else:
+        stage_a_nfev = _scaled_nfev(
+            700 * max(1, local_seed_flat.size),
+            stage_a_nfev_scale,
+            3000,
+            14000,
+        )
     stage_a_t0 = time.perf_counter()
     stage_a = _run_initial_fit_stage(
         x_arr,
@@ -861,7 +1034,6 @@ def run_piecewise_fit_pipeline(
         local_seed_flat,
         n_boundaries,
         stage_a_nfev,
-        use_jax=use_jax,
     )
     stage_a_elapsed = time.perf_counter() - stage_a_t0
     _fit_log.solver_stage(
@@ -869,7 +1041,6 @@ def run_piecewise_fit_pipeline(
         stage_a_elapsed,
         sse=getattr(stage_a, "sse", None),
         nfev=stage_a_nfev,
-        use_jax=use_jax,
     )
     if is_cancelled():
         raise FitCancelledError("cancelled")
@@ -907,15 +1078,12 @@ def run_piecewise_fit_pipeline(
         if free_boundary_indices.size > 0
         else np.asarray([], dtype=float)
     )
-    lower = np.concatenate(
-        [free_lower, np.zeros(int(free_boundary_indices.size), dtype=float)]
-    )
-    upper = np.concatenate(
-        [free_upper, np.ones(int(free_boundary_indices.size), dtype=float)]
-    )
+    lower = np.concatenate([free_lower, np.zeros(int(free_boundary_indices.size), dtype=float)])
+    upper = np.concatenate([free_upper, np.ones(int(free_boundary_indices.size), dtype=float)])
+    x0_free = np.asarray(shared_init_free, dtype=float)
     x0 = np.concatenate(
         [
-            np.clip(shared_init_free, free_lower, free_upper),
+            np.clip(x0_free, free_lower, free_upper),
             np.clip(free_boundary_seed, 0.0, 1.0),
         ]
     )
@@ -931,8 +1099,24 @@ def run_piecewise_fit_pipeline(
     def _compose_shared_vector(free_values: np.ndarray) -> np.ndarray:
         np.copyto(shared_work, shared_template)
         if n_free > 0:
-            shared_work[free_param_indices] = np.asarray(free_values, dtype=float)
+            free_vals = np.asarray(free_values, dtype=float)
+            shared_work[free_param_indices] = free_vals
         return shared_work
+
+    if has_free_periodic:
+        periodic_mask_opt, periodic_periods_opt, periodic_offsets_opt = (
+            _periodic_opt_vectors(
+                x0.size,
+                n_free,
+                free_periodic_mask,
+                free_periodic_periods,
+                free_periodic_offsets,
+            )
+        )
+    else:
+        periodic_mask_opt = np.zeros(x0.size, dtype=bool)
+        periodic_periods_opt = np.ones(x0.size, dtype=float)
+        periodic_offsets_opt = np.zeros(x0.size, dtype=float)
 
     def _compose_local_flat(
         shared_values: np.ndarray, free_boundary_values: np.ndarray
@@ -1003,12 +1187,28 @@ def run_piecewise_fit_pipeline(
             if free_boundary_indices.size > 0:
                 diff_step = np.full(x0.size, 1e-6, dtype=float)
                 diff_step[n_free:] = _boundary_ratio_diff_step_from_x(x_arr)
-            shared_refine_nfev = int(np.clip(500 * max(1, x0.size), 2500, 14000))
-            ls = least_squares(
+            if screening:
+                shared_refine_nfev = _scaled_nfev(
+                    500 * max(1, x0.size),
+                    stage_b_nfev_scale,
+                    1000,
+                    6000,
+                )
+            else:
+                shared_refine_nfev = _scaled_nfev(
+                    500 * max(1, x0.size),
+                    stage_b_nfev_scale,
+                    2500,
+                    14000,
+                )
+            jax_mgr = _get_jax_fit_manager_cached()
+            ls = jax_mgr.least_squares(
                 residuals,
                 x0,
                 bounds=(lower, upper),
-                method="trf",
+                periodic_mask=periodic_mask_opt,
+                periodic_periods=periodic_periods_opt,
+                periodic_offsets=periodic_offsets_opt,
                 loss="soft_l1",
                 f_scale=0.5,
                 max_nfev=shared_refine_nfev,
@@ -1104,11 +1304,16 @@ def run_piecewise_fit_pipeline(
                     model_def,
                     restart_seed,
                     bounds_map,
+                    periodic_params=periodic_by_key,
                     boundary_seed=restart_boundary,
                     cancel_check=cancel_check,
                     fixed_params=fixed_params,
                     fixed_boundary_ratios=fixed_boundary_map,
                     n_random_restarts=0,
+                    screening=screening,
+                    max_points=max_points,
+                    stage_a_nfev_scale=stage_a_nfev_scale,
+                    stage_b_nfev_scale=stage_b_nfev_scale,
                 )
             except FitCancelledError:
                 raise
@@ -1144,7 +1349,6 @@ def run_piecewise_fit_pipeline(
         restarts=n_restarts,
         restart_elapsed=restarts_elapsed,
         restart_improved=restart_improved_count,
-        use_jax=use_jax,
     )
     return best_result
 
@@ -1155,6 +1359,7 @@ def run_multi_channel_fit_pipeline(
     multi_model: MultiChannelModelDefinition,
     seed_map: Mapping[str, float],
     bounds_map: Mapping[str, Tuple[float, float]],
+    periodic_params: Optional[Mapping[str, Any]] = None,
     boundary_seeds: Optional[Mapping[str, np.ndarray]] = None,
     cancel_check: Optional[Callable[[], bool]] = None,
     fixed_params: Optional[Mapping[str, float]] = None,
@@ -1163,7 +1368,10 @@ def run_multi_channel_fit_pipeline(
     ] = None,
     n_random_restarts: int = 0,
     rng_seed: Optional[int] = None,
-    use_jax: bool = False,
+    screening: bool = False,
+    max_points: Optional[int] = None,
+    stage_a_nfev_scale: float = 1.0,
+    stage_b_nfev_scale: float = 1.0,
 ) -> Dict[str, Any]:
     """Fit shared parameters across multiple channel equations simultaneously.
 
@@ -1175,9 +1383,24 @@ def run_multi_channel_fit_pipeline(
     x_arr = np.asarray(x_data, dtype=float).reshape(-1)
     if x_arr.size < 8:
         raise ValueError("Not enough points to run multi-channel fitting.")
+    downsample_idx = _uniform_downsample_indices(x_arr.size, int(max_points or 0))
+    if downsample_idx is not None and downsample_idx.size >= 8:
+        x_arr = np.asarray(x_arr[downsample_idx], dtype=float)
+    y_data_map: Dict[str, np.ndarray] = {
+        str(ch): np.asarray(vals, dtype=float).reshape(-1)
+        for ch, vals in dict(y_data_by_channel).items()
+    }
+    if downsample_idx is not None and downsample_idx.size >= 8:
+        for ch, vals in list(y_data_map.items()):
+            if vals.size < int(np.max(downsample_idx)) + 1:
+                raise ValueError(
+                    f"Channel '{ch}' data length ({vals.size}) is incompatible with downsample indices."
+                )
+            y_data_map[ch] = np.asarray(vals[downsample_idx], dtype=float).reshape(-1)
 
     global_names = list(multi_model.global_param_names)
     global_index = {name: idx for idx, name in enumerate(global_names)}
+    periodic_by_key = normalize_periodic_params(periodic_params)
     boundary_seeds_map = dict(boundary_seeds or {})
     fixed_boundary_raw = {
         str(k): dict(v or {})
@@ -1195,6 +1418,19 @@ def run_multi_channel_fit_pipeline(
             continue
         if not np.isfinite(numeric):
             continue
+        if key in bounds_map:
+            low_raw, high_raw = bounds_map[key]
+            low = float(min(low_raw, high_raw))
+            high = float(max(low_raw, high_raw))
+            if bool(periodic_by_key.get(key)):
+                span = float(high - low)
+                if not (np.isfinite(low) and np.isfinite(high) and span > 0.0):
+                    continue
+                numeric = float(low + np.mod(float(numeric - low), span))
+            else:
+                tolerance = 1e-12 * max(1.0, abs(low), abs(high))
+                if numeric < (low - tolerance) or numeric > (high + tolerance):
+                    continue
         fixed_by_key[key] = float(numeric)
 
     seed_by_key: Dict[str, float] = {}
@@ -1204,6 +1440,19 @@ def run_multi_channel_fit_pipeline(
         value = float(seed_map[name])
         if not np.isfinite(value):
             raise ValueError(f"Seed for parameter '{name}' is not finite.")
+        if name in bounds_map:
+            low_raw, high_raw = bounds_map[name]
+            low = float(min(low_raw, high_raw))
+            high = float(max(low_raw, high_raw))
+            if bool(periodic_by_key.get(name)):
+                span = float(high - low)
+                if not (np.isfinite(low) and np.isfinite(high) and span > 0.0):
+                    raise ValueError(
+                        f"Periodic parameter '{name}' requires finite bounds with non-zero span."
+                    )
+                value = float(low + np.mod(value - low, span))
+            else:
+                value = float(np.clip(value, low, high))
         seed_by_key[name] = float(value)
     for key, value in fixed_by_key.items():
         seed_by_key[key] = float(value)
@@ -1228,15 +1477,23 @@ def run_multi_channel_fit_pipeline(
         for name, value in fixed_by_key.items()
         if name in global_index
     ]
+    free_periodic_mask, free_periodic_periods, free_periodic_offsets = (
+        _periodic_arrays_for_param_names(
+            free_param_names,
+            bounds_map,
+            periodic_by_key,
+        )
+    )
+    has_free_periodic = bool(np.any(free_periodic_mask))
 
     # Build per-channel segment specs and boundary info.
     channel_info: List[Dict[str, Any]] = []
     fixed_boundary_by_bid: Dict[Tuple[str, int], float] = {}
     for ch_model in multi_model.channel_models:
         target = ch_model.target_col
-        if target not in y_data_by_channel:
+        if target not in y_data_map:
             raise ValueError(f"Missing y-data for channel '{target}'.")
-        y_arr = np.asarray(y_data_by_channel[target], dtype=float).reshape(-1)
+        y_arr = np.asarray(y_data_map[target], dtype=float).reshape(-1)
         if y_arr.size != x_arr.size:
             raise ValueError(
                 f"Channel '{target}' data length ({y_arr.size}) != x length ({x_arr.size})."
@@ -1246,7 +1503,7 @@ def run_multi_channel_fit_pipeline(
             seed_by_key,
             bounds_map,
             fixed_param_values=fixed_by_key,
-            use_jax=use_jax,
+            periodic_params=periodic_by_key,
         )
         n_boundaries = max(0, len(segments) - 1)
         b_seed = boundary_seeds_map.get(target)
@@ -1293,7 +1550,6 @@ def run_multi_channel_fit_pipeline(
         n_free=len(free_param_names),
         n_fixed=len(fixed_by_key),
         restarts=int(max(0, n_random_restarts)),
-        use_jax=use_jax,
     )
 
     # Build shared optimization vector: [free_params, boundary_ch1, boundary_ch2, ...]
@@ -1314,7 +1570,20 @@ def run_multi_channel_fit_pipeline(
             local_seed[:n_local] = shared_seed[ch["local_to_global"]]
         if n_b > 0:
             local_seed[n_local:] = ch["boundary_seed"]
-        nfev = int(np.clip(700 * max(1, local_seed.size), 3000, 14000))
+        if screening:
+            nfev = _scaled_nfev(
+                700 * max(1, local_seed.size),
+                stage_a_nfev_scale,
+                1200,
+                5000,
+            )
+        else:
+            nfev = _scaled_nfev(
+                700 * max(1, local_seed.size),
+                stage_a_nfev_scale,
+                3000,
+                14000,
+            )
         ch_stage_t0 = time.perf_counter()
         stage = _run_initial_fit_stage(
             x_arr,
@@ -1323,7 +1592,6 @@ def run_multi_channel_fit_pipeline(
             local_seed,
             n_b,
             nfev,
-            use_jax=use_jax,
         )
         ch_stage_elapsed = time.perf_counter() - ch_stage_t0
         stage_a_total_elapsed += ch_stage_elapsed
@@ -1333,7 +1601,6 @@ def run_multi_channel_fit_pipeline(
             channel=ch["target"],
             sse=getattr(stage, "sse", None),
             nfev=nfev,
-            use_jax=use_jax,
         )
         ch["stage_a_local"] = np.asarray(stage.params[:n_local], dtype=float)
         ch["stage_a_boundary"] = np.asarray(stage.params[n_local:], dtype=float)
@@ -1452,9 +1719,10 @@ def run_multi_channel_fit_pipeline(
 
     lower = np.concatenate([free_lower, boundary_lo])
     upper = np.concatenate([free_upper, boundary_hi])
+    x0_free = np.asarray(shared_init_free, dtype=float)
     x0 = np.concatenate(
         [
-            np.clip(shared_init_free, free_lower, free_upper),
+            np.clip(x0_free, free_lower, free_upper),
             boundary_init,
         ]
     )
@@ -1518,8 +1786,24 @@ def run_multi_channel_fit_pipeline(
     def _compose_shared(free_values: np.ndarray) -> np.ndarray:
         np.copyto(shared_work, shared_template)
         if n_free > 0:
-            shared_work[free_param_indices] = np.asarray(free_values, dtype=float)
+            free_vals = np.asarray(free_values, dtype=float)
+            shared_work[free_param_indices] = free_vals
         return shared_work
+
+    if has_free_periodic:
+        periodic_mask_opt, periodic_periods_opt, periodic_offsets_opt = (
+            _periodic_opt_vectors(
+                x0.size,
+                n_free,
+                free_periodic_mask,
+                free_periodic_periods,
+                free_periodic_offsets,
+            )
+        )
+    else:
+        periodic_mask_opt = np.zeros(x0.size, dtype=bool)
+        periodic_periods_opt = np.ones(x0.size, dtype=float)
+        periodic_offsets_opt = np.zeros(x0.size, dtype=float)
 
     _mc_blend_w = _auto_blend_width(np.sort(x_arr)) if total_boundary > 0 else 0.0
     _mc_xmin = float(np.min(x_arr))
@@ -1563,12 +1847,28 @@ def run_multi_channel_fit_pipeline(
         diff_step = np.full(x0.size, 1e-6, dtype=float)
         if total_boundary > 0:
             diff_step[n_free:] = _boundary_ratio_diff_step_from_x(x_arr)
-        refine_nfev = int(np.clip(500 * max(1, x0.size), 2500, 20000))
-        ls = least_squares(
+        if screening:
+            refine_nfev = _scaled_nfev(
+                500 * max(1, x0.size),
+                stage_b_nfev_scale,
+                1000,
+                6000,
+            )
+        else:
+            refine_nfev = _scaled_nfev(
+                500 * max(1, x0.size),
+                stage_b_nfev_scale,
+                2500,
+                20000,
+            )
+        jax_mgr = _get_jax_fit_manager_cached()
+        ls = jax_mgr.least_squares(
             residuals,
             x0,
             bounds=(lower, upper),
-            method="trf",
+            periodic_mask=periodic_mask_opt,
+            periodic_periods=periodic_periods_opt,
+            periodic_offsets=periodic_offsets_opt,
             loss="soft_l1",
             f_scale=0.5,
             max_nfev=refine_nfev,
@@ -1670,15 +1970,20 @@ def run_multi_channel_fit_pipeline(
             try:
                 candidate = run_multi_channel_fit_pipeline(
                     x_arr,
-                    y_data_by_channel,
+                    y_data_map,
                     multi_model,
                     restart_seed,
                     bounds_map,
+                    periodic_params=periodic_by_key,
                     boundary_seeds=restart_boundary_seeds,
                     cancel_check=cancel_check,
                     fixed_params=fixed_params,
                     fixed_boundary_ratios_by_channel=fixed_boundary_ratios_by_channel,
                     n_random_restarts=0,
+                    screening=screening,
+                    max_points=max_points,
+                    stage_a_nfev_scale=stage_a_nfev_scale,
+                    stage_b_nfev_scale=stage_b_nfev_scale,
                 )
             except FitCancelledError:
                 raise
@@ -1714,7 +2019,6 @@ def run_multi_channel_fit_pipeline(
         restarts=n_restarts,
         restart_elapsed=restarts_elapsed,
         restart_improved=restart_improved_count,
-        use_jax=use_jax,
     )
     return best_result
 

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import ast
 import math
+import os
 import pathlib
 import sys
 import threading
@@ -29,6 +30,7 @@ from typing import (
     Optional,
     Sequence,
     Tuple,
+    Union,
 )
 
 import numpy as np
@@ -50,6 +52,47 @@ def _fit_debug(message: str) -> None:
     _fit_log.detail(f"[jax] {message}")
 
 
+def _fit_notice_use_color() -> bool:
+    if os.environ.get("NO_COLOR"):
+        return False
+    try:
+        return sys.stdout.isatty()
+    except Exception:
+        return False
+
+
+def _fit_notice_sgr(code: str, text: str) -> str:
+    if not _fit_notice_use_color():
+        return text
+    return f"\033[{code}m{text}\033[0m"
+
+
+def _fit_notice(
+    message: str,
+    *,
+    command: Optional[str] = None,
+    is_error: bool = False,
+) -> None:
+    """Emit important JAX backend notices even when fit-debug is off."""
+    text = f"[jax] {message}"
+    if command:
+        text = f"{text}\n      Try: {command}"
+    if _fit_log.enabled():
+        _fit_log.detail(text)
+        return
+    prefix = "[fit] [jax]"
+    if is_error:
+        headline = _fit_notice_sgr("1;31", message)
+    else:
+        headline = message
+    if command:
+        label = _fit_notice_sgr("1;33", "Try:")
+        cmd = _fit_notice_sgr("36", command)
+        print(f"{prefix} {headline}\n{prefix}   {label} {cmd}", flush=True)
+        return
+    print(f"{prefix} {headline}", flush=True)
+
+
 # ---------------------------------------------------------------------------
 # Lazy JAX / jaxfit initialisation  (thread-safe, runs at most once)
 # ---------------------------------------------------------------------------
@@ -59,13 +102,32 @@ _jax_ok = False
 _jax_gpu = False
 _jnp: Any = None  # jax.numpy module ref
 _CurveFit_cls: Any = None  # jaxfit.CurveFit class ref
+_LeastSquares_cls: Any = None  # jaxfit.LeastSquares class ref
 _JAX_INIT_ERROR: Optional[str] = None
+
+
+def _probe_nvidia_uvm() -> Tuple[bool, str]:
+    """Check whether NVIDIA UVM device node is usable in this process."""
+    if os.name != "posix":
+        return True, ""
+    uvm_path = "/dev/nvidia-uvm"
+    if not os.path.exists(uvm_path):
+        return True, f"{uvm_path} not present"
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    try:
+        fd = os.open(uvm_path, flags)
+        os.close(fd)
+        return True, f"{uvm_path} open ok"
+    except OSError as exc:
+        return False, f"{uvm_path} open failed: errno={exc.errno} ({exc.strerror})"
 
 
 def _ensure_jax_init() -> bool:
     """Lazily import JAX + jaxfit.  Returns *True* on success."""
     global _jax_initialized, _jax_ok, _jax_gpu
-    global _jnp, _CurveFit_cls, _JAX_INIT_ERROR
+    global _jnp, _CurveFit_cls, _LeastSquares_cls, _JAX_INIT_ERROR
 
     if _jax_initialized:
         return _jax_ok
@@ -74,6 +136,60 @@ def _ensure_jax_init() -> bool:
         if _jax_initialized:
             return _jax_ok
         try:
+            # Default is "auto" (let JAX choose, typically GPU when available).
+            # REDPITAYA_JAX_PLATFORM can force cpu/gpu/tpu when needed.
+            platform_pref = str(
+                os.environ.get("REDPITAYA_JAX_PLATFORM", "auto")
+            ).strip().lower()
+            raw_jax_platforms = str(os.environ.get("JAX_PLATFORMS", "")).strip().lower()
+            if platform_pref in {"cpu", "gpu", "tpu"}:
+                # Explicit override from app-level setting.
+                os.environ["JAX_PLATFORMS"] = platform_pref
+            else:
+                platform_pref = "auto"
+                # Avoid inherited shell state forcing CUDA/GPU only.
+                # In auto mode we want JAX to choose any available backend.
+                if raw_jax_platforms in {"cuda", "gpu"}:
+                    os.environ["JAX_PLATFORMS"] = ""
+                    _fit_debug(
+                        "cleared stale JAX_PLATFORMS override "
+                        f"(was '{raw_jax_platforms}') for auto backend selection"
+                    )
+
+            _fit_debug(
+                "init env: "
+                f"platform_pref={platform_pref} "
+                f"JAX_PLATFORMS={os.environ.get('JAX_PLATFORMS', '')!r} "
+                f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '')!r}"
+            )
+            if platform_pref in {"auto", "gpu"}:
+                uvm_ok, uvm_status = _probe_nvidia_uvm()
+                if uvm_ok:
+                    _fit_debug(f"nvidia uvm probe: {uvm_status}")
+                else:
+                    repair_cmd = "sudo rmmod nvidia_uvm && sudo modprobe nvidia_uvm"
+                    hint = (
+                        "CUDA device node is unhealthy; try "
+                        f"'{repair_cmd}' "
+                        "or reboot."
+                    )
+                    _fit_notice(
+                        "gpu init error (auto mode): "
+                        f"{uvm_status}. Falling back to CPU.",
+                        command=repair_cmd,
+                        is_error=True,
+                    )
+                    if platform_pref == "gpu":
+                        raise RuntimeError(
+                            "REDPITAYA_JAX_PLATFORM='gpu' requested but "
+                            f"{uvm_status}. {hint}"
+                        )
+                    os.environ["JAX_PLATFORMS"] = "cpu"
+                    _fit_debug(
+                        "forcing JAX_PLATFORMS='cpu' in auto mode because "
+                        "GPU init would fail"
+                    )
+
             # x64 MUST be enabled before any JAX computation (jaxfit requirement)
             import jax
 
@@ -88,31 +204,41 @@ def _ensure_jax_init() -> bool:
                 sys.path.insert(0, _jaxfit_dir)
 
             from jaxfit import CurveFit
+            from jaxfit.least_squares import LeastSquares
 
             _CurveFit_cls = CurveFit
+            _LeastSquares_cls = LeastSquares
 
-            # Detect GPU / TPU
-            try:
-                devices = jax.devices()
-                _jax_gpu = any(d.platform == "gpu" for d in devices)
-                dev_strs = []
-                for d in devices:
-                    kind = getattr(d, "device_kind", "")
-                    dev_strs.append(
-                        f"{d.platform.upper()}" + (f" ({kind})" if kind else "")
-                    )
-                _fit_debug(
-                    f"init ok: devices=[{', '.join(dev_strs)}] "
-                    f"gpu={'yes' if _jax_gpu else 'no'}"
+            # Detect active backend/devices. This must succeed; otherwise fitting
+            # will fail later with harder-to-debug runtime errors.
+            devices = jax.devices()
+            _jax_gpu = any(d.platform == "gpu" for d in devices)
+            if platform_pref == "gpu" and not _jax_gpu:
+                raise RuntimeError(
+                    "REDPITAYA_JAX_PLATFORM='gpu' requested but no visible GPU devices "
+                    f"were found. devices={devices!r}"
                 )
-            except Exception:
-                _jax_gpu = False
-                _fit_debug("init ok: device detection failed")
+            dev_strs = []
+            for d in devices:
+                kind = getattr(d, "device_kind", "")
+                dev_strs.append(
+                    f"{d.platform.upper()}" + (f" ({kind})" if kind else "")
+                )
+            _fit_debug(
+                f"init ok: devices=[{', '.join(dev_strs)}] "
+                f"gpu={'yes' if _jax_gpu else 'no'} "
+                f"platform_pref={platform_pref}"
+            )
 
             _jax_ok = True
         except Exception as exc:
             _JAX_INIT_ERROR = str(exc)
             _jax_ok = False
+            if platform_pref == "auto":
+                _fit_notice(
+                    f"gpu init error (auto mode): {exc}",
+                    is_error=True,
+                )
             _fit_debug(f"init FAILED: {exc}")
 
         _jax_initialized = True
@@ -125,29 +251,6 @@ def _ensure_jax_init() -> bool:
 def jax_available() -> bool:
     """Return *True* if JAX and jaxfit are importable."""
     return _ensure_jax_init()
-
-
-def backend_tag(use_jax: bool = False) -> str:
-    """Return a short backend label for log headers.
-
-    Returns one of:
-    - ``"NON-JIT"`` — JAX not requested or not available
-    - GPU device name (e.g. ``"NVIDIA RTX 4090"``) when a GPU is detected
-    - ``"JIT"`` — JAX available on CPU only
-    """
-    if not use_jax or not _ensure_jax_init():
-        return "NON-JIT"
-    if _jax_gpu:
-        try:
-            import jax
-
-            for d in jax.devices():
-                if d.platform == "gpu":
-                    kind = getattr(d, "device_kind", "")
-                    return kind if kind else "GPU"
-        except Exception:
-            return "GPU"
-    return "JIT"
 
 
 # ---------------------------------------------------------------------------
@@ -312,6 +415,7 @@ class JaxFitManager:
                     # keyed by (flength, func_id_hash)
                     inst._cache: Dict[Tuple, Any] = {}
                     inst._cache_lock = threading.Lock()
+                    inst._least_squares = None
                     cls._instance = inst
         return cls._instance
 
@@ -353,6 +457,205 @@ class JaxFitManager:
                 return self._cache[cache_key], flength, fid, False
             return self._cache[cache_key], flength, fid, True
 
+    def _get_ls(self):
+        if self._least_squares is None:
+            with self._cache_lock:
+                if self._least_squares is None:
+                    self._least_squares = _LeastSquares_cls()
+        return self._least_squares
+
+    @staticmethod
+    def _as_param_array(values, n: int, name: str) -> np.ndarray:
+        arr = np.asarray(values, dtype=float)
+        if arr.ndim == 0:
+            return np.full(n, float(arr), dtype=float)
+        out = np.asarray(arr, dtype=float).reshape(-1)
+        if out.size != int(n):
+            raise ValueError(f"{name} must be scalar or length {n}.")
+        return out
+
+    @staticmethod
+    def _parse_periodic_mask(periodic, n: int) -> np.ndarray:
+        if periodic is None:
+            return np.zeros(n, dtype=bool)
+        arr = np.asarray(periodic)
+        if arr.ndim == 0:
+            return np.full(n, bool(arr), dtype=bool)
+        mask = np.asarray(arr, dtype=bool).reshape(-1)
+        if mask.size != int(n):
+            raise ValueError(f"`periodic_mask` must be scalar or length {n}.")
+        return mask
+
+    @classmethod
+    def _parse_periodic_values(
+        cls,
+        values,
+        n: int,
+        name: str,
+        default: float,
+    ) -> np.ndarray:
+        if values is None:
+            return np.full(n, float(default), dtype=float)
+        return cls._as_param_array(values, n, name)
+
+    @staticmethod
+    def _wrap_periodic_numpy(
+        params: np.ndarray,
+        periodic_mask: np.ndarray,
+        periodic_periods: np.ndarray,
+        periodic_offsets: np.ndarray,
+    ) -> np.ndarray:
+        out = np.asarray(params, dtype=float).reshape(-1).copy()
+        if out.size == 0 or not np.any(periodic_mask):
+            return out
+        mask = np.asarray(periodic_mask, dtype=bool).reshape(-1)
+        out[mask] = periodic_offsets[mask] + np.mod(
+            out[mask] - periodic_offsets[mask],
+            periodic_periods[mask],
+        )
+        return out
+
+    @classmethod
+    def _prepare_periodic_least_squares_config(
+        cls,
+        x0: np.ndarray,
+        lb: np.ndarray,
+        ub: np.ndarray,
+        periodic_mask,
+        periodic_periods,
+        periodic_offsets,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        n = int(x0.size)
+        mask = cls._parse_periodic_mask(periodic_mask, n)
+        if not np.any(mask):
+            return (
+                mask,
+                np.ones(n, dtype=float),
+                np.zeros(n, dtype=float),
+                np.asarray(lb, dtype=float).copy(),
+                np.asarray(ub, dtype=float).copy(),
+                np.asarray(x0, dtype=float).copy(),
+            )
+
+        if periodic_periods is None:
+            periods = np.ones(n, dtype=float)
+            lb_arr = np.asarray(lb, dtype=float)
+            ub_arr = np.asarray(ub, dtype=float)
+            spans = ub_arr - lb_arr
+            valid = mask & np.isfinite(lb_arr) & np.isfinite(ub_arr) & (spans > 0.0)
+            if not np.all(valid[mask]):
+                raise ValueError(
+                    "Periodic least-squares parameters require finite bounds "
+                    "with non-zero span when `periodic_periods` is omitted."
+                )
+            periods[mask] = spans[mask]
+        else:
+            periods = cls._parse_periodic_values(
+                periodic_periods,
+                n,
+                "`periodic_periods`",
+                1.0,
+            )
+            invalid = mask & (~np.isfinite(periods) | (periods <= 0.0))
+            if np.any(invalid):
+                raise ValueError(
+                    "`periodic_periods` must be finite and > 0 for periodic parameters."
+                )
+            periods = np.where(mask, periods, 1.0)
+
+        if periodic_offsets is None:
+            offsets = np.zeros(n, dtype=float)
+            lb_arr = np.asarray(lb, dtype=float)
+            finite_lb = mask & np.isfinite(lb_arr)
+            offsets[finite_lb] = lb_arr[finite_lb]
+        else:
+            offsets = cls._parse_periodic_values(
+                periodic_offsets,
+                n,
+                "`periodic_offsets`",
+                0.0,
+            )
+            invalid_offsets = mask & ~np.isfinite(offsets)
+            if np.any(invalid_offsets):
+                raise ValueError(
+                    "`periodic_offsets` must be finite for periodic parameters."
+                )
+            offsets = np.where(mask, offsets, 0.0)
+
+        wrapped_x0 = cls._wrap_periodic_numpy(
+            np.asarray(x0, dtype=float),
+            mask,
+            periods,
+            offsets,
+        )
+        fit_lb = np.asarray(lb, dtype=float).copy()
+        fit_ub = np.asarray(ub, dtype=float).copy()
+        fit_lb[mask] = -np.inf
+        fit_ub[mask] = np.inf
+        return mask, periods, offsets, fit_lb, fit_ub, wrapped_x0
+
+    @classmethod
+    def _build_fd_jacobian(
+        cls,
+        residual_func: Callable[[np.ndarray], np.ndarray],
+        lb: np.ndarray,
+        ub: np.ndarray,
+        diff_step,
+    ) -> Callable[[np.ndarray], np.ndarray]:
+        lb_arr = np.asarray(lb, dtype=float).reshape(-1)
+        ub_arr = np.asarray(ub, dtype=float).reshape(-1)
+
+        def jac(xvals: np.ndarray) -> np.ndarray:
+            x = np.asarray(xvals, dtype=float).reshape(-1)
+            n = int(x.size)
+            steps = cls._as_param_array(
+                np.sqrt(np.finfo(float).eps) if diff_step is None else diff_step,
+                n,
+                "`diff_step`",
+            )
+            f0 = np.asarray(residual_func(x), dtype=float).reshape(-1)
+            m = int(f0.size)
+            jacobian = np.zeros((m, n), dtype=float)
+            for col in range(n):
+                base = float(abs(steps[col]))
+                h = float(base * max(1.0, abs(x[col])))
+                if not np.isfinite(h) or h <= 0.0:
+                    h = float(np.sqrt(np.finfo(float).eps) * max(1.0, abs(x[col])))
+                x_f = np.asarray(x, dtype=float).copy()
+                x_b = np.asarray(x, dtype=float).copy()
+                forward = x[col] + h
+                backward = x[col] - h
+                if np.isfinite(ub_arr[col]):
+                    forward = min(forward, ub_arr[col])
+                if np.isfinite(lb_arr[col]):
+                    backward = max(backward, lb_arr[col])
+                x_f[col] = forward
+                x_b[col] = backward
+                # Use exact step-size checks here. Relative-tolerance based
+                # comparisons (np.isclose defaults) can incorrectly treat valid
+                # finite-difference perturbations as "equal" and zero-out a
+                # Jacobian column, freezing optimization variables.
+                if float(x_f[col] - x_b[col]) == 0.0:
+                    continue
+                if float(x_b[col] - x[col]) == 0.0:
+                    f_f = np.asarray(residual_func(x_f), dtype=float).reshape(-1)
+                    denom = float(x_f[col] - x[col])
+                    if denom != 0.0:
+                        jacobian[:, col] = (f_f - f0) / denom
+                    continue
+                if float(x_f[col] - x[col]) == 0.0:
+                    f_b = np.asarray(residual_func(x_b), dtype=float).reshape(-1)
+                    denom = float(x[col] - x_b[col])
+                    if denom != 0.0:
+                        jacobian[:, col] = (f0 - f_b) / denom
+                    continue
+                f_f = np.asarray(residual_func(x_f), dtype=float).reshape(-1)
+                f_b = np.asarray(residual_func(x_b), dtype=float).reshape(-1)
+                jacobian[:, col] = (f_f - f_b) / float(x_f[col] - x_b[col])
+            return jacobian
+
+        return jac
+
     # -- public API --------------------------------------------------------
 
     def curve_fit(
@@ -362,6 +665,10 @@ class JaxFitManager:
         y_data: np.ndarray,
         p0: np.ndarray,
         bounds: Tuple = (-np.inf, np.inf),
+        periodic_mask: Optional[np.ndarray] = None,
+        periodic_periods: Optional[np.ndarray] = None,
+        periodic_offsets: Optional[np.ndarray] = None,
+        max_nfev: Optional[int] = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """Run ``CurveFit.curve_fit`` with automatic flength caching.
 
@@ -375,6 +682,14 @@ class JaxFitManager:
             Initial parameter guesses.
         bounds : tuple
             ``(lower, upper)`` parameter bounds.
+        periodic_mask : ndarray, optional
+            Boolean mask of periodic parameters.
+        periodic_periods : ndarray, optional
+            Per-parameter wrap periods.
+        periodic_offsets : ndarray, optional
+            Per-parameter wrap offsets.
+        max_nfev : int, optional
+            Maximum function evaluations for local TRF solve.
 
         Returns
         -------
@@ -383,12 +698,19 @@ class JaxFitManager:
         n = int(x_data.shape[-1] if x_data.ndim > 1 else x_data.size)
         cf, flength, fid, was_cached = self._get_cf(n, model_func)
         t0 = time.perf_counter()
+        fit_kwargs: Dict[str, Any] = {}
+        if max_nfev is not None:
+            fit_kwargs["max_nfev"] = int(max_nfev)
         popt, pcov = cf.curve_fit(
             model_func,
             np.asarray(x_data, dtype=np.float64),
             np.asarray(y_data, dtype=np.float64),
             p0=np.asarray(p0, dtype=np.float64),
             bounds=bounds,
+            periodic=periodic_mask,
+            periodic_periods=periodic_periods,
+            periodic_offsets=periodic_offsets,
+            **fit_kwargs,
         )
         elapsed = time.perf_counter() - t0
         _fit_debug(
@@ -399,6 +721,94 @@ class JaxFitManager:
             f"device={'GPU' if _jax_gpu else 'CPU'}"
         )
         return np.asarray(popt), np.asarray(pcov)
+
+    def least_squares(
+        self,
+        residual_func: Callable[[np.ndarray], np.ndarray],
+        x0: np.ndarray,
+        bounds: Tuple = (-np.inf, np.inf),
+        periodic_mask: Optional[np.ndarray] = None,
+        periodic_periods: Optional[np.ndarray] = None,
+        periodic_offsets: Optional[np.ndarray] = None,
+        loss: str = "linear",
+        f_scale: float = 1.0,
+        max_nfev: Optional[int] = None,
+        diff_step=None,
+        x_scale: Union[str, np.ndarray, float] = 1.0,
+    ):
+        """Run jaxfit LeastSquares with finite-difference Jacobian.
+
+        Periodic parameters are optimized in an unbounded variable and wrapped
+        into one period before each residual/Jacobian evaluation.
+        """
+        x0_arr = np.asarray(x0, dtype=float).reshape(-1)
+        n = int(x0_arr.size)
+        lb_arr = self._as_param_array(bounds[0], n, "lower bounds")
+        ub_arr = self._as_param_array(bounds[1], n, "upper bounds")
+        (
+            periodic_mask_arr,
+            periodic_period_arr,
+            periodic_offset_arr,
+            fit_lb_arr,
+            fit_ub_arr,
+            fit_x0_arr,
+        ) = self._prepare_periodic_least_squares_config(
+            x0_arr,
+            lb_arr,
+            ub_arr,
+            periodic_mask,
+            periodic_periods,
+            periodic_offsets,
+        )
+
+        wrapped_residual = residual_func
+        if np.any(periodic_mask_arr):
+
+            def _wrapped_residual(xvals: np.ndarray) -> np.ndarray:
+                wrapped = self._wrap_periodic_numpy(
+                    np.asarray(xvals, dtype=float),
+                    periodic_mask_arr,
+                    periodic_period_arr,
+                    periodic_offset_arr,
+                )
+                return residual_func(wrapped)
+
+            wrapped_residual = _wrapped_residual
+
+        jac_func = self._build_fd_jacobian(
+            wrapped_residual,
+            fit_lb_arr,
+            fit_ub_arr,
+            diff_step,
+        )
+        ls = self._get_ls()
+        t0 = time.perf_counter()
+        result = ls.least_squares(
+            wrapped_residual,
+            fit_x0_arr,
+            jac=jac_func,
+            bounds=(fit_lb_arr, fit_ub_arr),
+            method="trf",
+            loss=str(loss),
+            f_scale=float(f_scale),
+            max_nfev=(int(max_nfev) if max_nfev is not None else None),
+            x_scale=x_scale,
+        )
+        if np.any(periodic_mask_arr):
+            result.x = self._wrap_periodic_numpy(
+                np.asarray(result.x, dtype=float),
+                periodic_mask_arr,
+                periodic_period_arr,
+                periodic_offset_arr,
+            )
+        elapsed = time.perf_counter() - t0
+        _fit_debug(
+            f"least_squares  n={n}  m={np.asarray(result.fun).size}  "
+            f"nfev={getattr(result, 'nfev', '?')}  "
+            f"periodic={'yes' if np.any(periodic_mask_arr) else 'no'}  "
+            f"elapsed={elapsed:.4f}s"
+        )
+        return result
 
 
 def get_jax_fit_manager() -> JaxFitManager:

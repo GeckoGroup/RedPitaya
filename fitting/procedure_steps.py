@@ -20,6 +20,8 @@ from typing import (
 
 import numpy as np
 
+from periodic_params import normalize_periodic_params
+
 
 _SCALAR_EXPRESSION_ALLOWED_FUNCTIONS: Dict[str, Any] = {
     "abs": np.abs,
@@ -273,6 +275,7 @@ class ProcedureContext:
         *,
         seed_map: Dict[str, float],
         bounds_map: Dict[str, Tuple[float, float]],
+        periodic_params: Optional[Mapping[str, bool]] = None,
         boundary_seeds: Dict[str, Any],
         x_data: Any,
         y_data_by_channel: Dict[str, Any],
@@ -282,7 +285,6 @@ class ProcedureContext:
         cancel_check: Optional[Callable[[], bool]] = None,
         rng_seed: Optional[int] = None,
         boundary_name_to_ids: Optional[Mapping[str, Sequence[Sequence[Any]]]] = None,
-        use_jax: bool = False,
         # -- Cross-file sibling seeding --
         captures: Optional[Dict[str, Any]] = None,
         sibling_results: Optional[Mapping[str, Mapping[str, Any]]] = None,
@@ -291,6 +293,7 @@ class ProcedureContext:
     ):
         self.seed_map = dict(seed_map)
         self.bounds_map = dict(bounds_map)
+        self.periodic_params = normalize_periodic_params(periodic_params)
         self.boundary_seeds = {
             str(k): np.asarray(v, dtype=float).reshape(-1)
             for k, v in dict(boundary_seeds).items()
@@ -305,7 +308,6 @@ class ProcedureContext:
         self.cancel_check = cancel_check
         self.rng_seed = rng_seed
         self.boundary_name_to_ids = _normalise_boundary_name_map(boundary_name_to_ids)
-        self.use_jax = bool(use_jax)
         # Cross-file sibling seeding state.
         self.captures: Dict[str, Any] = dict(captures or {})
         self.sibling_results: Dict[str, Dict[str, Any]] = dict(sibling_results or {})

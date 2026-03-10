@@ -27,7 +27,7 @@ from typing import Sequence
 
 def enabled() -> bool:
     """Return whether fit-debug output is active."""
-    raw = str(os.environ.get("REDPITAYA_FIT_DEBUG", "1")).strip().lower()
+    raw = str(os.environ.get("REDPITAYA_FIT_DEBUG", "0")).strip().lower()
     return raw not in {"", "0", "false", "off", "no"}
 
 
@@ -138,10 +138,9 @@ def _status_icon(status: str) -> str:
 # ══════════════════════════════════════════════════════════════════
 
 
-def procedure_start(name: str, n_steps: int, backend: str = "") -> None:
+def procedure_start(name: str, n_steps: int) -> None:
     plural = "s" if n_steps != 1 else ""
-    tag = f" - {backend}" if backend else ""
-    _emit(0, _bold_cyan(f"══ {name} ({n_steps} step{plural}{tag}) " + "═" * 30))
+    _emit(0, _bold_cyan(f"══ {name} ({n_steps} step{plural}) " + "═" * 30))
 
 
 def procedure_done(elapsed: float, r2=None) -> None:

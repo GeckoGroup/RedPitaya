@@ -14,6 +14,7 @@ Key public API
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 import time
 from typing import (
     Any,
@@ -36,7 +37,69 @@ from procedure_steps import (
     deserialize_step,
 )
 import fit_log as _fit_log
-from jax_backend import backend_tag as _backend_tag
+
+
+def _env_int(name: str, default: int, minimum: int = 0) -> int:
+    raw = str(os.environ.get(name, "")).strip()
+    if not raw:
+        return int(default)
+    try:
+        value = int(raw)
+    except Exception:
+        return int(default)
+    return int(max(int(minimum), value))
+
+
+def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
+    raw = str(os.environ.get(name, "")).strip()
+    if not raw:
+        return float(default)
+    try:
+        value = float(raw)
+    except Exception:
+        return float(default)
+    if not np.isfinite(value):
+        return float(default)
+    return float(max(float(minimum), value))
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = str(os.environ.get(name, "")).strip().lower()
+    if raw == "":
+        return bool(default)
+    return raw in {"1", "true", "yes", "on"}
+
+
+_FIT_SCREEN_MAX_POINTS = _env_int("REDPITAYA_FIT_SCREEN_MAX_POINTS", 4096, minimum=8)
+_FIT_SCREEN_STAGEA_SCALE = _env_float(
+    "REDPITAYA_FIT_SCREEN_STAGEA_SCALE", 0.30, minimum=1e-6
+)
+_FIT_SCREEN_STAGEB_SCALE = _env_float(
+    "REDPITAYA_FIT_SCREEN_STAGEB_SCALE", 0.25, minimum=1e-6
+)
+_FIT_FULL_PATIENCE = _env_int("REDPITAYA_FIT_FULL_PATIENCE", 2, minimum=1)
+_FIT_FULL_MIN_DELTA_R2 = _env_float(
+    "REDPITAYA_FIT_FULL_MIN_DELTA_R2", 2e-4, minimum=0.0
+)
+_FIT_FULL_SCREEN_MAX_R2_GAP = _env_float(
+    "REDPITAYA_FIT_FULL_SCREEN_MAX_R2_GAP", 0.12, minimum=0.0
+)
+_FIT_FULL_SCREEN_MIN_REL_R2 = _env_float(
+    "REDPITAYA_FIT_FULL_SCREEN_MIN_REL_R2", 0.85, minimum=0.0
+)
+_FIT_FULL_SCREEN_ABS_MIN_R2 = _env_float(
+    "REDPITAYA_FIT_FULL_SCREEN_ABS_MIN_R2", 0.0, minimum=-1.0
+)
+_FIT_RETRY_SCREENING_ENABLED = _env_bool(
+    "REDPITAYA_FIT_RETRY_SCREENING_ENABLED", True
+)
+_FIT_SIBLING_MIN_R2 = _env_float("REDPITAYA_FIT_SIBLING_MIN_R2", 0.0, minimum=-1.0)
+_FIT_SIBLING_MIN_R2_MARGIN = _env_float(
+    "REDPITAYA_FIT_SIBLING_MIN_R2_MARGIN", 0.25, minimum=0.0
+)
+_FIT_SIBLING_EXACT_BONUS = _env_float(
+    "REDPITAYA_FIT_SIBLING_EXACT_BONUS", 0.25, minimum=0.0
+)
 
 
 # ---------------------------------------------------------------------------
@@ -156,92 +219,132 @@ def _best_sibling_seed_from_context(
     context: ProcedureContext,
     relevant_params: set,
     fixed_params: Dict[str, float],
+    min_seed_r2: Optional[float] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Find the best-matching sibling result based on captures.
-
-    Returns ``{"seed_map": ..., "boundary_seeds": ..., "r2": ...}`` or None.
-    Each sibling_results entry is expected to be a normalised dict with keys:
-    ``captures``, ``params_by_key``, ``boundary_ratios_by_channel``, ``r2``.
-    """
-    if not context.sibling_results or not context.captures:
+    ranked = _ranked_sibling_seed_candidates(
+        context,
+        relevant_params=relevant_params,
+        fixed_params=fixed_params,
+        enabled_targets=None,
+        min_seed_r2=min_seed_r2,
+        top_k=1,
+    )
+    if not ranked:
         return None
+    return ranked[0]
+
+
+def _ranked_sibling_seed_candidates(
+    context: ProcedureContext,
+    *,
+    relevant_params: set,
+    fixed_params: Mapping[str, float],
+    enabled_targets: Optional[Sequence[str]],
+    min_seed_r2: Optional[float] = None,
+    top_k: int = 3,
+) -> List[Dict[str, Any]]:
+    """Return top sibling candidates ranked by match quality + R²."""
+    if not context.sibling_results or not context.captures:
+        return []
+    def _finite_r2(value: Any) -> Optional[float]:
+        try:
+            numeric = float(value)
+        except Exception:
+            return None
+        if not np.isfinite(numeric):
+            return None
+        return float(numeric)
+
+    quality_floor = float(_FIT_SIBLING_MIN_R2)
+    min_seed_r2_val = _finite_r2(min_seed_r2)
+    if min_seed_r2_val is not None:
+        quality_floor = max(
+            quality_floor, float(min_seed_r2_val - float(_FIT_SIBLING_MIN_R2_MARGIN))
+        )
+
     seed_keys = context.capture_seed_keys
     if not seed_keys:
-        return None
-
+        return []
+    targets_filter = set(str(t) for t in (enabled_targets or ()))
     current_sig = _capture_seed_signature(context.captures, seed_keys)
-
-    best: Optional[Dict[str, Any]] = None
-    best_kind = ""
-    closest: Optional[Dict[str, Any]] = None
-    closest_distance: Optional[float] = None
-
+    ranked: List[Dict[str, Any]] = []
     for _file_key, sibling in context.sibling_results.items():
         sibling_captures = sibling.get("captures")
-        if not isinstance(sibling_captures, dict):
+        if not isinstance(sibling_captures, Mapping):
             continue
-        sibling.get("r2")
-        params = sibling.get("params_by_key")
-        if not params:
+        sibling_params = dict(sibling.get("params_by_key") or {})
+        if not sibling_params:
             continue
-
         candidate_sig = _capture_seed_signature(sibling_captures, seed_keys)
-        if (
+        exact_match = (
             current_sig is not None
             and candidate_sig is not None
             and current_sig == candidate_sig
-        ):
-            if best is None or (sibling.get("r2") or 0) > (best.get("r2") or 0):
-                best = sibling
-                best_kind = "matching-captures"
-            continue
-
+        )
         distance = _capture_distance(context.captures, sibling_captures, seed_keys)
         if distance is None:
+            distance = 1.0
+        sibling_r2 = _finite_r2(sibling.get("r2"))
+        if sibling_r2 is not None and float(sibling_r2) < float(quality_floor):
             continue
-        if closest is None or float(distance) < float(closest_distance):
-            closest = sibling
-            closest_distance = float(distance)
-        elif np.isclose(float(distance), float(closest_distance)) and (
-            (sibling.get("r2") or 0) > (closest.get("r2") or 0)
-        ):
-            closest = sibling
-            closest_distance = float(distance)
+        # Scoring: low distance + high R², exact match as a light tie-breaker.
+        score = (
+            (float(_FIT_SIBLING_EXACT_BONUS) if exact_match else 0.0)
+            - float(distance)
+            + float(sibling_r2 or 0.0)
+        )
 
-    match = best or closest
-    if match is None:
-        return None
-
-    # Build seed_map from sibling params (only free params).
-    sibling_params = dict(match.get("params_by_key") or {})
-    seed_map: Dict[str, float] = {}
-    for key in relevant_params:
-        if key in fixed_params:
-            continue
-        if key in sibling_params:
+        seed_map: Dict[str, float] = {}
+        for key in relevant_params:
+            if key in fixed_params:
+                continue
+            if key not in sibling_params:
+                continue
             try:
                 val = float(sibling_params[key])
-                if np.isfinite(val):
-                    seed_map[key] = val
-            except (TypeError, ValueError):
-                pass
-
-    # Build boundary_seeds from sibling.
-    boundary_seeds: Dict[str, np.ndarray] = {}
-    for ch, ratios in (match.get("boundary_ratios_by_channel") or {}).items():
-        if ratios is not None:
-            try:
-                boundary_seeds[str(ch)] = np.asarray(ratios, dtype=float).reshape(-1)
             except Exception:
-                pass
+                continue
+            if np.isfinite(val):
+                seed_map[str(key)] = float(val)
+        if not seed_map:
+            continue
 
-    kind = best_kind if best is not None else "closest-captures"
-    return {
-        "seed_map": seed_map,
-        "boundary_seeds": boundary_seeds,
-        "source_kind": kind,
-        "r2": match.get("r2"),
-    }
+        boundary_seeds: Dict[str, np.ndarray] = {}
+        for ch, ratios in (sibling.get("boundary_ratios_by_channel") or {}).items():
+            ch_key = str(ch)
+            if targets_filter and ch_key not in targets_filter:
+                continue
+            try:
+                arr = np.asarray(ratios, dtype=float).reshape(-1)
+            except Exception:
+                continue
+            if arr.size > 0:
+                boundary_seeds[ch_key] = arr
+
+        ranked.append(
+            {
+                "seed_map": seed_map,
+                "boundary_seeds": boundary_seeds,
+                "source_kind": "matching-captures" if exact_match else "closest-captures",
+                "distance": float(distance),
+                "exact_match": bool(exact_match),
+                "r2": sibling_r2,
+                "score": float(score),
+            }
+        )
+    ranked.sort(
+        key=lambda item: (
+            float(item.get("score") or 0.0),
+            float(item.get("r2") or -1e9),
+            int(bool(item.get("exact_match"))),
+            -float(item.get("distance") or 1e9),
+        ),
+        reverse=True,
+    )
+    limit = max(0, int(top_k))
+    if limit > 0:
+        return ranked[:limit]
+    return ranked
 
 
 def _attempt_seed_signature(
@@ -544,9 +647,6 @@ def _execute_fit_step(step: FitStep, context: ProcedureContext) -> StepResult:
         fixed_boundary_by_channel.setdefault(target, {})[int(bidx)] = float(arr[bidx])
 
     # --- Run the fit (with retries) ---
-    best_result = None
-    best_r2 = None
-    retry_r2_history: List[float] = []
     max_attempts = 1 + max(0, step.max_retries)
     retry_mode = str(step.retry_mode or "jitter_then_random").strip()
     if retry_mode not in {"jitter", "random", "jitter_then_random"}:
@@ -572,7 +672,10 @@ def _execute_fit_step(step: FitStep, context: ProcedureContext) -> StepResult:
             )
         else:
             _sibling_seed_info = _best_sibling_seed_from_context(
-                context, seen_global, step_fixed_filtered
+                context,
+                seen_global,
+                step_fixed_filtered,
+                min_seed_r2=step.min_r2,
             )
             if _sibling_seed_info:
                 n_seed_params = len(_sibling_seed_info.get("seed_map") or {})
@@ -605,76 +708,362 @@ def _execute_fit_step(step: FitStep, context: ProcedureContext) -> StepResult:
 
     # --- Dedup tracking ---
     _seen_attempt_sigs: set = set()
+    best_result = None
+    best_r2 = None
+    retry_r2_history: List[float] = []
+    attempt_counter = 0
+    high_retry_heuristics = (
+        int(step.max_retries) >= 2 and bool(_FIT_RETRY_SCREENING_ENABLED)
+    )
+    sibling_pool = (
+        _ranked_sibling_seed_candidates(
+            context,
+            relevant_params=set(seen_global),
+            fixed_params=step_fixed_filtered,
+            enabled_targets=tuple(enabled_targets),
+            min_seed_r2=step.min_r2,
+            top_k=3,
+        )
+        if context.seed_from_siblings
+        else []
+    )
 
-    for attempt in range(max_attempts):
+    def _clone_boundary_map(boundary_map: Mapping[str, Any]) -> Dict[str, np.ndarray]:
+        out: Dict[str, np.ndarray] = {}
+        for ch, arr in dict(boundary_map).items():
+            out[str(ch)] = np.asarray(arr, dtype=float).reshape(-1).copy()
+        return out
+
+    def _boundary_template() -> Dict[str, np.ndarray]:
+        template: Dict[str, np.ndarray] = {}
+        for target, n_b in n_boundaries_by_target.items():
+            base = step_boundary_seeds.get(target)
+            if base is None:
+                base_arr = context.ensure_boundary_seed_size(target, n_b)
+            else:
+                base_arr = np.asarray(base, dtype=float).reshape(-1)
+                if base_arr.size != n_b:
+                    base_arr = context.ensure_boundary_seed_size(target, n_b)
+            template[target] = np.clip(np.asarray(base_arr, dtype=float), 0.0, 1.0)
+        for target, locked in fixed_boundary_by_channel.items():
+            arr = template.get(target)
+            if arr is None:
+                continue
+            arr = arr.copy()
+            for idx, value in locked.items():
+                if 0 <= int(idx) < arr.size:
+                    arr[int(idx)] = float(np.clip(value, 0.0, 1.0))
+            template[target] = arr
+        return template
+
+    base_boundary_template = _boundary_template()
+
+    def _sanitize_seed(seed_like: Mapping[str, float]) -> Dict[str, float]:
+        out: Dict[str, float] = {}
+        raw = dict(seed_like or {})
+        for key in seen_global:
+            if key in step_fixed_filtered:
+                out[key] = float(step_fixed_filtered[key])
+                continue
+            low_raw, high_raw = context.bounds_map.get(key, (-np.inf, np.inf))
+            low = float(min(low_raw, high_raw))
+            high = float(max(low_raw, high_raw))
+            default = context.seed_map.get(key, (low + high) / 2.0)
+            try:
+                value = float(raw.get(key, default))
+            except Exception:
+                value = float(default)
+            if np.isfinite(low) and np.isfinite(high):
+                if bool(context.periodic_params.get(str(key), False)) and (high > low):
+                    value = float(low + np.mod(value - low, high - low))
+                else:
+                    value = float(np.clip(value, low, high))
+            out[key] = float(value)
+        return out
+
+    def _sanitize_boundaries(boundary_like: Mapping[str, Any]) -> Dict[str, np.ndarray]:
+        out = _clone_boundary_map(base_boundary_template)
+        for ch, raw_arr in dict(boundary_like or {}).items():
+            ch_key = str(ch)
+            if ch_key not in out:
+                continue
+            target_arr = out[ch_key]
+            try:
+                candidate = np.asarray(raw_arr, dtype=float).reshape(-1)
+            except Exception:
+                continue
+            if candidate.size != target_arr.size:
+                continue
+            out[ch_key] = np.clip(candidate, 0.0, 1.0)
+        for target, locked in fixed_boundary_by_channel.items():
+            arr = out.get(target)
+            if arr is None:
+                continue
+            arr = np.asarray(arr, dtype=float).reshape(-1).copy()
+            for idx, value in locked.items():
+                if 0 <= int(idx) < arr.size:
+                    arr[int(idx)] = float(np.clip(value, 0.0, 1.0))
+            out[target] = arr
+        return out
+
+    def _extract_boundary_seed_map(result: Mapping[str, Any]) -> Dict[str, np.ndarray]:
+        out: Dict[str, np.ndarray] = {}
+        ch_res = result.get("channel_results")
+        if isinstance(ch_res, Mapping):
+            for ch_t, ch_r in ch_res.items():
+                if not isinstance(ch_r, Mapping):
+                    continue
+                br = ch_r.get("boundary_ratios")
+                if br is None:
+                    continue
+                try:
+                    out[str(ch_t)] = np.asarray(br, dtype=float).reshape(-1)
+                except Exception:
+                    pass
+            return out
+        if (
+            len(enabled_models) == 1
+            and result.get("boundary_ratios") is not None
+            and enabled_models[0].target_col in n_boundaries_by_target
+        ):
+            ch_t = str(enabled_models[0].target_col)
+            try:
+                out[ch_t] = np.asarray(result["boundary_ratios"], dtype=float).reshape(-1)
+            except Exception:
+                pass
+        return out
+
+    def _seed_from_fit_result(
+        base_seed: Mapping[str, float],
+        base_boundaries: Mapping[str, Any],
+        fit_result: Mapping[str, Any],
+    ) -> Tuple[Dict[str, float], Dict[str, np.ndarray]]:
+        seed_out = dict(base_seed)
+        for key, value in dict(fit_result.get("params_by_key") or {}).items():
+            k = str(key)
+            if k in seen_global and k not in step_fixed_filtered:
+                try:
+                    v = float(value)
+                except Exception:
+                    continue
+                if np.isfinite(v):
+                    seed_out[k] = v
+        boundary_out = _clone_boundary_map(_sanitize_boundaries(base_boundaries))
+        boundary_from_result = _extract_boundary_seed_map(fit_result)
+        for ch, arr in boundary_from_result.items():
+            if ch not in boundary_out:
+                continue
+            candidate = np.asarray(arr, dtype=float).reshape(-1)
+            if candidate.size == boundary_out[ch].size:
+                boundary_out[ch] = np.clip(candidate, 0.0, 1.0)
+        return _sanitize_seed(seed_out), _sanitize_boundaries(boundary_out)
+
+    def _randomise_seed(
+        rng: np.random.Generator,
+        base_seed: Mapping[str, float],
+        scale: float,
+        *,
+        force_random: bool = False,
+    ) -> Dict[str, float]:
+        out = dict(base_seed)
+        for key in seen_global:
+            if key in step_fixed_filtered:
+                out[key] = float(step_fixed_filtered[key])
+                continue
+            if key not in context.bounds_map:
+                continue
+            low_raw, high_raw = context.bounds_map[key]
+            low = float(min(low_raw, high_raw))
+            high = float(max(low_raw, high_raw))
+            if not (np.isfinite(low) and np.isfinite(high)):
+                continue
+            if np.isclose(low, high):
+                out[key] = float(low)
+                continue
+            if force_random or retry_mode == "random":
+                out[key] = float(rng.uniform(low, high))
+                continue
+            span = high - low
+            center = float(out.get(key, (low + high) / 2.0))
+            delta = float(rng.uniform(-scale, scale) * span)
+            out[key] = float(np.clip(center + delta, low, high))
+        return _sanitize_seed(out)
+
+    def _jitter_seed(
+        rng: np.random.Generator,
+        center_seed: Mapping[str, float],
+        scale: float,
+    ) -> Dict[str, float]:
+        out = dict(center_seed)
+        for key in seen_global:
+            if key in step_fixed_filtered or key not in context.bounds_map:
+                continue
+            low_raw, high_raw = context.bounds_map[key]
+            low = float(min(low_raw, high_raw))
+            high = float(max(low_raw, high_raw))
+            if not (np.isfinite(low) and np.isfinite(high)):
+                continue
+            if np.isclose(low, high):
+                out[key] = float(low)
+                continue
+            span = high - low
+            center = float(out.get(key, (low + high) / 2.0))
+            delta = float(rng.normal(0.0, max(1e-6, scale) * span))
+            out[key] = float(np.clip(center + delta, low, high))
+        return _sanitize_seed(out)
+
+    def _jitter_boundaries(
+        rng: np.random.Generator,
+        boundary_seed_map: Mapping[str, Any],
+        scale: float,
+    ) -> Dict[str, np.ndarray]:
+        out = _clone_boundary_map(_sanitize_boundaries(boundary_seed_map))
+        for ch, arr in list(out.items()):
+            if arr.size <= 0:
+                continue
+            jitter = rng.normal(0.0, max(1e-6, scale) * 0.35, size=arr.size)
+            out[ch] = np.clip(np.asarray(arr, dtype=float) + jitter, 0.0, 1.0)
+        return _sanitize_boundaries(out)
+
+    def _blend_from_siblings(
+        siblings: Sequence[Mapping[str, Any]],
+    ) -> Tuple[Dict[str, float], Dict[str, np.ndarray]]:
+        base_seed = _sanitize_seed(context.seed_map)
+        seed_out = dict(base_seed)
+        if not siblings:
+            return seed_out, _sanitize_boundaries(base_boundary_template)
+        base_w = 0.45
+        sib_weights = [0.30, 0.18, 0.07][: len(siblings)]
+        for key in seen_global:
+            if key in step_fixed_filtered:
+                seed_out[key] = float(step_fixed_filtered[key])
+                continue
+            weighted = base_w * float(base_seed.get(key, context.seed_map.get(key, 0.0)))
+            wsum = base_w
+            for idx, sib in enumerate(siblings):
+                s_map = dict(sib.get("seed_map") or {})
+                if key not in s_map:
+                    continue
+                w = sib_weights[idx]
+                weighted += w * float(s_map[key])
+                wsum += w
+            if wsum > 0:
+                seed_out[key] = float(weighted / wsum)
+        boundary_out = _clone_boundary_map(_sanitize_boundaries(base_boundary_template))
+        for ch, arr in list(boundary_out.items()):
+            if arr.size <= 0:
+                continue
+            weighted = base_w * np.asarray(arr, dtype=float)
+            wsum = np.full(arr.size, base_w, dtype=float)
+            for idx, sib in enumerate(siblings):
+                s_b = (sib.get("boundary_seeds") or {}).get(ch)
+                if s_b is None:
+                    continue
+                candidate = np.asarray(s_b, dtype=float).reshape(-1)
+                if candidate.size != arr.size:
+                    continue
+                w = sib_weights[idx]
+                weighted += w * candidate
+                wsum += w
+            safe = np.where(wsum > 0.0, wsum, 1.0)
+            boundary_out[ch] = np.clip(weighted / safe, 0.0, 1.0)
+        return _sanitize_seed(seed_out), _sanitize_boundaries(boundary_out)
+
+    def _make_candidate(
+        seed: Mapping[str, float],
+        boundaries: Mapping[str, Any],
+        seed_source: str,
+    ) -> Dict[str, Any]:
+        return {
+            "seed": _sanitize_seed(seed),
+            "boundaries": _sanitize_boundaries(boundaries),
+            "seed_source": str(seed_source),
+        }
+
+    def _emit_attempt_callback(
+        *,
+        attempt_idx: int,
+        attempt_r2: Optional[float],
+        is_new_best: bool,
+        attempt_strategy: str,
+        elapsed: float,
+        phase: str,
+        seed_source: str,
+        result: Mapping[str, Any],
+    ) -> None:
+        if context.attempt_callback is None:
+            return
+        attempt_params = dict(result.get("params_by_key") or {})
+        attempt_boundary_ratios_out: Dict[str, Any] = {}
+        ch_res = result.get("channel_results")
+        if isinstance(ch_res, Mapping):
+            for ch_t, ch_r in ch_res.items():
+                if not isinstance(ch_r, Mapping):
+                    continue
+                br = ch_r.get("boundary_ratios")
+                if br is not None:
+                    attempt_boundary_ratios_out[str(ch_t)] = (
+                        np.asarray(br, dtype=float).reshape(-1).tolist()
+                    )
+        elif result.get("boundary_ratios") is not None and len(enabled_models) == 1:
+            ch_t = str(enabled_models[0].target_col)
+            attempt_boundary_ratios_out[ch_t] = (
+                np.asarray(result["boundary_ratios"], dtype=float).reshape(-1).tolist()
+            )
+        try:
+            context.attempt_callback(
+                context.step_index - 1,  # 0-based step index
+                int(attempt_idx),
+                {
+                    "r2": float(attempt_r2) if attempt_r2 is not None else None,
+                    "is_new_best": bool(is_new_best),
+                    "strategy": attempt_strategy,
+                    "phase": str(phase),
+                    "seed_source": str(seed_source),
+                    "attempt": int(attempt_idx),
+                    "max_attempts": int(max(int(max_attempts), int(attempt_counter))),
+                    "best_r2": best_r2,
+                    "elapsed": float(elapsed),
+                    "retry_r2_history": list(retry_r2_history),
+                    "step_label": step_label,
+                    "params_by_key": attempt_params,
+                    "boundary_ratios": attempt_boundary_ratios_out,
+                    "channels": list(sorted(enabled_targets)),
+                    "free_params": list(step_free_for_log),
+                    "fixed_params": list(step_fixed_filtered.keys()),
+                },
+            )
+        except Exception:
+            pass
+
+    def _run_attempt(
+        candidate: Mapping[str, Any],
+        *,
+        phase: str,
+        screening_mode: bool,
+    ) -> Optional[Dict[str, Any]]:
+        nonlocal best_result, best_r2, attempt_counter
         if context.is_cancelled():
             raise model.FitCancelledError("cancelled")
-
-        attempt_seed = dict(context.seed_map)
-        attempt_boundary_seeds = dict(step_boundary_seeds)
-        attempt_strategy = "seed"
-
-        # Apply sibling seed to the first attempt when available.
-        if attempt == 0 and _sibling_seed_info is not None:
-            sibling_seed_map = _sibling_seed_info.get("seed_map") or {}
-            applied = 0
-            for key, val in sibling_seed_map.items():
-                if key not in step_fixed_filtered and key in seen_global:
-                    attempt_seed[key] = float(val)
-                    applied += 1
-            sibling_boundaries = _sibling_seed_info.get("boundary_seeds") or {}
-            for ch, arr in sibling_boundaries.items():
-                if ch in attempt_boundary_seeds:
-                    attempt_boundary_seeds[ch] = np.asarray(arr, dtype=float)
-            if applied > 0 or sibling_boundaries:
-                attempt_strategy = "sibling+seed"
-                _fit_log.detail(
-                    "sibling-seed applied to attempt 1: "
-                    f"{applied} params, {len(sibling_boundaries)} boundary channels"
-                )
-        if attempt > 0:
-            # Retries: jitter or random strategies (sibling seed was already
-            # applied on attempt 0 when available, so skip the old attempt==1
-            # sibling-only retry to avoid dedup).
-            rng = np.random.default_rng((context.rng_seed or 42) + int(attempt))
-            if retry_mode == "jitter":
-                strategy = "jitter"
-            elif retry_mode == "random":
-                strategy = "random"
-            else:
-                strategy = "jitter" if attempt == 1 else "random"
-            attempt_strategy = strategy
-            retry_targets = set(seen_global)
-            scale = float(step.retry_scale)
-            for key in sorted(retry_targets):
-                if key in step_fixed_filtered:
-                    continue
-                if key not in context.bounds_map:
-                    continue
-                low, high = context.bounds_map[key]
-                if low > high:
-                    low, high = high, low
-                span = high - low
-                if strategy == "random":
-                    if np.isclose(low, high):
-                        attempt_seed[key] = float(low)
-                    else:
-                        attempt_seed[key] = float(rng.uniform(low, high))
-                else:
-                    current = attempt_seed.get(key, (low + high) / 2.0)
-                    delta = rng.uniform(-scale, scale) * span
-                    attempt_seed[key] = float(np.clip(current + delta, low, high))
-
-        # --- Dedup: skip if this exact seed was already attempted ---
+        attempt_seed = _sanitize_seed(candidate.get("seed") or {})
+        attempt_boundary_seeds = _sanitize_boundaries(candidate.get("boundaries") or {})
+        seed_source = str(candidate.get("seed_source") or "base")
         sig = _attempt_seed_signature(attempt_seed, attempt_boundary_seeds)
+        attempt_strategy = f"{phase}:{seed_source}"
         if sig in _seen_attempt_sigs:
             _fit_log.attempt_start(
-                attempt + 1, max_attempts, f"{attempt_strategy}(dedup-skip)"
+                int(attempt_counter + 1),
+                int(max(int(max_attempts), int(attempt_counter + 1))),
+                f"{attempt_strategy}(dedup-skip)",
             )
-            continue
+            return None
         _seen_attempt_sigs.add(sig)
-
-        _fit_log.attempt_start(attempt + 1, max_attempts, attempt_strategy)
+        attempt_counter += 1
+        _fit_log.attempt_start(
+            int(attempt_counter),
+            int(max(int(max_attempts), int(attempt_counter))),
+            attempt_strategy,
+        )
         attempt_t0 = time.perf_counter()
         try:
             if step_multi.is_multi_channel:
@@ -684,13 +1073,29 @@ def _execute_fit_step(step: FitStep, context: ProcedureContext) -> StepResult:
                     step_multi,
                     attempt_seed,
                     context.bounds_map,
+                    periodic_params=context.periodic_params,
                     boundary_seeds=attempt_boundary_seeds,
                     cancel_check=context.cancel_check,
                     fixed_params=step_fixed_filtered,
                     fixed_boundary_ratios_by_channel=fixed_boundary_by_channel,
                     n_random_restarts=0,
                     rng_seed=context.rng_seed,
-                    use_jax=context.use_jax,
+                    screening=bool(screening_mode),
+                    max_points=(
+                        int(_FIT_SCREEN_MAX_POINTS)
+                        if bool(screening_mode)
+                        else None
+                    ),
+                    stage_a_nfev_scale=(
+                        float(_FIT_SCREEN_STAGEA_SCALE)
+                        if bool(screening_mode)
+                        else 1.0
+                    ),
+                    stage_b_nfev_scale=(
+                        float(_FIT_SCREEN_STAGEB_SCALE)
+                        if bool(screening_mode)
+                        else 1.0
+                    ),
                 )
             else:
                 ch_model = enabled_models[0]
@@ -702,13 +1107,29 @@ def _execute_fit_step(step: FitStep, context: ProcedureContext) -> StepResult:
                     ch_model,
                     attempt_seed,
                     context.bounds_map,
+                    periodic_params=context.periodic_params,
                     boundary_seed=b_seed,
                     cancel_check=context.cancel_check,
                     fixed_params=step_fixed_filtered,
                     fixed_boundary_ratios=fixed_boundary_by_channel.get(ch_target, {}),
                     n_random_restarts=0,
                     rng_seed=context.rng_seed,
-                    use_jax=context.use_jax,
+                    screening=bool(screening_mode),
+                    max_points=(
+                        int(_FIT_SCREEN_MAX_POINTS)
+                        if bool(screening_mode)
+                        else None
+                    ),
+                    stage_a_nfev_scale=(
+                        float(_FIT_SCREEN_STAGEA_SCALE)
+                        if bool(screening_mode)
+                        else 1.0
+                    ),
+                    stage_b_nfev_scale=(
+                        float(_FIT_SCREEN_STAGEB_SCALE)
+                        if bool(screening_mode)
+                        else 1.0
+                    ),
                 )
         except model.FitCancelledError:
             raise
@@ -716,75 +1137,369 @@ def _execute_fit_step(step: FitStep, context: ProcedureContext) -> StepResult:
             _fit_log.attempt_fail(
                 time.perf_counter() - attempt_t0, f"{type(exc).__name__}: {exc}"
             )
-            # Fit failed for this attempt; try again if retries remain.
-            continue
+            return None
 
-        attempt_r2 = result.get("r2")
+        elapsed = time.perf_counter() - attempt_t0
+        raw_r2 = result.get("r2")
+        attempt_r2 = float(raw_r2) if raw_r2 is not None else None
         is_new_best = best_result is None or (
-            attempt_r2 is not None and (best_r2 is None or float(attempt_r2) > best_r2)
+            attempt_r2 is not None and (best_r2 is None or attempt_r2 > float(best_r2))
         )
-        _fit_log.attempt_done(
-            time.perf_counter() - attempt_t0, r2=attempt_r2, is_best=is_new_best
-        )
+        _fit_log.attempt_done(elapsed, r2=attempt_r2, is_best=is_new_best)
         if attempt_r2 is not None:
             retry_r2_history.append(float(attempt_r2))
-
-        if best_result is None or (
-            attempt_r2 is not None and (best_r2 is None or float(attempt_r2) > best_r2)
-        ):
+        if is_new_best:
             best_result = result
-            best_r2 = float(attempt_r2) if attempt_r2 is not None else None
+            best_r2 = float(attempt_r2) if attempt_r2 is not None else best_r2
+        _emit_attempt_callback(
+            attempt_idx=int(attempt_counter - 1),
+            attempt_r2=attempt_r2,
+            is_new_best=is_new_best,
+            attempt_strategy=attempt_strategy,
+            elapsed=elapsed,
+            phase=phase,
+            seed_source=seed_source,
+            result=result,
+        )
+        return {
+            "result": result,
+            "r2": attempt_r2,
+            "elapsed": float(elapsed),
+            "seed": attempt_seed,
+            "boundaries": attempt_boundary_seeds,
+            "seed_source": seed_source,
+            "phase": phase,
+        }
 
-        # Fire per-attempt callback so the GUI can update live.
-        if context.attempt_callback is not None:
-            attempt_params = dict(result.get("params_by_key") or {})
-            attempt_boundary_ratios_out: Dict[str, Any] = {}
-            ch_res = result.get("channel_results")
-            if isinstance(ch_res, dict):
-                for ch_t, ch_r in ch_res.items():
-                    br = ch_r.get("boundary_ratios")
-                    if br is not None:
-                        attempt_boundary_ratios_out[str(ch_t)] = (
-                            np.asarray(br, dtype=float).reshape(-1).tolist()
+    # Two-stage attempt pipeline for high-retry fit steps.
+    if high_retry_heuristics:
+        rng = np.random.default_rng((context.rng_seed or 42) + int(context.step_index))
+        candidate_queue: List[Dict[str, Any]] = []
+        candidate_queue.append(
+            _make_candidate(context.seed_map, base_boundary_template, "base")
+        )
+        if _sibling_seed_info is not None:
+            sibling_seed = dict(context.seed_map)
+            sibling_seed.update(dict(_sibling_seed_info.get("seed_map") or {}))
+            sibling_boundaries = _clone_boundary_map(base_boundary_template)
+            for ch, arr in dict(_sibling_seed_info.get("boundary_seeds") or {}).items():
+                if str(ch) in sibling_boundaries:
+                    sibling_boundaries[str(ch)] = np.asarray(arr, dtype=float).reshape(-1)
+            candidate_queue.append(
+                _make_candidate(sibling_seed, sibling_boundaries, "sibling_blend")
+            )
+        if sibling_pool:
+            blend_seed, blend_boundaries = _blend_from_siblings(sibling_pool)
+            candidate_queue.append(
+                _make_candidate(blend_seed, blend_boundaries, "sibling_blend")
+            )
+            for sibling in sibling_pool:
+                s_seed = _sanitize_seed(sibling.get("seed_map") or {})
+                s_boundaries = _sanitize_boundaries(sibling.get("boundary_seeds") or {})
+                candidate_queue.append(
+                    _make_candidate(
+                        _jitter_seed(rng, s_seed, max(0.05, float(step.retry_scale) * 0.5)),
+                        _jitter_boundaries(
+                            rng, s_boundaries, max(0.05, float(step.retry_scale) * 0.4)
+                        ),
+                        "sibling_jitter",
+                    )
+                )
+        if len(candidate_queue) > max_attempts:
+            candidate_queue = candidate_queue[:max_attempts]
+
+        reserve_for_best = 1 if max_attempts >= 4 else 0
+        while len(candidate_queue) < max(1, max_attempts - reserve_for_best):
+            candidate_queue.append(
+                _make_candidate(
+                    _randomise_seed(
+                        rng,
+                        context.seed_map,
+                        max(0.1, float(step.retry_scale) if retry_mode != "random" else 1.0),
+                        force_random=True,
+                    ),
+                    _jitter_boundaries(
+                        rng,
+                        base_boundary_template,
+                        0.75 if retry_mode == "random" else max(0.1, float(step.retry_scale)),
+                    ),
+                    "random",
+                )
+            )
+
+        screening_results: List[Dict[str, Any]] = []
+        best_screen: Optional[Dict[str, Any]] = None
+        screen_target_hit = False
+        queue_idx = 0
+        while queue_idx < len(candidate_queue):
+            outcome = _run_attempt(candidate_queue[queue_idx], phase="screen", screening_mode=True)
+            queue_idx += 1
+            if outcome is None:
+                continue
+            screening_results.append(outcome)
+            if (
+                best_screen is None
+                or (
+                    (outcome.get("r2") is not None and best_screen.get("r2") is None)
+                    or (
+                        outcome.get("r2") is not None
+                        and best_screen.get("r2") is not None
+                        and float(outcome["r2"]) > float(best_screen["r2"])
+                    )
+                    or (
+                        outcome.get("r2") is not None
+                        and best_screen.get("r2") is not None
+                        and np.isclose(float(outcome["r2"]), float(best_screen["r2"]))
+                        and float(outcome.get("elapsed") or np.inf)
+                        < float(best_screen.get("elapsed") or np.inf)
+                    )
+                )
+            ):
+                best_screen = outcome
+                if len(candidate_queue) < max_attempts:
+                    tuned_seed, tuned_boundaries = _seed_from_fit_result(
+                        best_screen["seed"],
+                        best_screen["boundaries"],
+                        best_screen["result"],
+                    )
+                    candidate_queue.append(
+                        _make_candidate(
+                            _jitter_seed(
+                                rng,
+                                tuned_seed,
+                                max(0.05, float(step.retry_scale) * 0.4),
+                            ),
+                            _jitter_boundaries(
+                                rng,
+                                tuned_boundaries,
+                                max(0.05, float(step.retry_scale) * 0.35),
+                            ),
+                            "best_jitter",
                         )
-            elif result.get("boundary_ratios") is not None:
-                ch_t = enabled_models[0].target_col
-                attempt_boundary_ratios_out[str(ch_t)] = (
-                    np.asarray(result["boundary_ratios"], dtype=float)
-                    .reshape(-1)
-                    .tolist()
+                    )
+            if (
+                step.min_r2 is not None
+                and outcome.get("r2") is not None
+                and float(outcome["r2"]) >= float(step.min_r2)
+            ):
+                screen_target_hit = True
+                _fit_log.detail(
+                    "screen target reached: "
+                    f"r2={float(outcome['r2']):.6f} >= min_r2={float(step.min_r2):.6f}; "
+                    "skipping remaining screen/full attempts"
                 )
-            try:
-                context.attempt_callback(
-                    context.step_index - 1,  # 0-based step index
-                    attempt,
-                    {
-                        "r2": float(attempt_r2) if attempt_r2 is not None else None,
-                        "is_new_best": is_new_best,
-                        "strategy": attempt_strategy,
-                        "attempt": attempt,
-                        "max_attempts": max_attempts,
-                        "best_r2": best_r2,
-                        "elapsed": time.perf_counter() - attempt_t0,
-                        "retry_r2_history": list(retry_r2_history),
-                        "step_label": step_label,
-                        "params_by_key": attempt_params,
-                        "boundary_ratios": attempt_boundary_ratios_out,
-                        "channels": list(sorted(enabled_targets)),
-                        "free_params": list(step_free_for_log),
-                        "fixed_params": list(step_fixed_filtered.keys()),
-                    },
-                )
-            except Exception:
-                pass
+                break
 
-        # If R² threshold is met, stop retrying.
-        if (
-            step.min_r2 is not None
-            and attempt_r2 is not None
-            and float(attempt_r2) >= float(step.min_r2)
-        ):
-            break
+        if screen_target_hit and best_screen is not None:
+            best_result = best_screen["result"]
+            best_r2 = (
+                float(best_screen["r2"]) if best_screen.get("r2") is not None else best_r2
+            )
+        else:
+            ranked_screen = sorted(
+                screening_results,
+                key=lambda item: (
+                    float(item.get("r2") if item.get("r2") is not None else -1e12),
+                    -float(item.get("elapsed") or np.inf),
+                ),
+                reverse=True,
+            )
+            best_screen_r2: Optional[float] = None
+            if ranked_screen:
+                top_screen_r2 = ranked_screen[0].get("r2")
+                if top_screen_r2 is not None:
+                    try:
+                        top_numeric = float(top_screen_r2)
+                    except Exception:
+                        top_numeric = None
+                    if top_numeric is not None and np.isfinite(top_numeric):
+                        best_screen_r2 = float(top_numeric)
+            full_screen_floor_r2: Optional[float] = None
+            if best_screen_r2 is not None:
+                full_screen_floor_r2 = float(
+                    max(
+                        float(_FIT_FULL_SCREEN_ABS_MIN_R2),
+                        float(best_screen_r2 - float(_FIT_FULL_SCREEN_MAX_R2_GAP)),
+                        float(best_screen_r2 * float(_FIT_FULL_SCREEN_MIN_REL_R2)),
+                    )
+                )
+                _fit_log.detail(
+                    "full-candidate screen floor: "
+                    f"best={best_screen_r2:.6f} floor={full_screen_floor_r2:.6f}"
+                )
+
+            def _screen_candidate_allowed(entry: Mapping[str, Any], *, is_best: bool) -> bool:
+                if is_best:
+                    return True
+                if full_screen_floor_r2 is None:
+                    return True
+                r2_raw = entry.get("r2")
+                if r2_raw is None:
+                    _fit_log.detail(
+                        "full-candidate dropped (screen): "
+                        f"seed_source={entry.get('seed_source')} reason=no-r2"
+                    )
+                    return False
+                try:
+                    r2_value = float(r2_raw)
+                except Exception:
+                    _fit_log.detail(
+                        "full-candidate dropped (screen): "
+                        f"seed_source={entry.get('seed_source')} reason=invalid-r2"
+                    )
+                    return False
+                if not np.isfinite(r2_value):
+                    _fit_log.detail(
+                        "full-candidate dropped (screen): "
+                        f"seed_source={entry.get('seed_source')} reason=non-finite-r2"
+                    )
+                    return False
+                if float(r2_value) < float(full_screen_floor_r2):
+                    _fit_log.detail(
+                        "full-candidate dropped (screen): "
+                        f"seed_source={entry.get('seed_source')} "
+                        f"r2={r2_value:.6f} floor={float(full_screen_floor_r2):.6f}"
+                    )
+                    return False
+                return True
+
+            n_full = min(3, max(1, int(np.ceil(np.sqrt(max_attempts)))))
+            full_candidates: List[Dict[str, Any]] = []
+            anchor_sources = {"base", "sibling_blend"}
+            if ranked_screen:
+                for idx, entry in enumerate(ranked_screen):
+                    if str(entry.get("seed_source") or "") not in anchor_sources:
+                        continue
+                    if not _screen_candidate_allowed(entry, is_best=(idx == 0)):
+                        continue
+                    tuned_seed, tuned_boundaries = _seed_from_fit_result(
+                        entry["seed"],
+                        entry["boundaries"],
+                        entry["result"],
+                    )
+                    full_candidates.append(
+                        _make_candidate(
+                            tuned_seed,
+                            tuned_boundaries,
+                            str(entry.get("seed_source") or "base"),
+                        )
+                    )
+                    break
+            for idx, entry in enumerate(ranked_screen):
+                if not _screen_candidate_allowed(entry, is_best=(idx == 0)):
+                    continue
+                tuned_seed, tuned_boundaries = _seed_from_fit_result(
+                    entry["seed"],
+                    entry["boundaries"],
+                    entry["result"],
+                )
+                candidate = _make_candidate(
+                    tuned_seed, tuned_boundaries, str(entry.get("seed_source") or "base")
+                )
+                sig = _attempt_seed_signature(candidate["seed"], candidate["boundaries"])
+                if any(
+                    _attempt_seed_signature(c["seed"], c["boundaries"]) == sig
+                    for c in full_candidates
+                ):
+                    continue
+                full_candidates.append(candidate)
+                if len(full_candidates) >= n_full:
+                    break
+
+            best_full_result = None
+            best_full_r2 = None
+            no_progress = 0
+            for candidate in full_candidates:
+                outcome = _run_attempt(candidate, phase="full", screening_mode=False)
+                if outcome is None:
+                    continue
+                current_r2 = outcome.get("r2")
+                improved = False
+                if current_r2 is not None and (
+                    best_full_r2 is None or float(current_r2) > float(best_full_r2)
+                ):
+                    delta = (
+                        float(current_r2) - float(best_full_r2)
+                        if best_full_r2 is not None
+                        else np.inf
+                    )
+                    improved = bool(delta >= float(_FIT_FULL_MIN_DELTA_R2))
+                    best_full_r2 = float(current_r2)
+                    best_full_result = outcome["result"]
+                elif best_full_result is None:
+                    best_full_result = outcome["result"]
+
+                if improved:
+                    no_progress = 0
+                else:
+                    no_progress += 1
+
+                if (
+                    step.min_r2 is not None
+                    and current_r2 is not None
+                    and float(current_r2) >= float(step.min_r2)
+                ):
+                    break
+                if no_progress >= int(_FIT_FULL_PATIENCE):
+                    break
+
+            if best_full_result is not None:
+                best_result = best_full_result
+                full_r2 = best_full_result.get("r2")
+                best_r2 = float(full_r2) if full_r2 is not None else best_r2
+    else:
+        for attempt in range(max_attempts):
+            if context.is_cancelled():
+                raise model.FitCancelledError("cancelled")
+            attempt_seed = dict(context.seed_map)
+            attempt_boundary_seeds = _clone_boundary_map(base_boundary_template)
+            seed_source = "base"
+            if attempt == 0 and _sibling_seed_info is not None:
+                for key, val in dict(_sibling_seed_info.get("seed_map") or {}).items():
+                    if key in seen_global and key not in step_fixed_filtered:
+                        attempt_seed[str(key)] = float(val)
+                for ch, arr in dict(_sibling_seed_info.get("boundary_seeds") or {}).items():
+                    if str(ch) in attempt_boundary_seeds:
+                        attempt_boundary_seeds[str(ch)] = np.asarray(
+                            arr, dtype=float
+                        ).reshape(-1)
+                seed_source = "sibling_blend"
+            if attempt > 0:
+                rng = np.random.default_rng((context.rng_seed or 42) + int(attempt))
+                if retry_mode == "jitter":
+                    seed_source = "best_jitter"
+                    attempt_seed = _jitter_seed(
+                        rng, attempt_seed, max(0.05, float(step.retry_scale))
+                    )
+                elif retry_mode == "random":
+                    seed_source = "random"
+                    attempt_seed = _randomise_seed(rng, attempt_seed, 1.0, force_random=True)
+                else:
+                    if attempt == 1:
+                        seed_source = "best_jitter"
+                        attempt_seed = _jitter_seed(
+                            rng, attempt_seed, max(0.05, float(step.retry_scale))
+                        )
+                    else:
+                        seed_source = "random"
+                        attempt_seed = _randomise_seed(
+                            rng, attempt_seed, 1.0, force_random=True
+                        )
+
+            outcome = _run_attempt(
+                _make_candidate(attempt_seed, attempt_boundary_seeds, seed_source),
+                phase="full",
+                screening_mode=False,
+            )
+            if outcome is None:
+                continue
+            attempt_r2 = outcome.get("r2")
+            if (
+                step.min_r2 is not None
+                and attempt_r2 is not None
+                and float(attempt_r2) >= float(step.min_r2)
+            ):
+                break
 
     if best_result is None:
         _fit_log.step_done("fail", message="All fit attempts failed.")
@@ -879,6 +1594,7 @@ def run_procedure_pipeline(
     procedure: FitProcedure,
     seed_map: Mapping[str, float],
     bounds_map: Mapping[str, Tuple[float, float]],
+    periodic_params: Optional[Mapping[str, bool]] = None,
     boundary_seeds: Optional[Mapping[str, np.ndarray]] = None,
     cancel_check: Optional[Callable[[], bool]] = None,
     step_callback: Optional[Callable[[int, Dict[str, Any]], None]] = None,
@@ -886,7 +1602,6 @@ def run_procedure_pipeline(
     bound_values: Optional[Mapping[str, float]] = None,
     boundary_name_groups: Optional[Mapping[str, Sequence[Sequence[Any]]]] = None,
     rng_seed: Optional[int] = None,
-    use_jax: bool = False,
     # -- Cross-file sibling seeding --
     captures: Optional[Mapping[str, Any]] = None,
     sibling_results: Optional[Mapping[str, Mapping[str, Any]]] = None,
@@ -921,6 +1636,7 @@ def run_procedure_pipeline(
     context = ProcedureContext(
         seed_map=dict(seed_map),
         bounds_map=dict(bounds_map),
+        periodic_params=periodic_params,
         boundary_seeds=dict(boundary_seeds or {}),
         x_data=x_data,
         y_data_by_channel=dict(y_data_by_channel),
@@ -934,7 +1650,6 @@ def run_procedure_pipeline(
             if boundary_name_groups is not None
             else _default_boundary_name_groups(multi_model)
         ),
-        use_jax=use_jax,
         captures=dict(captures or {}),
         sibling_results=dict(sibling_results or {}),
         capture_seed_keys=tuple(capture_seed_keys or ()),
@@ -948,7 +1663,7 @@ def run_procedure_pipeline(
 
     n_steps = len(procedure.steps)
     context.step_total = n_steps
-    _fit_log.procedure_start(procedure.name, n_steps, backend=_backend_tag(use_jax))
+    _fit_log.procedure_start(procedure.name, n_steps)
     procedure_t0 = time.perf_counter()
 
     for step_idx, step in enumerate(procedure.steps):

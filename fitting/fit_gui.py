@@ -4,15 +4,17 @@ Manual Curve Fitting GUI for MI Model
 Allows manual adjustment of parameters for failed automatic fits.
 """
 
+import argparse
 import os
 import re
 import sys
 import html
 import json
 import time
+import warnings
 from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Literal, Optional, Self, Set, Tuple
+from typing import Any, Dict, List, Literal, Optional, Self, Sequence, Set, Tuple
 
 from matplotlib.gridspec import GridSpec
 import numpy as np
@@ -87,7 +89,7 @@ from matplotlib.pyplot import switch_backend
 
 from data_io import (
     is_supported_archive_path,
-    list_archive_csv_members,
+    open_archive_csv_member_stream,
     read_measurement_csv,
     stem_for_file_ref,
 )
@@ -126,7 +128,6 @@ from model import (
     extract_segment_parameter_names,
     build_piecewise_model_definition,
     build_multi_channel_model_definition,
-    make_segment_specs,
     shared_to_local_flat,
     compute_r2,
     smooth_channel_array,
@@ -608,8 +609,41 @@ class ProcedureLivePanel(QWidget):
         self.dismissed.emit()
 
 
+class DataPreloadWorker(QObject):
+    """Background CSV reader that preloads file frames for faster navigation."""
+
+    file_loaded = pyqtSignal(int, str, object, object)  # (session, file_ref, frame, error)
+    finished = pyqtSignal(int)  # (session)
+
+    def __init__(self, session_id: int, file_refs) -> None:
+        super().__init__()
+        self.session_id = int(session_id)
+        self.file_refs: List[str] = [
+            str(ref).strip() for ref in list(file_refs or []) if str(ref).strip()
+        ]
+        self.cancel_requested = False
+
+    def request_cancel(self) -> None:
+        self.cancel_requested = True
+
+    def run(self) -> None:
+        for file_ref in self.file_refs:
+            if self.cancel_requested:
+                break
+            frame = None
+            error = None
+            try:
+                frame = read_measurement_csv(file_ref)
+            except Exception as exc:
+                error = str(exc)
+            if self.cancel_requested:
+                break
+            self.file_loaded.emit(self.session_id, str(file_ref), frame, error)
+        self.finished.emit(self.session_id)
+
+
 class ManualFitGUI(QMainWindow):
-    def __init__(self):
+    def __init__(self, source_path: Optional[str] = None):
         super().__init__()
         self._scroll_eat_filter = _ScrollEatFilter(self)
         self.param_specs = list(DEFAULT_PARAM_SPECS)
@@ -619,6 +653,7 @@ class ManualFitGUI(QMainWindow):
         self.param_max_spinboxes = {}
         self._model_param_min_spinboxes = {}
         self._model_param_max_spinboxes = {}
+        self._model_param_periodic_checkboxes = {}
         self.param_lock_status_labels = {}
         self.param_tail_spacers_by_key = {}
         self.breakpoint_controls = {}
@@ -658,6 +693,7 @@ class ManualFitGUI(QMainWindow):
         self._manually_fixed_boundary_ids = set()  # {(target_col, boundary_idx), ...}
         self._boundary_fix_checkboxes = {}
         self._manually_fixed_params = set()  # Param keys manually fixed by user
+        self._periodic_param_keys = set()  # Param keys treated as periodic
         self.param_fix_checkboxes = {}  # key -> QCheckBox
         self._param_channel_header_labels = {}  # target_col -> QLabel
         self._fit_channel_enabled = {}  # {target_col: bool} per-equation fit toggles
@@ -707,7 +743,6 @@ class ManualFitGUI(QMainWindow):
         self.auto_fit_btn_default_text = "Auto Fit"
         self._auto_fit_run_mode = "fit"
         self._batch_fit_run_mode = "fit"
-        self._use_jax_backend = False
         self._auto_fit_mode_actions = {}
         self._batch_fit_mode_actions = {}
         initial_boundary_count = max(
@@ -747,8 +782,14 @@ class ManualFitGUI(QMainWindow):
         self._fit_worker_thread.task_failed.connect(self._on_fit_task_failed)
         self._fit_worker_thread.task_cancelled.connect(self._on_fit_task_cancelled)
         self._fit_worker_thread.start()
+        self._data_preload_cache: Dict[str, Any] = {}
+        self._data_preload_failed: set[str] = set()
+        self._data_preload_thread: QThread | None = None
+        self._data_preload_worker: DataPreloadWorker | None = None
+        self._data_preload_session: int = 0
         self._batch_refit_random_restarts = 2
         self._batch_total_tasks = 0
+        self._batch_progress_started_at = 0.0
         self._batch_cancel_requested = False
         self.batch_fit_in_progress = False
         self._batch_cancel_pending = False
@@ -761,6 +802,8 @@ class ManualFitGUI(QMainWindow):
         self.analysis_columns = []
         self.analysis_numeric_data = {}
         self.analysis_param_columns = []
+        self._analysis_math_controls_refreshing = False
+        self._analysis_row_x_cache: Dict[Tuple[str, str], np.ndarray] = {}
         self._analysis_point_pick_cid = None
         self._analysis_hover_cid = None
         self._analysis_hover_leave_cid = None
@@ -793,6 +836,18 @@ class ManualFitGUI(QMainWindow):
         self._batch_analysis_refresh_timer.timeout.connect(
             self._flush_batch_analysis_refresh
         )
+        self._idle_archive_scan_queue: List[str] = []
+        self._idle_archive_scan_total: int = 0
+        self._idle_archive_scan_done: int = 0
+        self._idle_archive_scan_added: int = 0
+        self._idle_archive_scan_session: int = 0
+        self._idle_archive_scan_stream = None
+        self._idle_archive_scan_current_archive: str | None = None
+        self._idle_archive_scan_current_found: int = 0
+        self._last_source_load_cancelled: bool = False
+        self._idle_archive_scan_timer = QTimer()
+        self._idle_archive_scan_timer.setSingleShot(True)
+        self._idle_archive_scan_timer.timeout.connect(self._process_idle_archive_scan)
         self.thumb_thread = None
         self.thumb_worker = None
         self.thumb_render_in_progress = False
@@ -824,11 +879,16 @@ class ManualFitGUI(QMainWindow):
         self.smoothing_enabled = True
         self.smoothing_window = 101
 
-        # Current directory
-        self.current_dir = "../AFG_measurements/"
+        # Current source path (directory/archive/csv)
+        default_source = "../AFG_measurements/"
+        if source_path not in (None, ""):
+            self.current_dir = str(Path(str(source_path)).expanduser())
+        else:
+            self.current_dir = str(Path(default_source).expanduser())
         self._source_display_override = None
         self._source_selected_paths = []
         self._fit_details_restore_in_progress = False
+        self._fit_details_autoload_attempted = False
 
         # Create central widget
         central_widget = QWidget()
@@ -839,6 +899,10 @@ class ManualFitGUI(QMainWindow):
         main_layout = QVBoxLayout(central_widget)
         main_layout.setContentsMargins(6, 6, 6, 6)
         main_layout.setSpacing(4)
+
+        self.stats_text = SingleLineStatusLabel("")
+        self.stats_text.setObjectName("statsLine")
+        self.stats_text.setStyleSheet("padding: 0px 2px; margin: 0px;")
 
         self.tabs = QTabWidget()
         self.tabs.setSizePolicy(
@@ -938,15 +1002,14 @@ class ManualFitGUI(QMainWindow):
         corner_layout = QHBoxLayout(corner_widget)
         corner_layout.setContentsMargins(0, 0, 0, 0)
         corner_layout.setSpacing(4)
-        self.tab_r2_label: QLabel = self._new_label(
-            "R²: N/A",
-            object_name="statusLabel",
-            style_sheet="font-weight: 600; color: #334155; padding: 1px 2px;",
-        )
-        corner_layout.addWidget(self.tab_r2_label)
+        if hasattr(self, "stats_text"):
+            self.stats_text.setSizePolicy(
+                QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred
+            )
+            self.stats_text.setMinimumWidth(260)
+            self.stats_text.setMaximumWidth(560)
+            corner_layout.addWidget(self.stats_text)
         self.tabs.setCornerWidget(corner_widget, Qt.Corner.TopRightCorner)
-        self.tab_corner_controls: QWidget = corner_widget
-        self.tab_r2_label.setVisible(self.tabs.currentWidget() is self.manual_tab)
 
     def sizeHint(self):
         return QSize(1000, 800)
@@ -1718,10 +1781,26 @@ class ManualFitGUI(QMainWindow):
             return
         total: int = max(0, int(getattr(self, "_batch_total_tasks", 0)))
         done: int = max(0, int(getattr(self, "_batch_progress_done", 0)))
-        self.run_batch_btn.setEnabled(False)
-        self.run_batch_btn.setText(
-            f"{self.run_batch_btn_default_text} ({done}/{total})"
+        running_batch = any(
+            str(task.get("kind")) == "batch" and str(task.get("status")) == "running"
+            for task in self.fit_tasks.values()
         )
+        display_done: int = min(
+            total,
+            done + (1 if running_batch and done < total else 0),
+        )
+        eta_text: str = self._progress_eta_text(
+            done=done,
+            total=total,
+            started_at=float(getattr(self, "_batch_progress_started_at", 0.0) or 0.0),
+        )
+        self.run_batch_btn.setEnabled(False)
+        if self._current_batch_fit_run_mode() == "procedure":
+            self.run_batch_btn.setText(f"{display_done}/{total} ({eta_text})")
+        else:
+            self.run_batch_btn.setText(
+                f"{self.run_batch_btn_default_text} ({done}/{total})"
+            )
         self.cancel_batch_btn.setEnabled(True)
         self.cancel_batch_btn.setText(
             "Force Stop"
@@ -1729,6 +1808,123 @@ class ManualFitGUI(QMainWindow):
             else "Cancel"
         )
         self._set_batch_fit_mode_selector_enabled(False)
+
+    @staticmethod
+    def _format_time_left(seconds: float) -> str:
+        if not np.isfinite(seconds) or float(seconds) <= 0.0:
+            return "0s left"
+        total_seconds: int = max(1, int(round(float(seconds))))
+        if total_seconds < 60:
+            return f"{total_seconds}s left"
+        total_minutes = int(round(total_seconds / 60.0))
+        if total_minutes < 60:
+            return f"{total_minutes}m left"
+        hours, minutes = divmod(total_minutes, 60)
+        if hours < 24:
+            if minutes == 0:
+                return f"{hours}h left"
+            return f"{hours}h {minutes}m left"
+        days, hours = divmod(hours, 24)
+        if hours == 0:
+            return f"{days}d left"
+        return f"{days}d {hours}h left"
+
+    def _progress_eta_text(self, *, done: int, total: int, started_at: float) -> str:
+        total_i: int = max(0, int(total))
+        done_i: int = max(0, int(done))
+        if total_i <= 0:
+            return "estimating..."
+        remaining: int = max(0, total_i - done_i)
+        if remaining <= 0:
+            return "0s left"
+        if done_i <= 0 or float(started_at) <= 0.0:
+            return "estimating..."
+        elapsed = max(0.0, float(time.perf_counter()) - float(started_at))
+        if elapsed <= 0.0:
+            return "estimating..."
+        eta_seconds = elapsed * (float(remaining) / float(done_i))
+        return self._format_time_left(float(eta_seconds))
+
+    def _update_batch_procedure_status(
+        self,
+        *,
+        current_task: Optional[Mapping[str, Any]] = None,
+        step_done: Optional[int] = None,
+        step_total: Optional[int] = None,
+    ) -> None:
+        if not bool(getattr(self, "batch_fit_in_progress", False)):
+            return
+        if self._current_batch_fit_run_mode() != "procedure":
+            return
+        total: int = max(0, int(getattr(self, "_batch_total_tasks", 0)))
+        done: int = max(0, int(getattr(self, "_batch_progress_done", 0)))
+        running_batch = any(
+            str(task.get("kind")) == "batch" and str(task.get("status")) == "running"
+            for task in self.fit_tasks.values()
+        )
+        display_done: int = min(
+            total,
+            done + (1 if running_batch and done < total else 0),
+        )
+        eta_text: str = self._progress_eta_text(
+            done=done,
+            total=total,
+            started_at=float(getattr(self, "_batch_progress_started_at", 0.0) or 0.0),
+        )
+        file_label = ""
+        task_ref = current_task or {}
+        if task_ref:
+            file_label = stem_for_file_ref(task_ref.get("file_path"))
+        if not file_label:
+            running_tasks = [
+                task
+                for task in self.fit_tasks.values()
+                if str(task.get("kind")) == "batch" and str(task.get("status")) == "running"
+            ]
+            if running_tasks:
+                file_label = stem_for_file_ref(running_tasks[0].get("file_path"))
+        detail = ""
+        if step_done is not None and step_total is not None and int(step_total) > 0:
+            detail = f" step {max(0, int(step_done))}/{max(1, int(step_total))}"
+        message = f"Procedures {display_done}/{total} ({eta_text})"
+        if file_label:
+            message += f" - {file_label}"
+        if detail:
+            message += detail
+        self.stats_text.setText(message)
+
+    def _update_manual_procedure_status(
+        self,
+        task: Mapping[str, Any],
+        *,
+        step_done: int,
+        step_total: int,
+    ) -> None:
+        if str(task.get("kind")) != "manual":
+            return
+        if self._normalize_fit_run_mode(task.get("execution_mode")) != "procedure":
+            return
+        total_i: int = max(1, int(step_total))
+        done_i: int = max(0, min(int(step_done), total_i))
+        started_at_raw = task.get("_progress_started_at")
+        started_at_val = (
+            finite_float_or_none(started_at_raw) if started_at_raw is not None else None
+        )
+        if started_at_val is None or started_at_val <= 0.0:
+            started_at_val = float(time.perf_counter())
+            try:
+                task["_progress_started_at"] = float(started_at_val)
+            except Exception:
+                pass
+        eta_text: str = self._progress_eta_text(
+            done=done_i,
+            total=total_i,
+            started_at=float(started_at_val),
+        )
+        file_label: str = stem_for_file_ref(task.get("file_path"))
+        self.stats_text.setText(
+            f"Procedure {done_i}/{total_i} ({eta_text}) - {file_label}"
+        )
 
     @staticmethod
     def _normalize_fit_run_mode(mode_value) -> str:
@@ -1956,11 +2152,6 @@ class ManualFitGUI(QMainWindow):
             toggle: Any | None = getattr(self, "smoothing_enable_cb", None)
         enabled = bool(toggle and toggle.isChecked())
         spin.setEnabled(enabled)
-
-    def _on_jax_toggle_changed(self) -> None:
-        """Handle JAX backend toggle."""
-        toggle: Any | None = getattr(self, "jax_toggle_btn", None)
-        self._use_jax_backend = bool(toggle and toggle.isChecked())
 
     def _on_smoothing_controls_changed(self) -> None:
         toggle: Any | None = getattr(self, "smoothing_toggle_btn", None)
@@ -3902,55 +4093,92 @@ class ManualFitGUI(QMainWindow):
 
         # Merge manually fixed parameters from UI checkboxes.
         manually_fixed = getattr(self, "_manually_fixed_params", set())
-        current_values = self.get_current_param_map()
+        current_values_raw = self.get_current_param_map()
+        current_values: Dict[str, float] = {}
+        for raw_key, raw_value in dict(current_values_raw or {}).items():
+            key_text: str = str(raw_key).strip()
+            if not key_text:
+                continue
+            numeric: float | None = finite_float_or_none(raw_value)
+            if numeric is None:
+                continue
+            current_values[key_text] = float(numeric)
         for key in manually_fixed:
-            if key not in fixed_map and key in current_values:
+            key_text: str = str(key).strip()
+            if key_text and key_text not in fixed_map and key_text in current_values:
                 try:
-                    fixed_map[key] = float(current_values[key])
+                    fixed_map[key_text] = float(current_values[key_text])
                 except (TypeError, ValueError):
                     pass
         spec_by_key: Dict[str, ParameterSpec] = {
-            spec.key: spec for spec in self.param_specs
+            str(spec.key): spec for spec in self.param_specs
+        }
+        periodic_selected: set[str] = {
+            str(key).strip()
+            for key in set(getattr(self, "_periodic_param_keys", set()) or set())
+            if str(key).strip()
+        }
+        periodic_by_key: Dict[str, bool] = {
+            key: True
+            for key in periodic_selected
+            if key in fit_param_key_set and key in spec_by_key
         }
         bounds_by_key = {}
         seed_map = {}
         missing_keys = []
+
+        def _coerce_to_param_bounds(key: str, value: float) -> float:
+            if key not in bounds_by_key:
+                return float(value)
+            low_raw, high_raw = bounds_by_key[key]
+            low = float(min(low_raw, high_raw))
+            high = float(max(low_raw, high_raw))
+            numeric = float(value)
+            if (
+                bool(periodic_by_key.get(str(key)))
+                and np.isfinite(low)
+                and np.isfinite(high)
+                and (high > low)
+            ):
+                return float(low + np.mod(numeric - low, high - low))
+            return float(np.clip(numeric, low, high))
+
         for key in ordered_keys:
-            spec: ParameterSpec | None = spec_by_key.get(key)
+            key_text: str = str(key)
+            spec: ParameterSpec | None = spec_by_key.get(key_text)
             if spec is None:
-                missing_keys.append(key)
+                missing_keys.append(key_text)
                 continue
             low = float(spec.min_value)
             high = float(spec.max_value)
             if low > high:
                 low, high = high, low
-            bounds_by_key[key] = (low, high)
+            bounds_by_key[key_text] = (low, high)
 
-            if key in current_values:
-                seed = float(current_values[key])
+            if key_text in current_values:
+                seed = float(current_values[key_text])
             else:
-                spec: ParameterSpec | None = spec_by_key.get(key)
+                spec: ParameterSpec | None = spec_by_key.get(key_text)
                 if spec is None:
-                    missing_keys.append(key)
+                    missing_keys.append(key_text)
                     continue
                 seed = float(spec.default)
-            seed_map[key] = float(np.clip(seed, low, high))
+            seed_map[key_text] = _coerce_to_param_bounds(key_text, float(seed))
         if missing_keys:
             missing_text: str = ", ".join(dict.fromkeys(missing_keys))
             raise ValueError(
                 f"Model/UI parameter mismatch. Missing controls for: {missing_text}"
             )
-        for key, value in fixed_map.items():
+        for key, value in list(fixed_map.items()):
+            if key in bounds_by_key:
+                fixed_map[key] = _coerce_to_param_bounds(key, float(value))
             if key in seed_map:
-                seed_map[key] = float(value)
+                seed_map[key] = float(fixed_map[key])
         if seed_overrides:
             for key, value in seed_overrides.items():
                 if key not in seed_map or key in fixed_map:
                     continue
-                low, high = bounds_by_key[key]
-                seed_map[key] = float(
-                    np.clip(float(value), min(low, high), max(low, high))
-                )
+                seed_map[key] = _coerce_to_param_bounds(str(key), float(value))
 
         for key in fit_param_keys:
             if key in fixed_map:
@@ -3962,6 +4190,11 @@ class ManualFitGUI(QMainWindow):
                 raise ValueError(
                     f"Bounds for '{key}' are equal; expand them before fitting."
                 )
+            if bool(periodic_by_key.get(key)):
+                if not (np.isfinite(low) and np.isfinite(high)):
+                    raise ValueError(
+                        f"Periodic parameter '{key}' requires finite bounds."
+                    )
 
         self._refresh_boundary_state_topology(preserve_existing=True)
         n_boundaries: int = max(0, len(active_model_def.segment_exprs) - 1)
@@ -4053,6 +4286,7 @@ class ManualFitGUI(QMainWindow):
             "ordered_keys": ordered_keys,
             "seed_map": seed_map,
             "bounds_map": bounds_by_key,
+            "periodic_params": periodic_by_key,
             "model_def": active_model_def,
             "multi_channel_model": active_multi_model,
             "boundary_seed": boundary_seed,
@@ -4061,6 +4295,66 @@ class ManualFitGUI(QMainWindow):
             "fixed_boundary_ratios": fixed_boundary_ratios,
             "fixed_boundary_ratios_by_channel": fixed_boundary_ratios_by_channel,
         }
+
+    @staticmethod
+    def _segment_model_from_evaluator(
+        evaluator: Callable[[np.ndarray, Mapping[str, float]], np.ndarray],
+        ordered_names: Sequence[str],
+    ) -> Callable[..., np.ndarray]:
+        names: Tuple[str, ...] = tuple(str(name) for name in ordered_names)
+
+        def _model(x_data, *params) -> np.ndarray[Tuple[int, ...], np.dtype[Any]]:
+            if len(params) != len(names):
+                raise ValueError(
+                    f"Expected {len(names)} parameters, got {len(params)}."
+                )
+            x_arr: np.ndarray[Tuple[int, ...], np.dtype[Any]] = np.asarray(
+                x_data, dtype=float
+            ).reshape(-1)
+            values: Dict[str, float] = {
+                name: float(params[idx]) for idx, name in enumerate(names)
+            }
+            return np.asarray(evaluator(x_arr, values), dtype=float).reshape(-1)
+
+        return _model
+
+    def _make_plot_segment_specs(
+        self,
+        model_def: PiecewiseModelDefinition,
+        seed_map: Mapping[str, float],
+        bounds_map: Mapping[str, Tuple[float, float]],
+    ) -> Tuple[SegmentSpec, ...]:
+        """Build non-JAX segment specs for plotting/evaluation only."""
+        specs: List[SegmentSpec] = []
+        for seg_names, evaluator in zip(
+            model_def.segment_param_names, model_def.segment_evaluators
+        ):
+            names: Tuple[str, ...] = tuple(str(name) for name in seg_names)
+            lower: List[float] = []
+            upper: List[float] = []
+            p0: List[float] = []
+            for name in names:
+                if name not in bounds_map:
+                    raise ValueError(f"Missing bounds for fit parameter '{name}'.")
+                low_raw, high_raw = bounds_map[name]
+                low = float(min(low_raw, high_raw))
+                high = float(max(low_raw, high_raw))
+                if name not in seed_map:
+                    raise ValueError(f"Missing parameter '{name}'.")
+                value = float(seed_map[name])
+                if np.isfinite(low) and np.isfinite(high):
+                    value = float(np.clip(value, low, high))
+                lower.append(low)
+                upper.append(high)
+                p0.append(value)
+            specs.append(
+                SegmentSpec(
+                    model_func=self._segment_model_from_evaluator(evaluator, names),
+                    p0=p0,
+                    bounds=(lower, upper),
+                )
+            )
+        return tuple(specs)
 
     def evaluate_model_map(
         self,
@@ -4120,7 +4414,7 @@ class ManualFitGUI(QMainWindow):
             raise ValueError(
                 f"Model/UI parameter mismatch. Missing parameter values: {missing_text}"
             )
-        segments: os.Sequence[SegmentSpec] = make_segment_specs(
+        segments: Tuple[SegmentSpec, ...] = self._make_plot_segment_specs(
             model_def, seed_map, bounds_map
         )
         shared: np.ndarray[Tuple[int, ...], np.dtype[Any]] = np.asarray(
@@ -4174,7 +4468,7 @@ class ManualFitGUI(QMainWindow):
                 seed_map[key] = float(current_values[key])
             else:
                 raise ValueError(f"Missing parameter '{key}'.")
-        segments: os.Sequence[SegmentSpec] = make_segment_specs(
+        segments: Tuple[SegmentSpec, ...] = self._make_plot_segment_specs(
             channel_model, seed_map, bounds_map
         )
         shared: np.ndarray[Tuple[int, ...], np.dtype[Any]] = np.asarray(
@@ -4678,16 +4972,37 @@ class ManualFitGUI(QMainWindow):
 
         # Container widget for channel-visibility toggles, embedded in the toolbar.
         self.plot_channel_toggle_container = QWidget()
-        self.plot_channel_toggle_container.setMaximumHeight(22)
+        self.plot_channel_toggle_container.setMaximumHeight(24)
         self.plot_channel_toggles_layout = QHBoxLayout(
             self.plot_channel_toggle_container
         )
         self.plot_channel_toggles_layout.setContentsMargins(4, 0, 0, 0)
-        self.plot_channel_toggles_layout.setSpacing(3)
+        self.plot_channel_toggles_layout.setSpacing(6)
+        self.plot_channel_toggles_buttons_widget = QWidget()
+        self.plot_channel_toggles_buttons_layout = QHBoxLayout(
+            self.plot_channel_toggles_buttons_widget
+        )
+        self.plot_channel_toggles_buttons_layout.setContentsMargins(0, 0, 0, 0)
+        self.plot_channel_toggles_buttons_layout.setSpacing(3)
+        self.plot_channel_toggles_layout.addWidget(
+            self.plot_channel_toggles_buttons_widget
+        )
+        self.plot_channel_toggles_layout.addStretch(1)
+        self.plot_toolbar_status_widget = QWidget()
+        self.plot_toolbar_status_layout = QHBoxLayout(self.plot_toolbar_status_widget)
+        self.plot_toolbar_status_layout.setContentsMargins(0, 0, 0, 0)
+        self.plot_toolbar_status_layout.setSpacing(6)
+        self.tab_r2_label: QLabel = self._new_label(
+            "R²: N/A",
+            object_name="statusLabel",
+            style_sheet="font-weight: 600; color: #334155; padding: 0px 2px;",
+        )
+        self.plot_toolbar_status_layout.addWidget(self.tab_r2_label)
+        self.plot_channel_toggles_layout.addWidget(self.plot_toolbar_status_widget)
         self.plot_channel_toggle_container.setSizePolicy(
             QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred
         )
-        self.plot_channel_toggle_container.setVisible(False)
+        self.plot_channel_toggle_container.setVisible(True)
         self._toolbar_toggle_action = self.toolbar.addWidget(
             self.plot_channel_toggle_container
         )
@@ -4960,6 +5275,7 @@ class ManualFitGUI(QMainWindow):
         clear_layout(layout)
         self._model_param_min_spinboxes = {}
         self._model_param_max_spinboxes = {}
+        self._model_param_periodic_checkboxes = {}
 
         if not self.param_specs:
             panel.setVisible(False)
@@ -5001,6 +5317,14 @@ class ManualFitGUI(QMainWindow):
             ),
             0,
             2,
+        )
+        grid.addWidget(
+            self._new_label(
+                "Periodic",
+                style_sheet="font-weight: 700; color: #64748b; font-size: 10px;",
+            ),
+            0,
+            3,
         )
 
         for row_idx, spec in enumerate(self.param_specs, start=1):
@@ -5057,10 +5381,23 @@ class ManualFitGUI(QMainWindow):
                     name, "max"
                 )
             )
+            periodic_cb: QCheckBox = self._new_checkbox(
+                "",
+                checked=bool(key in getattr(self, "_periodic_param_keys", set())),
+                tooltip=(
+                    "Treat this parameter as periodic during fitting. "
+                    "One period is inferred from current [lower, upper] bounds."
+                ),
+            )
+            periodic_cb.stateChanged.connect(
+                lambda _state, name=key: self._on_model_param_periodic_toggled(name)
+            )
             grid.addWidget(min_box, row_idx, 1)
             grid.addWidget(max_box, row_idx, 2)
+            grid.addWidget(periodic_cb, row_idx, 3, alignment=Qt.AlignmentFlag.AlignHCenter)
             self._model_param_min_spinboxes[key] = min_box
             self._model_param_max_spinboxes[key] = max_box
+            self._model_param_periodic_checkboxes[key] = periodic_cb
 
         row = QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
@@ -5109,6 +5446,18 @@ class ManualFitGUI(QMainWindow):
             src_min.setValue(float(model_min.value()))
         else:
             src_max.setValue(float(model_max.value()))
+
+    def _on_model_param_periodic_toggled(self, key) -> None:
+        cb: QCheckBox | None = self._model_param_periodic_checkboxes.get(str(key))
+        if cb is None:
+            return
+        periodic_keys: set[str] = set(getattr(self, "_periodic_param_keys", set()))
+        if cb.isChecked():
+            periodic_keys.add(str(key))
+        else:
+            periodic_keys.discard(str(key))
+        self._periodic_param_keys = periodic_keys
+        self._autosave_fit_details()
 
     def create_parameters_frame(self, parent_layout) -> None:
         """Create full-width controls + parameters section."""
@@ -5334,20 +5683,6 @@ class ManualFitGUI(QMainWindow):
         fit_actions_row.addWidget(self.auto_fit_btn)
         fit_actions_row.addWidget(self.reset_from_batch_btn)
 
-        self.jax_toggle_btn: QPushButton = self._new_button(
-            "JAX",
-            checkable=True,
-            checked=self._use_jax_backend,
-            toggled_handler=self._on_jax_toggle_changed,
-            tooltip=(
-                "Enable JAX/GPU-accelerated fitting (jaxfit backend).\n"
-                "When enabled, per-segment curve_fit calls use JAX with\n"
-                "auto-diff Jacobians and JIT compilation for faster fits.\n"
-                "Set REDPITAYA_FIT_DEBUG=1 for detailed timing/cache output."
-            ),
-        )
-        fit_actions_row.addWidget(self.jax_toggle_btn)
-
         fit_actions_row.addStretch(1)
         fit_group_layout.addLayout(fit_actions_row)
 
@@ -5572,10 +5907,6 @@ class ManualFitGUI(QMainWindow):
         self._sync_param_row_tail_spacers()
         QTimer.singleShot(0, self._sync_param_row_tail_spacers)
 
-        self.stats_text = SingleLineStatusLabel("")
-        self.stats_text.setObjectName("statsLine")
-        self.stats_text.setStyleSheet("padding: 0px 2px; margin: 0px;")
-
         group.setLayout(layout)
         self._parameters_group: QGroupBox = group
         parent_layout.addWidget(group)
@@ -5779,12 +6110,124 @@ class ManualFitGUI(QMainWindow):
             self.channel_tokens_layout.addStretch(1)
         self._refresh_expression_highlighting()
 
+    def _remap_param_values_by_key(
+        self,
+        raw_params,
+        *,
+        source_keys: Sequence[str],
+        target_keys: Sequence[str],
+        fallback_by_key: Mapping[str, Any] | None = None,
+    ) -> None | List[float]:
+        """Remap a parameter vector from source key order into target key order."""
+        values: np.ndarray[Tuple[int], np.dtype[Any]] = self._as_float_array(raw_params)
+        if values.size <= 0:
+            return None
+
+        source_map: Dict[str, float] = {}
+        for idx, key in enumerate(list(source_keys)):
+            if idx >= values.size:
+                break
+            numeric: float | None = finite_float_or_none(values[idx])
+            if numeric is None:
+                continue
+            source_map[str(key)] = float(numeric)
+
+        fallback_map: Dict[str, Any] = dict(fallback_by_key or {})
+        remapped: List[float] = []
+        for key in list(target_keys):
+            target_key: str = str(key)
+            value: float | None = source_map.get(target_key)
+            if value is None:
+                fallback_val: float | None = finite_float_or_none(
+                    fallback_map.get(target_key)
+                )
+                value = float(fallback_val) if fallback_val is not None else 0.0
+            remapped.append(float(value))
+        return remapped
+
+    def _remap_batch_result_params_on_model_change(
+        self,
+        *,
+        old_param_keys: Sequence[str],
+        new_param_specs: Sequence[ParameterSpec],
+    ) -> int:
+        """Remap stored batch fit vectors to the current parameter key order."""
+        rows: List[Any] = list(getattr(self, "batch_results", []) or [])
+        if not rows:
+            return 0
+
+        source_keys: List[str] = [str(key) for key in list(old_param_keys or [])]
+        target_keys: List[str] = [str(spec.key) for spec in list(new_param_specs or [])]
+        if not source_keys or not target_keys:
+            return 0
+
+        spec_by_key: Dict[str, ParameterSpec] = {
+            str(spec.key): spec for spec in list(new_param_specs or [])
+        }
+        fallback_by_key: Dict[str, float] = {
+            str(spec.key): float(spec.default) for spec in list(new_param_specs or [])
+        }
+        remapped_rows: int = 0
+        for idx, raw_row in enumerate(rows):
+            row = canonicalize_fit_row(raw_row)
+            prior_values: np.ndarray[Tuple[int], np.dtype[Any]] = self._as_float_array(
+                fit_get(row, "params")
+            )
+            remapped: None | List[float] = self._remap_param_values_by_key(
+                fit_get(row, "params"),
+                source_keys=source_keys,
+                target_keys=target_keys,
+                fallback_by_key=fallback_by_key,
+            )
+            if remapped is None:
+                self.batch_results[idx] = row
+                continue
+
+            clipped_remapped: List[float] = []
+            for key, raw_value in zip(target_keys, remapped):
+                numeric: float = float(raw_value)
+                spec: ParameterSpec | None = spec_by_key.get(str(key))
+                if spec is not None:
+                    low = float(min(spec.min_value, spec.max_value))
+                    high = float(max(spec.min_value, spec.max_value))
+                    if (
+                        str(key) in set(getattr(self, "_periodic_param_keys", set()))
+                        and np.isfinite(low)
+                        and np.isfinite(high)
+                        and (high > low)
+                    ):
+                        numeric = float(low + np.mod(float(numeric - low), high - low))
+                    else:
+                        numeric = float(np.clip(numeric, low, high))
+                clipped_remapped.append(float(numeric))
+
+            remapped_arr: np.ndarray[Tuple[int], np.dtype[Any]] = np.asarray(
+                clipped_remapped, dtype=float
+            ).reshape(-1)
+            changed: bool = prior_values.size != remapped_arr.size or not np.allclose(
+                prior_values,
+                remapped_arr,
+                rtol=0.0,
+                atol=0.0,
+                equal_nan=True,
+            )
+            if changed:
+                remapped_rows += 1
+            fit_set(row, "params", [float(v) for v in remapped_arr.tolist()])
+            row["plot_has_fit"] = bool(has_nonempty_values(fit_get(row, "params")))
+            row = self._apply_param_range_validation_to_row(row)
+            self.batch_results[idx] = row
+        return remapped_rows
+
     def apply_expression_from_input(self) -> bool:
         if self._apply_expression_in_progress:
             return False
         self._apply_expression_in_progress = True
         try:
             expression_text = self._expression_editor_text()
+            old_param_keys: List[str] = [
+                str(spec.key) for spec in list(getattr(self, "param_specs", []) or [])
+            ]
             if (
                 expression_text
                 and expression_text != self.function_input.toPlainText().strip()
@@ -5905,6 +6348,9 @@ class ManualFitGUI(QMainWindow):
             self._manually_fixed_params = (
                 getattr(self, "_manually_fixed_params", set()) & valid_keys
             )
+            self._periodic_param_keys = (
+                getattr(self, "_periodic_param_keys", set()) & valid_keys
+            )
             # Prune procedure steps for removed params/channels.
             if hasattr(self, "_procedure_panel"):
                 self._procedure_panel.prune_invalid_params()
@@ -5989,14 +6435,30 @@ class ManualFitGUI(QMainWindow):
                         row["plot_has_fit"] = None
                         row["_equation_stale"] = False
                 else:
+                    remapped_rows: int = self._remap_batch_result_params_on_model_change(
+                        old_param_keys=old_param_keys,
+                        new_param_specs=self.param_specs,
+                    )
                     for row in self.batch_results:
                         row["_equation_stale"] = True
-                    self.stats_text.append(
-                        "Equation updated; existing batch results were kept and marked stale."
-                    )
+                    if remapped_rows > 0:
+                        plural: str = "s" if remapped_rows != 1 else ""
+                        self.stats_text.append(
+                            "Equation updated; "
+                            f"remapped fit parameters for {remapped_rows} kept result{plural} "
+                            "and marked all kept results stale."
+                        )
+                    else:
+                        self.stats_text.append(
+                            "Equation updated; existing batch results were kept and marked stale."
+                        )
                 self.update_batch_table()
                 self._refresh_batch_analysis_if_run()
                 self.queue_visible_thumbnail_render()
+                current_file: Any | None = self._current_loaded_file_path()
+                if current_file:
+                    self._apply_batch_params_for_file(current_file)
+                self.update_plot(fast=False, preserve_view=True)
             if expression_changed:
                 self._autosave_fit_details()
             return True
@@ -6364,10 +6826,15 @@ class ManualFitGUI(QMainWindow):
     def _rebuild_channel_visibility_toggles(self) -> None:
         """Rebuild the channel-visibility toggle buttons from current data columns."""
         layout: Any | None = getattr(self, "plot_channel_toggles_layout", None)
+        buttons_layout: Any | None = getattr(
+            self, "plot_channel_toggles_buttons_layout", None
+        )
         container: Any | None = getattr(self, "plot_channel_toggle_container", None)
         toggle_action: Any | None = getattr(self, "_toolbar_toggle_action", None)
         if layout is None or container is None:
             return
+        if buttons_layout is None:
+            buttons_layout = layout
 
         def _set_toggles_visible(vis: bool) -> None:
             container.setVisible(vis)
@@ -6375,13 +6842,16 @@ class ManualFitGUI(QMainWindow):
                 toggle_action.setVisible(vis)
 
         # Remove existing toggle buttons.
-        clear_layout(layout)
+        clear_layout(buttons_layout)
         for btn in list(self._channel_toggle_buttons.values()):
             btn.deleteLater()
         self._channel_toggle_buttons.clear()
 
+        has_status_area: bool = bool(
+            getattr(self, "plot_toolbar_status_widget", None) is not None
+        )
         if self.current_data is None:
-            _set_toggles_visible(False)
+            _set_toggles_visible(has_status_area)
             return
 
         channel_names = [
@@ -6389,7 +6859,7 @@ class ManualFitGUI(QMainWindow):
         ]
 
         if len(channel_names) <= 1:
-            _set_toggles_visible(False)
+            _set_toggles_visible(has_status_area)
             return
 
         # Preserve existing visibility state; default new channels to visible.
@@ -6397,7 +6867,7 @@ class ManualFitGUI(QMainWindow):
             if name not in self._channel_visibility:
                 self._channel_visibility[name] = True
 
-        layout.addWidget(
+        buttons_layout.addWidget(
             self._new_label(
                 "Show:",
                 style_sheet="font-weight: 600; color: #475569; font-size: 11px;",
@@ -6414,7 +6884,7 @@ class ManualFitGUI(QMainWindow):
             btn.setProperty("_ch_name", name)
             btn.setProperty("_ch_color", color)
             btn.toggled.connect(self._on_channel_visibility_toggled)
-            layout.addWidget(btn)
+            buttons_layout.addWidget(btn)
             self._channel_toggle_buttons[name] = btn
 
         _set_toggles_visible(True)
@@ -6798,6 +7268,51 @@ class ManualFitGUI(QMainWindow):
         axis_row.addStretch(1)
         layout.addLayout(axis_row)
 
+        math_row = QHBoxLayout()
+        math_row.setSpacing(4)
+        math_row.addWidget(self._new_label("Derived (Y):"))
+        self.analysis_math_enable_btn: QCheckBox = self._new_checkbox(
+            "Use",
+            checked=False,
+            toggled_handler=self._on_analysis_math_controls_changed,
+            tooltip="Plot a derived series from two fit parameters.",
+        )
+        math_row.addWidget(self.analysis_math_enable_btn)
+        self.analysis_math_left_combo: RichTextComboBox | QComboBox = (
+            self._new_combobox(
+                current_index_changed=self._on_analysis_math_controls_changed,
+                rich_text=True,
+                fixed_width=190,
+            )
+        )
+        math_row.addWidget(self.analysis_math_left_combo)
+        self.analysis_math_op_combo: RichTextComboBox | QComboBox = self._new_combobox(
+            items=[
+                ("+", "+"),
+                ("-", "-"),
+                ("*", "*"),
+                ("/", "/"),
+            ],
+            current_data="-",
+            current_index_changed=self._on_analysis_math_controls_changed,
+            fixed_width=64,
+        )
+        math_row.addWidget(self.analysis_math_op_combo)
+        self.analysis_math_right_combo: RichTextComboBox | QComboBox = (
+            self._new_combobox(
+                current_index_changed=self._on_analysis_math_controls_changed,
+                rich_text=True,
+                fixed_width=190,
+            )
+        )
+        math_row.addWidget(self.analysis_math_right_combo)
+        self.analysis_math_enable_btn.setEnabled(False)
+        self.analysis_math_left_combo.setEnabled(False)
+        self.analysis_math_op_combo.setEnabled(False)
+        self.analysis_math_right_combo.setEnabled(False)
+        math_row.addStretch(1)
+        layout.addLayout(math_row)
+
         self.analysis_param_buttons = {}
         self.analysis_params_widget = QWidget()
         self.analysis_params_widget.setObjectName("analysisParamsPanel")
@@ -7104,6 +7619,125 @@ class ManualFitGUI(QMainWindow):
             invalid = bool(out_of_spec or key in invalid_by_row)
             box.setStyleSheet("color: #b91c1c;" if invalid else "")
 
+    def _x_values_for_analysis_row(self, row) -> np.ndarray[Tuple[int], np.dtype[Any]]:
+        file_ref: str = str(row.get("file") or row.get("__file_ref") or "").strip()
+        if not file_ref:
+            return np.asarray([], dtype=float)
+        x_channel: str = str(row.get("x_channel") or self.x_channel or "").strip()
+        if not x_channel:
+            return np.asarray([], dtype=float)
+
+        file_key: str = self._fit_task_file_key(file_ref)
+        cache_key: Tuple[str, str] = (file_key or file_ref, x_channel)
+        cached = self._analysis_row_x_cache.get(cache_key)
+        if cached is not None:
+            return np.asarray(cached, dtype=float).reshape(-1)
+
+        x_values: np.ndarray[Tuple[int], np.dtype[Any]] = np.asarray([], dtype=float)
+        current_file: Any | None = self._current_loaded_file_path()
+        if (
+            current_file
+            and file_key
+            and self._fit_task_file_key(current_file) == file_key
+            and self.current_data is not None
+        ):
+            try:
+                x_values = np.asarray(
+                    self._get_channel_data(x_channel), dtype=float
+                ).reshape(-1)
+            except Exception:
+                x_values = np.asarray([], dtype=float)
+        else:
+            frame = self._data_preload_cache.get(file_ref)
+            if frame is None and file_ref not in self._data_preload_failed:
+                try:
+                    frame = read_measurement_csv(file_ref)
+                    self._data_preload_cache[file_ref] = frame
+                except Exception:
+                    self._data_preload_failed.add(file_ref)
+            if frame is not None:
+                try:
+                    source_col = (
+                        x_channel
+                        if x_channel in frame.columns
+                        else str(frame.columns[0])
+                    )
+                    x_values = np.asarray(
+                        frame[source_col].to_numpy(dtype=float, copy=False),
+                        dtype=float,
+                    ).reshape(-1)
+                except Exception:
+                    x_values = np.asarray([], dtype=float)
+
+        x_finite = x_values[np.isfinite(x_values)]
+        self._analysis_row_x_cache[cache_key] = np.asarray(x_finite, dtype=float)
+        return np.asarray(x_finite, dtype=float).reshape(-1)
+
+    def _channel_boundary_values_for_analysis_row(
+        self,
+        row,
+        target: str,
+    ) -> np.ndarray[Tuple[int], np.dtype[Any]]:
+        target_key: str = str(target or "").strip()
+        if not target_key:
+            return np.asarray([], dtype=float)
+
+        ch_results_raw = fit_get(row, "channel_results")
+        if not isinstance(ch_results_raw, Mapping):
+            return np.asarray([], dtype=float)
+        ch_data = ch_results_raw.get(target_key)
+        if not isinstance(ch_data, Mapping):
+            # Normalize target matching for loaded payloads where channel keys
+            # may differ by whitespace/case.
+            for raw_target, raw_entry in ch_results_raw.items():
+                raw_target_text: str = str(raw_target).strip()
+                if raw_target_text == target_key:
+                    target_key = raw_target_text
+                    ch_data = raw_entry
+                    break
+                if raw_target_text.lower() == target_key.lower():
+                    target_key = raw_target_text
+                    ch_data = raw_entry
+                    break
+            if not isinstance(ch_data, Mapping):
+                return np.asarray([], dtype=float)
+
+        boundaries = self._as_float_array(ch_data.get("boundaries"))
+        if boundaries.size > 0:
+            return boundaries
+
+        ratios = self._as_float_array(ch_data.get("boundary_ratios"))
+        if ratios.size <= 0:
+            return np.asarray([], dtype=float)
+
+        x_values = self._x_values_for_analysis_row(row)
+        if x_values.size <= 0:
+            return np.asarray([], dtype=float)
+
+        try:
+            computed: np.ndarray[Tuple[int], np.dtype[Any]] = np.asarray(
+                boundary_ratios_to_x_values(
+                    ratios,
+                    x_values,
+                    int(ratios.size),
+                ),
+                dtype=float,
+            ).reshape(-1)
+        except Exception:
+            return np.asarray([], dtype=float)
+        if computed.size <= 0:
+            return np.asarray([], dtype=float)
+
+        # Cache computed channel boundaries on the row so follow-up analysis
+        # refreshes do not need to recompute/read source data.
+        if isinstance(ch_results_raw, dict):
+            updated_entry: Dict[str, Any] = dict(ch_data)
+            updated_entry["boundaries"] = np.asarray(computed, dtype=float).copy()
+            ch_results_raw[target_key] = updated_entry
+            fit_set(row, "channel_results", ch_results_raw)
+
+        return np.asarray(computed, dtype=float).reshape(-1)
+
     def _extract_analysis_records_from_batch(self):
         records = []
         param_columns = self._batch_parameter_column_items()
@@ -7123,6 +7757,18 @@ class ManualFitGUI(QMainWindow):
                 np.ndarray[Tuple[int, ...], np.dtype[Any]]
                 | np.ndarray[Tuple[int], np.dtype[Any]]
             ) = self._as_float_array(fit_get(row, "boundary_values"))
+            row_target: str = str(row.get("y_channel") or "").strip()
+            boundary_targets: Set[str] = {
+                str(item.get("target") or "").strip()
+                for item in param_columns
+                if str(item.get("kind") or "") == "boundary"
+                and str(item.get("target") or "").strip()
+            }
+            ch_boundary_values: Dict[str, np.ndarray] = {}
+            for target in boundary_targets:
+                ch_vals = self._channel_boundary_values_for_analysis_row(row, target)
+                if ch_vals.size > 0:
+                    ch_boundary_values[target] = ch_vals
             for item in param_columns:
                 idx = int(item["index"])
                 if item["kind"] == "param":
@@ -7130,9 +7776,21 @@ class ManualFitGUI(QMainWindow):
                         float(params[idx]) if params.size > idx else None
                     )
                 else:
+                    target_col = str(item.get("target") or "").strip()
+                    if target_col:
+                        if row_target and row_target == target_col:
+                            # Keep the fitted row target authoritative; legacy
+                            # channel_results payloads can contain stale copies.
+                            bv_arr = boundary_values
+                        else:
+                            bv_arr = ch_boundary_values.get(target_col)
+                            if bv_arr is None:
+                                bv_arr = np.asarray([], dtype=float)
+                    else:
+                        bv_arr = boundary_values
                     value: float | None = (
-                        float(boundary_values[idx])
-                        if boundary_values.size > idx
+                        float(bv_arr[idx])
+                        if bv_arr.size > idx
                         else None
                     )
                 record[str(item["key"])] = value
@@ -7387,6 +8045,9 @@ class ManualFitGUI(QMainWindow):
             self.analysis_param_columns = [
                 key for key in numeric_columns if key not in ("R2",)
             ]
+        self._refresh_analysis_math_controls(
+            preserve_selection=bool(preserve_selection)
+        )
 
         previous_x: Any | None = (
             self.analysis_x_combo.currentData() if preserve_selection else None
@@ -7435,6 +8096,161 @@ class ManualFitGUI(QMainWindow):
             if button.isChecked()
         ]
 
+    def _analysis_math_operand_keys(self) -> List[str]:
+        keys: List[str] = [
+            str(key).strip()
+            for key in list(getattr(self, "analysis_param_columns", []) or [])
+            if str(key).strip()
+        ]
+        non_metric_keys: List[str] = [key for key in keys if key != "R2"]
+        return non_metric_keys if non_metric_keys else keys
+
+    def _refresh_analysis_math_controls(self, *, preserve_selection: bool) -> None:
+        if not hasattr(self, "analysis_math_left_combo"):
+            return
+
+        left_combo = self.analysis_math_left_combo
+        right_combo = self.analysis_math_right_combo
+        op_combo = self.analysis_math_op_combo
+        enable_btn = self.analysis_math_enable_btn
+
+        operand_keys: List[str] = self._analysis_math_operand_keys()
+        previous_left: Any | None = (
+            left_combo.currentData() if preserve_selection else None
+        )
+        previous_right: Any | None = (
+            right_combo.currentData() if preserve_selection else None
+        )
+
+        self._analysis_math_controls_refreshing = True
+        try:
+            for combo in (left_combo, right_combo):
+                blocked = combo.blockSignals(True)
+                combo.clear()
+                if isinstance(combo, RichTextComboBox):
+                    combo.add_rich_item(
+                        "Select parameter...",
+                        None,
+                        "Select parameter...",
+                    )
+                else:
+                    combo.addItem("Select parameter...", None)
+                for key in operand_keys:
+                    plain_label, rich_label = self._analysis_field_display_text(key)
+                    if not plain_label:
+                        plain_label = str(key)
+                    if not rich_label:
+                        rich_label = html.escape(plain_label)
+                    if isinstance(combo, RichTextComboBox):
+                        combo.add_rich_item(plain_label, key, rich_label)
+                    else:
+                        combo.addItem(plain_label, key)
+                combo.blockSignals(blocked)
+
+            chosen_left: Any | None = (
+                previous_left if previous_left in operand_keys else None
+            )
+            chosen_right: Any | None = (
+                previous_right if previous_right in operand_keys else None
+            )
+            if chosen_left is None and operand_keys:
+                chosen_left = operand_keys[0]
+            if chosen_right is None and operand_keys:
+                chosen_right = (
+                    operand_keys[1] if len(operand_keys) > 1 else operand_keys[0]
+                )
+
+            for combo, chosen in (
+                (left_combo, chosen_left),
+                (right_combo, chosen_right),
+            ):
+                blocked = combo.blockSignals(True)
+                combo_idx: int = combo.findData(chosen)
+                if combo_idx < 0:
+                    combo_idx = combo.findData(None)
+                if combo_idx >= 0:
+                    combo.setCurrentIndex(combo_idx)
+                combo.blockSignals(blocked)
+
+            has_operands: bool = bool(operand_keys)
+            left_combo.setEnabled(has_operands)
+            right_combo.setEnabled(has_operands)
+            op_combo.setEnabled(has_operands)
+            enable_btn.setEnabled(has_operands)
+            if not preserve_selection:
+                blocked = enable_btn.blockSignals(True)
+                enable_btn.setChecked(False)
+                enable_btn.blockSignals(blocked)
+            if not has_operands:
+                blocked = enable_btn.blockSignals(True)
+                enable_btn.setChecked(False)
+                enable_btn.blockSignals(blocked)
+        finally:
+            self._analysis_math_controls_refreshing = False
+
+    def _on_analysis_math_controls_changed(self, *_args) -> None:
+        if getattr(self, "_analysis_math_controls_refreshing", False):
+            return
+        self.update_batch_analysis_plot()
+
+    def _analysis_math_series_spec(self) -> None | Dict[str, Any]:
+        if not hasattr(self, "analysis_math_enable_btn"):
+            return None
+        if not self.analysis_math_enable_btn.isChecked():
+            return None
+
+        left_key: Any | None = self.analysis_math_left_combo.currentData()
+        right_key: Any | None = self.analysis_math_right_combo.currentData()
+        op: str = str(self.analysis_math_op_combo.currentData() or "").strip()
+        if op not in {"+", "-", "*", "/"}:
+            return None
+        if left_key not in self.analysis_numeric_data:
+            return None
+        if right_key not in self.analysis_numeric_data:
+            return None
+
+        left_values: np.ndarray[Tuple[int, ...], np.dtype[Any]] = np.asarray(
+            self.analysis_numeric_data[left_key],
+            dtype=float,
+        ).reshape(-1)
+        right_values: np.ndarray[Tuple[int, ...], np.dtype[Any]] = np.asarray(
+            self.analysis_numeric_data[right_key],
+            dtype=float,
+        ).reshape(-1)
+        if left_values.size <= 0 or right_values.size <= 0:
+            return None
+        if left_values.size != right_values.size:
+            return None
+
+        with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+            if op == "+":
+                y_values = left_values + right_values
+            elif op == "-":
+                y_values = left_values - right_values
+            elif op == "*":
+                y_values = left_values * right_values
+            else:
+                y_values = left_values / right_values
+
+        y_values = np.asarray(y_values, dtype=float).reshape(-1)
+        y_values[~np.isfinite(y_values)] = np.nan
+
+        left_label, _ = self._analysis_field_display_text(left_key)
+        right_label, _ = self._analysis_field_display_text(right_key)
+        if not left_label:
+            left_label = str(left_key)
+        if not right_label:
+            right_label = str(right_key)
+        plot_label_text: str = f"{left_label} {op} {right_label}"
+        hover_op: str = "\u00d7" if op == "*" else op
+        hover_label: str = f"{left_label} {hover_op} {right_label}"
+        return {
+            "key": "__analysis_math__",
+            "y_values": y_values,
+            "plot_label": parameter_symbol_to_mathtext(plot_label_text),
+            "hover_label": hover_label,
+        }
+
     def _collect_analysis_ui_state(self) -> Dict[str, Any]:
         """Serialize current Analysis tab control state."""
         state: Dict[str, Any] = {
@@ -7446,6 +8262,10 @@ class ManualFitGUI(QMainWindow):
             "show_fit_lines": True,
             "show_legend": True,
             "log_x": False,
+            "math_enabled": False,
+            "math_left": None,
+            "math_op": "-",
+            "math_right": None,
         }
         if hasattr(self, "analysis_x_combo"):
             state["x_field"] = self.analysis_x_combo.currentData()
@@ -7465,6 +8285,16 @@ class ManualFitGUI(QMainWindow):
             state["show_legend"] = bool(self.analysis_legend_btn.isChecked())
         if hasattr(self, "analysis_log_x_btn"):
             state["log_x"] = bool(self.analysis_log_x_btn.isChecked())
+        if hasattr(self, "analysis_math_enable_btn"):
+            state["math_enabled"] = bool(self.analysis_math_enable_btn.isChecked())
+        if hasattr(self, "analysis_math_left_combo"):
+            state["math_left"] = self.analysis_math_left_combo.currentData()
+        if hasattr(self, "analysis_math_op_combo"):
+            op_text: str = str(self.analysis_math_op_combo.currentData() or "").strip()
+            if op_text in {"+", "-", "*", "/"}:
+                state["math_op"] = op_text
+        if hasattr(self, "analysis_math_right_combo"):
+            state["math_right"] = self.analysis_math_right_combo.currentData()
         if hasattr(self, "analysis_param_buttons"):
             state["selected_params"] = [
                 str(key)
@@ -7505,6 +8335,30 @@ class ManualFitGUI(QMainWindow):
             blocked = btn.blockSignals(True)
             btn.setChecked(bool(state.get(state_key)))
             btn.blockSignals(blocked)
+
+        math_enable_btn: Any | None = getattr(self, "analysis_math_enable_btn", None)
+        if math_enable_btn is not None and "math_enabled" in state:
+            blocked = math_enable_btn.blockSignals(True)
+            math_enable_btn.setChecked(bool(state.get("math_enabled")))
+            math_enable_btn.blockSignals(blocked)
+
+        math_combo_fields = (
+            ("analysis_math_left_combo", "math_left"),
+            ("analysis_math_op_combo", "math_op"),
+            ("analysis_math_right_combo", "math_right"),
+        )
+        for attr_name, state_key in math_combo_fields:
+            combo: Any | None = getattr(self, attr_name, None)
+            if combo is None:
+                continue
+            if state_key not in state:
+                continue
+            idx = combo.findData(state.get(state_key))
+            if idx < 0:
+                continue
+            blocked = combo.blockSignals(True)
+            combo.setCurrentIndex(idx)
+            combo.blockSignals(blocked)
 
         saved_x = state.get("x_field")
         x_idx: int = self.analysis_x_combo.findData(saved_x)
@@ -7644,12 +8498,40 @@ class ManualFitGUI(QMainWindow):
         if timer is not None and timer.isActive():
             timer.stop()
         self._set_analysis_canvas_height(1)
-        self.analysis_fig.clear()
+        self._clear_analysis_figure()
         ax: Axes = self.analysis_fig.add_subplot(111)
         self._set_hover_axes([ax])
         ax.text(0.5, 0.5, message, ha="center", va="center")
         ax.set_axis_off()
         self.analysis_canvas.draw_idle()
+
+    def _clear_analysis_figure(self) -> None:
+        fig: Figure | None = getattr(self, "analysis_fig", None)
+        if fig is None:
+            return
+
+        # Clearing a figure with log-scaled axes can trigger matplotlib warnings
+        # when stale non-positive limits exist. Normalize scales before clear.
+        for axis in list(fig.axes):
+            try:
+                axis.set_xscale("linear")
+            except Exception:
+                pass
+            try:
+                axis.set_yscale("linear")
+            except Exception:
+                pass
+
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=(
+                    "Attempt to set non-positive xlim on a log-scaled axis "
+                    "will be ignored."
+                ),
+                category=UserWarning,
+            )
+            fig.clear()
 
     def _set_analysis_canvas_height(self, axis_count: int) -> None:
         if not hasattr(self, "analysis_canvas"):
@@ -7724,7 +8606,7 @@ class ManualFitGUI(QMainWindow):
             return str(value)
         if not np.isfinite(number):
             return "NaN"
-        return f"{number:.6g}"
+        return f"{number:.12g}"
 
     def _build_hover_annotation(self, axis: Axes):
         annotation = axis.annotate(
@@ -8219,18 +9101,34 @@ class ManualFitGUI(QMainWindow):
 
         x_field = self.analysis_x_combo.currentData()
         selected_params = self._selected_analysis_params()
+        series_specs: List[Dict[str, Any]] = []
+        for param_name in selected_params:
+            y_values = self.analysis_numeric_data.get(param_name)
+            if y_values is None:
+                continue
+            series_specs.append(
+                {
+                    "key": str(param_name),
+                    "y_values": np.asarray(y_values, dtype=float).reshape(-1),
+                    "plot_label": self._display_name_for_param_key_mathtext(param_name),
+                    "hover_label": self._display_name_for_param_key(param_name),
+                }
+            )
+        math_series = self._analysis_math_series_spec()
+        if math_series is not None:
+            series_specs.append(math_series)
         if x_field not in self.analysis_numeric_data:
             self._show_analysis_message("Select an X field to plot.")
             return
-        if not selected_params:
-            self._show_analysis_message("Select at least one parameter to plot.")
+        if not series_specs:
+            self._show_analysis_message(
+                "Select at least one parameter or enable a math-derived series."
+            )
             return
 
         x_values = self.analysis_numeric_data[x_field]
-        if x_field in self.analysis_param_columns:
-            analysis_x_hover_label: str = self._display_name_for_param_key(x_field)
-        else:
-            analysis_x_hover_label = str(x_field)
+        x_hover_label, _ = self._analysis_field_display_text(x_field)
+        analysis_x_hover_label: str = x_hover_label or str(x_field)
         mode = self.analysis_mode_combo.currentData()
         show_points: bool = self.analysis_show_points_btn.isChecked()
         show_series_line: bool = self.analysis_show_series_line_btn.isChecked()
@@ -8242,9 +9140,12 @@ class ManualFitGUI(QMainWindow):
         )
         if use_log_x:
             log_invalid_reason: str = ""
-            for param_name in selected_params:
-                y_values = self.analysis_numeric_data.get(param_name)
-                if y_values is None:
+            for spec in series_specs:
+                y_values = np.asarray(
+                    spec.get("y_values", np.asarray([], dtype=float)),
+                    dtype=float,
+                ).reshape(-1)
+                if y_values.size != np.size(x_values):
                     continue
                 valid_pairs = np.isfinite(x_values) & np.isfinite(y_values)
                 valid_count: int = int(np.count_nonzero(valid_pairs))
@@ -8254,8 +9155,8 @@ class ManualFitGUI(QMainWindow):
                     np.count_nonzero(valid_pairs & (x_values > 0.0))
                 )
                 if positive_count < valid_count:
-                    display_name: str = self._display_name_for_param_key_mathtext(
-                        str(param_name)
+                    display_name: str = str(
+                        spec.get("plot_label") or spec.get("hover_label") or "series"
                     )
                     log_invalid_reason = (
                         f"X values for {display_name} include zero/negative points."
@@ -8280,14 +9181,14 @@ class ManualFitGUI(QMainWindow):
             return
 
         axis_count: int = (
-            len(selected_params)
-            if mode == "separate" and len(selected_params) > 1
+            len(series_specs)
+            if mode == "separate" and len(series_specs) > 1
             else 1
         )
         self._set_analysis_canvas_height(axis_count)
-        self.analysis_fig.clear()
-        if mode == "separate" and len(selected_params) > 1:
-            axes = self.analysis_fig.subplots(len(selected_params), 1, sharex=True)
+        self._clear_analysis_figure()
+        if mode == "separate" and len(series_specs) > 1:
+            axes = self.analysis_fig.subplots(len(series_specs), 1, sharex=True)
             axes: List[Any] = list(np.atleast_1d(axes))
         else:
             axes: List[Axes] = [self.analysis_fig.add_subplot(111)]
@@ -8296,9 +9197,12 @@ class ManualFitGUI(QMainWindow):
         plotted_any = False
         x_min_plot: None | float = None
         x_max_plot: None | float = None
-        for idx, param_name in enumerate(selected_params):
-            y_values = self.analysis_numeric_data.get(param_name)
-            if y_values is None:
+        for idx, spec in enumerate(series_specs):
+            y_values = np.asarray(
+                spec.get("y_values", np.asarray([], dtype=float)),
+                dtype=float,
+            ).reshape(-1)
+            if y_values.size <= 0 or y_values.size != np.size(x_values):
                 continue
             mask = np.isfinite(x_values) & np.isfinite(y_values)
             if use_log_x:
@@ -8339,10 +9243,12 @@ class ManualFitGUI(QMainWindow):
                     np.size(x_sorted), 0.5, dtype=float
                 )
             target_ax: Any | Axes = axes[idx] if len(axes) > 1 else axes[0]
-            param_plot_label: str = self._display_name_for_param_key_mathtext(
-                param_name
+            param_plot_label: str = str(
+                spec.get("plot_label") or spec.get("hover_label") or spec.get("key")
             )
-            param_hover_label: str = self._display_name_for_param_key(param_name)
+            param_hover_label: str = str(
+                spec.get("hover_label") or spec.get("plot_label") or spec.get("key")
+            )
 
             if show_points:
                 scatter_label: str = (
@@ -8445,7 +9351,15 @@ class ManualFitGUI(QMainWindow):
                 axis.set_xscale("linear")
 
         if len(axes) == 1:
-            axes[0].set_ylabel("Parameter Value")
+            if len(series_specs) == 1:
+                single_label: str = str(
+                    series_specs[0].get("plot_label")
+                    or series_specs[0].get("hover_label")
+                    or "Parameter Value"
+                )
+                axes[0].set_ylabel(single_label)
+            else:
+                axes[0].set_ylabel("Parameter Value")
             if show_legend:
                 axes[0].legend(loc="best", fontsize=8)
             axes[0].grid(True, alpha=0.3)
@@ -8455,19 +9369,7 @@ class ManualFitGUI(QMainWindow):
         else:
             x_axis_label = x_field
 
-        # If 'one per parameter' mode or only one parameter selected, show parameter name in xlabel
-        if (mode == "separate" and len(selected_params) == 1) or len(
-            selected_params
-        ) == 1:
-            # Use the selected parameter's display name
-            param_label = (
-                self._display_name_for_param_key_mathtext(selected_params[0])
-                if selected_params
-                else x_axis_label
-            )
-            axes[-1].set_xlabel(param_label)
-        else:
-            axes[-1].set_xlabel(x_axis_label)
+        axes[-1].set_xlabel(x_axis_label)
         self.analysis_fig.tight_layout()
         self.analysis_canvas.draw_idle()
 
@@ -8677,6 +9579,7 @@ class ManualFitGUI(QMainWindow):
     def _serialize_fit_parameter_specs(self):
         serialized = []
         manually_fixed = getattr(self, "_manually_fixed_params", set())
+        periodic_keys = set(getattr(self, "_periodic_param_keys", set()) or set())
         for spec in self.param_specs:
             min_box = self.param_min_spinboxes.get(spec.key)
             max_box = self.param_max_spinboxes.get(spec.key)
@@ -8705,6 +9608,7 @@ class ManualFitGUI(QMainWindow):
                     "decimals": int(spec.decimals),
                     "value": float(np.clip(value, low, high)),
                     "fixed": bool(spec.key in manually_fixed),
+                    "periodic": bool(spec.key in periodic_keys),
                 }
             )
         return serialized
@@ -8775,6 +9679,11 @@ class ManualFitGUI(QMainWindow):
                         ch_list: None | List[float] = self._float_list_or_none(ch_br)
                         if ch_list is not None:
                             ch_entry["boundary_ratios"] = ch_list
+                    ch_bv = ch_result.get("boundaries")
+                    if ch_bv is not None:
+                        ch_bv_list: None | List[float] = self._float_list_or_none(ch_bv)
+                        if ch_bv_list is not None:
+                            ch_entry["boundaries"] = ch_bv_list
                     ch_r2 = finite_float_or_none(ch_result.get("r2"))
                     if ch_r2 is not None:
                         ch_entry["r2"] = ch_r2
@@ -8849,7 +9758,7 @@ class ManualFitGUI(QMainWindow):
         batch_rows = self._serialize_fit_batch_rows()
         payload = {
             "format": "manual_fit_gui_details",
-            "version": 9,
+            "version": 10,
             "saved_at_utc": datetime.now(timezone.utc).isoformat(),
             "gui": {
                 "equation": str(getattr(self, "current_expression", "")).strip(),
@@ -8950,6 +9859,39 @@ class ManualFitGUI(QMainWindow):
         file_ref: str = str(row_data.get("file") or "").strip()
         if file_ref and file_ref in self.data_files:
             return file_ref
+        if file_ref:
+            target_key: str = self._fit_task_file_key(file_ref)
+            if target_key:
+                canonical_matches = [
+                    data_file
+                    for data_file in self.data_files
+                    if self._fit_task_file_key(data_file) == target_key
+                ]
+                if len(canonical_matches) == 1:
+                    return canonical_matches[0]
+            if "::" in file_ref:
+                raw_archive, raw_member = file_ref.split("::", 1)
+                member_key: str = str(raw_member).strip().replace("\\", "/").lower()
+                archive_name: str = str(Path(raw_archive).name).strip().lower()
+                archive_member_matches = []
+                member_only_matches = []
+                for data_file in self.data_files:
+                    data_text: str = str(data_file).strip()
+                    if "::" not in data_text:
+                        continue
+                    data_archive, data_member = data_text.split("::", 1)
+                    data_member_key: str = (
+                        str(data_member).strip().replace("\\", "/").lower()
+                    )
+                    if data_member_key != member_key:
+                        continue
+                    member_only_matches.append(data_file)
+                    if str(Path(data_archive).name).strip().lower() == archive_name:
+                        archive_member_matches.append(data_file)
+                if len(archive_member_matches) == 1:
+                    return archive_member_matches[0]
+                if len(member_only_matches) == 1:
+                    return member_only_matches[0]
         stem: str = str(row_data.get("file_stem") or "").strip()
         if not stem and file_ref:
             stem: str = stem_for_file_ref(file_ref)
@@ -8988,12 +9930,6 @@ class ManualFitGUI(QMainWindow):
 
         applied = 0
         skipped = 0
-        expected_boundaries: int = max(
-            0,
-            len(self._piecewise_model.segment_exprs) - 1
-            if self._piecewise_model is not None
-            else 0,
-        )
         expected_params: int = len(self.param_specs)
 
         for raw_row in imported_rows:
@@ -9009,6 +9945,11 @@ class ManualFitGUI(QMainWindow):
             row["captures"] = dict(raw_row.get("captures") or row.get("captures") or {})
             row["x_channel"] = self.x_channel
             row["y_channel"] = self.y_channel
+            # Restore per-row y_channel early so boundary data is associated with
+            # the correct target channel.
+            saved_y: str = str(raw_row.get("y_channel") or "").strip()
+            if saved_y:
+                row["y_channel"] = saved_y
             raw_fit_results = dict(raw_row.get("fit_results") or {})
             fit_set(
                 row,
@@ -9046,20 +9987,19 @@ class ManualFitGUI(QMainWindow):
                 np.ndarray[Tuple[int, ...], np.dtype[Any]]
                 | np.ndarray[Tuple[int], np.dtype[Any]]
             ) = self._as_float_array(raw_fit_results.get("boundary_ratios"))
-            if boundary_ratios.size == expected_boundaries:
+            if boundary_ratios.size > 0:
                 fit_set(row, "boundary_ratios", np.clip(boundary_ratios, 0.0, 1.0))
+            else:
+                fit_set(row, "boundary_ratios", None)
 
             boundary_values: (
                 np.ndarray[Tuple[int, ...], np.dtype[Any]]
                 | np.ndarray[Tuple[int], np.dtype[Any]]
             ) = self._as_float_array(raw_fit_results.get("boundary_values"))
-            if boundary_values.size == expected_boundaries:
+            if boundary_values.size > 0:
                 fit_set(row, "boundary_values", boundary_values)
-
-            # Restore per-row y_channel if saved.
-            saved_y: str = str(raw_row.get("y_channel") or "").strip()
-            if saved_y:
-                row["y_channel"] = saved_y
+            else:
+                fit_set(row, "boundary_values", None)
 
             saved_ch_results = raw_fit_results.get("channel_results")
             if isinstance(saved_ch_results, Mapping):
@@ -9071,6 +10011,9 @@ class ManualFitGUI(QMainWindow):
                     ch_br = self._as_float_array(ch_result.get("boundary_ratios"))
                     if ch_br.size > 0:
                         entry["boundary_ratios"] = np.clip(ch_br, 0.0, 1.0)
+                    ch_bv = self._as_float_array(ch_result.get("boundaries"))
+                    if ch_bv.size > 0:
+                        entry["boundaries"] = ch_bv
                     ch_r2 = finite_float_or_none(ch_result.get("r2"))
                     if ch_r2 is not None:
                         entry["r2"] = ch_r2
@@ -9080,13 +10023,45 @@ class ManualFitGUI(QMainWindow):
                     fit_set(row, "channel_results", normalized_ch_results)
                 else:
                     fit_set(row, "channel_results", None)
+            else:
+                fit_set(row, "channel_results", None)
+
+            # If legacy rows only saved per-channel boundaries, mirror the row target
+            # boundary ratios to top-level fields used by file-load restore.
+            row_target: str = str(row.get("y_channel") or "").strip()
+            if row_target and fit_get(row, "boundary_ratios") is None:
+                normalized_ch_results = fit_get(row, "channel_results")
+                if isinstance(normalized_ch_results, Mapping):
+                    target_entry = normalized_ch_results.get(row_target)
+                    if isinstance(target_entry, Mapping):
+                        target_ratios = self._as_float_array(
+                            target_entry.get("boundary_ratios")
+                        )
+                        if target_ratios.size > 0:
+                            fit_set(
+                                row,
+                                "boundary_ratios",
+                                np.clip(target_ratios, 0.0, 1.0),
+                            )
+                        if fit_get(row, "boundary_values") is None:
+                            target_boundaries = self._as_float_array(
+                                target_entry.get("boundaries")
+                            )
+                            if target_boundaries.size > 0:
+                                fit_set(row, "boundary_values", target_boundaries)
 
             row["plot_full"] = None
             row["plot"] = None
             row["plot_render_size"] = None
             row["plot_has_fit"] = has_nonempty_values(fit_get(row, "params"))
-            if row.get("plot_has_fit"):
+            has_imported_fit: bool = bool(
+                row.get("plot_has_fit")
+                or has_nonempty_values(fit_get(row, "boundary_ratios"))
+                or bool(fit_get(row, "channel_results"))
+            )
+            if has_imported_fit:
                 row["_equation_stale"] = False
+                row["_fit_conditions_stale"] = False
             row = self._apply_param_range_validation_to_row(row)
             existing_by_file[file_ref] = row
             applied += 1
@@ -9193,8 +10168,10 @@ class ManualFitGUI(QMainWindow):
                         max_value=max_value,
                         decimals=decimals,
                     )
+                    periodic_enabled: bool = bool(entry.get("periodic", False))
                     value_by_key[key] = {
                         "value": entry.get("value"),
+                        "periodic": periodic_enabled,
                     }
 
                 if spec_by_key:
@@ -9202,6 +10179,12 @@ class ManualFitGUI(QMainWindow):
                     for spec in self.param_specs:
                         merged_specs.append(spec_by_key.get(spec.key, spec))
                     self.param_specs = merged_specs
+                    valid_param_keys: set[str] = {str(spec.key) for spec in self.param_specs}
+                    self._periodic_param_keys = {
+                        str(key)
+                        for key, state in value_by_key.items()
+                        if bool(state.get("periodic")) and str(key) in valid_param_keys
+                    }
                     self.defaults = self._default_param_values(self.param_specs)
                     self.rebuild_manual_param_controls()
                     self._rebuild_model_segment_info()
@@ -9371,6 +10354,16 @@ class ManualFitGUI(QMainWindow):
                 cb.blockSignals(True)
                 cb.setChecked(key not in self._manually_fixed_params)
                 cb.blockSignals(False)
+            valid_param_keys: set[str] = {str(spec.key) for spec in self.param_specs}
+            self._periodic_param_keys = {
+                str(k)
+                for k in getattr(self, "_periodic_param_keys", set())
+                if str(k) in valid_param_keys
+            }
+            for key, cb in getattr(self, "_model_param_periodic_checkboxes", {}).items():
+                cb.blockSignals(True)
+                cb.setChecked(str(key) in self._periodic_param_keys)
+                cb.blockSignals(False)
 
             # Restore fitting procedure.
             saved_procedure = gui.get("procedure")
@@ -9533,6 +10526,17 @@ class ManualFitGUI(QMainWindow):
             )
             return False
 
+    def _attempt_fit_details_autoload_once(self, *, reason: str = "") -> bool:
+        if bool(getattr(self, "_fit_details_autoload_attempted", False)):
+            return False
+        self._fit_details_autoload_attempted = True
+        loaded: bool = bool(self._autoload_fit_details_from_source())
+        fit_debug(
+            "fit-details autoload attempt: "
+            f"reason={reason or '-'} loaded={loaded}"
+        )
+        return loaded
+
     def _autoload_fit_details_from_source(self) -> bool:
         if bool(getattr(self, "_fit_details_restore_in_progress", False)):
             return False
@@ -9645,6 +10649,9 @@ class ManualFitGUI(QMainWindow):
                 ch_boundary = self._as_float_array(raw_entry.get("boundary_ratios"))
                 if ch_boundary.size > 0:
                     entry["boundary_ratios"] = np.clip(ch_boundary, 0.0, 1.0)
+                ch_boundaries = self._as_float_array(raw_entry.get("boundaries"))
+                if ch_boundaries.size > 0:
+                    entry["boundaries"] = ch_boundaries
                 if entry:
                     normalized[target] = entry
             return normalized
@@ -9920,7 +10927,348 @@ class ManualFitGUI(QMainWindow):
             return "wipe"
         return "keep"
 
-    def _apply_data_file_list(self, files, *, empty_message) -> bool:
+    def _stop_background_data_preload(self, *, wait_ms: int = 80) -> None:
+        worker: DataPreloadWorker | None = getattr(self, "_data_preload_worker", None)
+        thread: QThread | None = getattr(self, "_data_preload_thread", None)
+        self._request_worker_cancel(worker)
+        stopped = True
+        if thread is not None:
+            if bool(thread.isRunning()):
+                stopped = bool(
+                    self._shutdown_thread(
+                        thread,
+                        wait_ms=wait_ms,
+                        force_terminate=True,
+                    )
+                )
+            else:
+                try:
+                    thread.deleteLater()
+                except Exception:
+                    pass
+        if stopped:
+            self._data_preload_worker = None
+            self._data_preload_thread = None
+
+    def _start_background_data_preload(self, *, prioritize_file: str | None = None) -> None:
+        files: List[str] = [str(ref).strip() for ref in list(self.data_files or [])]
+        files = [ref for ref in files if ref]
+        if not files:
+            return
+
+        self._stop_background_data_preload(wait_ms=80)
+        if getattr(self, "_data_preload_thread", None) is not None:
+            fit_debug("data-preload start skipped: previous worker still stopping")
+            return
+        self._data_preload_session = int(getattr(self, "_data_preload_session", 0)) + 1
+        session_id: int = int(self._data_preload_session)
+
+        queue: List[str] = []
+        preferred: str = str(prioritize_file or "").strip()
+        if (
+            preferred
+            and preferred in files
+            and preferred not in self._data_preload_cache
+            and preferred not in self._data_preload_failed
+        ):
+            queue.append(preferred)
+        for ref in files:
+            if ref in self._data_preload_cache:
+                continue
+            if ref in self._data_preload_failed:
+                continue
+            if ref in queue:
+                continue
+            queue.append(ref)
+        if not queue:
+            return
+
+        worker = DataPreloadWorker(session_id, queue)
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.file_loaded.connect(self._on_background_data_preload_loaded)
+        worker.finished.connect(self._on_background_data_preload_finished)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+
+        self._data_preload_worker = worker
+        self._data_preload_thread = thread
+        fit_debug(
+            "data-preload start: "
+            f"session={session_id} files={len(queue)} cached={len(self._data_preload_cache)}"
+        )
+        thread.start()
+
+    def _on_background_data_preload_loaded(
+        self,
+        session_id: int,
+        file_ref: str,
+        frame: Any,
+        error: Any,
+    ) -> None:
+        if int(session_id) != int(getattr(self, "_data_preload_session", 0)):
+            return
+        file_key: str = str(file_ref).strip()
+        if not file_key:
+            return
+        if frame is not None:
+            self._data_preload_cache[file_key] = frame
+            self._data_preload_failed.discard(file_key)
+            return
+        if error not in (None, ""):
+            self._data_preload_failed.add(file_key)
+            fit_debug(
+                "data-preload file failed: "
+                f"file={stem_for_file_ref(file_key)} error={error}"
+            )
+
+    def _on_background_data_preload_finished(self, session_id: int) -> None:
+        if int(session_id) != int(getattr(self, "_data_preload_session", 0)):
+            return
+        fit_debug(
+            "data-preload done: "
+            f"session={session_id} cached={len(self._data_preload_cache)}"
+        )
+        self._data_preload_worker = None
+        self._data_preload_thread = None
+        pending = [
+            str(ref).strip()
+            for ref in list(self.data_files or [])
+            if str(ref).strip()
+            and str(ref).strip() not in self._data_preload_cache
+            and str(ref).strip() not in self._data_preload_failed
+        ]
+        if pending:
+            active_file: Any | None = self._current_loaded_file_path()
+            self._start_background_data_preload(
+                prioritize_file=str(active_file) if active_file else None
+            )
+
+    def _cancel_idle_archive_scan(self) -> None:
+        timer: QTimer | None = getattr(self, "_idle_archive_scan_timer", None)
+        if timer is not None and timer.isActive():
+            timer.stop()
+        stream: Any | None = getattr(self, "_idle_archive_scan_stream", None)
+        if stream is not None:
+            close_method = getattr(stream, "close", None)
+            if callable(close_method):
+                try:
+                    close_method()
+                except Exception:
+                    pass
+        self._idle_archive_scan_queue = []
+        self._idle_archive_scan_total = 0
+        self._idle_archive_scan_done = 0
+        self._idle_archive_scan_added = 0
+        self._idle_archive_scan_stream = None
+        self._idle_archive_scan_current_archive = None
+        self._idle_archive_scan_current_found = 0
+        self._idle_archive_scan_session = int(
+            getattr(self, "_idle_archive_scan_session", 0)
+        ) + 1
+
+    def _queue_idle_archive_scan(self, archive_paths) -> None:
+        deduped: List[str] = []
+        seen: set[str] = set()
+        for raw_path in list(archive_paths or []):
+            text: str = str(raw_path).strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            deduped.append(text)
+        if not deduped:
+            return
+
+        self._idle_archive_scan_session = int(
+            getattr(self, "_idle_archive_scan_session", 0)
+        ) + 1
+        self._idle_archive_scan_queue = deduped
+        self._idle_archive_scan_total = len(deduped)
+        self._idle_archive_scan_done = 0
+        self._idle_archive_scan_added = 0
+        self._idle_archive_scan_stream = None
+        self._idle_archive_scan_current_archive = None
+        self._idle_archive_scan_current_found = 0
+        self.stats_text.setText(
+            f"Scanning {self._idle_archive_scan_total} archive(s) in background..."
+        )
+        timer: QTimer | None = getattr(self, "_idle_archive_scan_timer", None)
+        if timer is not None:
+            if timer.isActive():
+                timer.stop()
+            timer.start(0)
+
+    def _append_archive_file_refs(self, file_refs) -> int:
+        refs: List[str] = [
+            str(ref).strip() for ref in list(file_refs or []) if str(ref).strip()
+        ]
+        if not refs:
+            return 0
+        existing: set[str] = {
+            str(item).strip() for item in list(self.data_files or [])
+        }
+        new_refs: List[str] = [ref for ref in refs if ref not in existing]
+        if not new_refs:
+            return 0
+
+        combo: Any | None = getattr(self, "file_combo", None)
+        combo_was_blocked: bool = (
+            bool(combo.blockSignals(True)) if combo is not None else False
+        )
+        try:
+            for ref in new_refs:
+                self.data_files.append(ref)
+                if combo is not None:
+                    combo.addItem(stem_for_file_ref(ref), ref)
+        finally:
+            if combo is not None:
+                combo.blockSignals(combo_was_blocked)
+
+        self._sync_file_navigation_buttons()
+        self._sync_batch_files_from_shared(sync_pattern=False)
+        return len(new_refs)
+
+    def _process_idle_archive_scan(self) -> None:
+        timer: QTimer | None = getattr(self, "_idle_archive_scan_timer", None)
+        queue: List[str] = list(getattr(self, "_idle_archive_scan_queue", []) or [])
+        stream: Any | None = getattr(self, "_idle_archive_scan_stream", None)
+        total: int = max(1, int(getattr(self, "_idle_archive_scan_total", 0)))
+        done: int = int(getattr(self, "_idle_archive_scan_done", 0))
+
+        if stream is None:
+            if not queue:
+                added: int = int(getattr(self, "_idle_archive_scan_added", 0))
+                if int(getattr(self, "_idle_archive_scan_total", 0)) > 0:
+                    if added > 0:
+                        if self.current_data is None:
+                            self.stats_text.setText(
+                                f"Archive scan complete: added {added} file(s). Select a file to load."
+                            )
+                        else:
+                            self.stats_text.setText(
+                                f"Archive scan complete: added {added} file(s)."
+                            )
+                    elif not self.data_files:
+                        self.stats_text.setText("No CSV files found in selected source.")
+                self._idle_archive_scan_total = 0
+                self._idle_archive_scan_done = 0
+                self._idle_archive_scan_added = 0
+                self._idle_archive_scan_current_archive = None
+                self._idle_archive_scan_current_found = 0
+                # Apply one full batch sync after archive expansion completes.
+                if self.data_files:
+                    self._sync_batch_files_from_shared(sync_pattern=True)
+                    # If the source started as archive-only, we may have had no
+                    # file loaded when scanning began. Load the first readable
+                    # file now so the main plot is populated.
+                    if self.current_data is None:
+                        candidate_indices: List[int] = []
+                        preferred_idx = int(getattr(self, "current_file_idx", 0))
+                        if 0 <= preferred_idx < len(self.data_files):
+                            candidate_indices.append(preferred_idx)
+                        if 0 not in candidate_indices:
+                            candidate_indices.append(0)
+                        for idx in candidate_indices:
+                            if self.load_file(idx, report_errors=False):
+                                break
+                    self._attempt_fit_details_autoload_once(
+                        reason="archive_scan_complete"
+                    )
+                    if getattr(self, "_data_preload_thread", None) is None:
+                        active_file: Any | None = self._current_loaded_file_path()
+                        self._start_background_data_preload(
+                            prioritize_file=str(active_file) if active_file else None
+                        )
+                return
+
+            archive_path: str = str(queue.pop(0))
+            self._idle_archive_scan_queue = queue
+            self._idle_archive_scan_current_archive = archive_path
+            self._idle_archive_scan_current_found = 0
+            try:
+                stream = open_archive_csv_member_stream(archive_path)
+            except Exception as exc:
+                archive_name: str = Path(archive_path).name
+                self.stats_text.setText(
+                    f"Archive scan failed for '{archive_name}': {exc}"
+                )
+                self._idle_archive_scan_done = done + 1
+                if timer is not None:
+                    timer.start(10)
+                return
+            self._idle_archive_scan_stream = stream
+
+        archive_path = str(getattr(self, "_idle_archive_scan_current_archive", "") or "")
+        archive_name: str = Path(archive_path).name if archive_path else "archive"
+
+        members_batch: List[str] = []
+        try:
+            members_batch = list(stream.next_batch(max_items=96))
+        except Exception as exc:
+            self.stats_text.setText(f"Archive scan failed for '{archive_name}': {exc}")
+            close_method = getattr(stream, "close", None)
+            if callable(close_method):
+                try:
+                    close_method()
+                except Exception:
+                    pass
+            self._idle_archive_scan_stream = None
+            self._idle_archive_scan_current_archive = None
+            self._idle_archive_scan_current_found = 0
+            self._idle_archive_scan_done = done + 1
+            if timer is not None:
+                timer.start(10)
+            return
+
+        if members_batch:
+            added_count: int = self._append_archive_file_refs(
+                [f"{archive_path}::{member}" for member in members_batch]
+            )
+            self._idle_archive_scan_added = int(
+                getattr(self, "_idle_archive_scan_added", 0)
+            ) + int(max(0, added_count))
+            self._idle_archive_scan_current_found = int(
+                getattr(self, "_idle_archive_scan_current_found", 0)
+            ) + int(len(members_batch))
+
+        done_for_archive: bool = bool(getattr(stream, "done", False))
+        if done_for_archive:
+            close_method = getattr(stream, "close", None)
+            if callable(close_method):
+                try:
+                    close_method()
+                except Exception:
+                    pass
+            found_count: int = int(getattr(self, "_idle_archive_scan_current_found", 0))
+            self._idle_archive_scan_stream = None
+            self._idle_archive_scan_current_archive = None
+            self._idle_archive_scan_current_found = 0
+            self._idle_archive_scan_done = done + 1
+            self.stats_text.setText(
+                f"Scanned archive {self._idle_archive_scan_done}/{total} '{archive_name}' ({found_count} member(s))."
+            )
+            QCoreApplication.processEvents()
+            if timer is not None:
+                timer.start(10)
+            return
+
+        found_count: int = int(getattr(self, "_idle_archive_scan_current_found", 0))
+        self.stats_text.setText(
+            f"Scanning archive {done + 1}/{total} '{archive_name}'... ({found_count} member(s) found)"
+        )
+        QCoreApplication.processEvents()
+        if timer is not None:
+            timer.start(0)
+
+    def _apply_data_file_list(
+        self,
+        files,
+        *,
+        empty_message,
+        confirm_clear_batch: bool = True,
+    ) -> bool:
         deduped_files = []
         seen = set()
         for file_ref in files:
@@ -9930,9 +11278,16 @@ class ManualFitGUI(QMainWindow):
             seen.add(text)
             deduped_files.append(text)
 
-        if not self._confirm_clear_batch_results("Loading a new data source"):
-            self.stats_text.append("Load cancelled; existing batch results kept.")
-            return False
+        if bool(confirm_clear_batch):
+            if not self._confirm_clear_batch_results("Loading a new data source"):
+                self._last_source_load_cancelled = True
+                self.stats_text.append("Load cancelled; existing batch results kept.")
+                return False
+        self._last_source_load_cancelled = False
+        self._stop_background_data_preload(wait_ms=80)
+        self._data_preload_cache = {}
+        self._data_preload_failed = set()
+        self._fit_details_autoload_attempted = False
 
         self.data_files = deduped_files
         self.file_combo.clear()
@@ -9959,10 +11314,24 @@ class ManualFitGUI(QMainWindow):
         self._sync_batch_files_from_shared(sync_pattern=True)
         loaded_ok = False
         loaded_idx = -1
-        for idx in range(len(self.data_files)):
+        candidate_indices: List[int] = []
+        preferred_idx = 0
+        if 0 <= int(getattr(self, "current_file_idx", 0)) < len(self.data_files):
+            preferred_idx = int(getattr(self, "current_file_idx", 0))
+        if preferred_idx not in candidate_indices:
+            candidate_indices.append(preferred_idx)
+        if 0 not in candidate_indices:
+            candidate_indices.append(0)
+        # Keep startup responsive: probe only a few files instead of scanning
+        # the full list before showing the GUI as ready.
+        max_probe = min(4, len(self.data_files))
+        for idx in range(max_probe):
+            if idx not in candidate_indices:
+                candidate_indices.append(idx)
+        for idx in candidate_indices:
             if self.load_file(idx, report_errors=False):
                 loaded_ok = True
-                loaded_idx: int = idx
+                loaded_idx = int(idx)
                 break
 
         if loaded_ok:
@@ -9973,7 +11342,10 @@ class ManualFitGUI(QMainWindow):
                 )
             elif self.stats_text.text().strip() == "Loading data sources...":
                 self.stats_text.clear()
-            self._autoload_fit_details_from_source()
+            self._attempt_fit_details_autoload_once(reason="initial_file_load")
+            if getattr(self, "_data_preload_thread", None) is None:
+                loaded_file_ref: str = str(self.data_files[loaded_idx]).strip()
+                self._start_background_data_preload(prioritize_file=loaded_file_ref)
             self._sync_file_navigation_buttons()
             return True
 
@@ -10010,16 +11382,18 @@ class ManualFitGUI(QMainWindow):
 
     def load_files(self) -> None:
         """Load CSV sources from a directory root, archive, or single CSV file."""
+        self._cancel_idle_archive_scan()
         source_path: Path = Path(self.current_dir).expanduser()
-        files = []
+        files: List[str] = []
+        archive_paths: List[str] = []
         empty_message = "No CSV files found in selected source."
 
         self._source_display_override = None
         self._source_selected_paths = []
 
         if source_path.is_dir():
-            csv_files = []
-            archive_paths = []
+            csv_files: List[str] = []
+            archive_candidates: List[str] = []
             for candidate in sorted(source_path.rglob("*")):
                 if not candidate.is_file():
                     continue
@@ -10027,34 +11401,28 @@ class ManualFitGUI(QMainWindow):
                 if suffix == ".csv":
                     csv_files.append(str(candidate))
                 elif is_supported_archive_path(candidate):
-                    archive_paths.append(candidate)
-
-            archive_members = []
-            for archive_path in archive_paths:
-                try:
-                    members = list_archive_csv_members(archive_path)
-                except Exception:
-                    continue
-                archive_members.extend(
-                    f"{archive_path}::{member}" for member in members
-                )
-            files = csv_files + archive_members
+                    archive_candidates.append(str(candidate))
+            files = list(csv_files)
+            archive_paths = list(archive_candidates)
+            if not files and archive_paths:
+                empty_message = "Scanning archive members in background..."
         elif source_path.is_file() and is_supported_archive_path(source_path):
-            try:
-                files = [
-                    f"{source_path}::{member}"
-                    for member in list_archive_csv_members(source_path)
-                ]
-            except Exception as exc:
-                empty_message: str = f"Failed to read archive root: {exc}"
-                files = []
+            files = []
+            archive_paths = [str(source_path)]
+            empty_message = "Scanning archive members in background..."
         elif source_path.is_file() and source_path.suffix.lower() == ".csv":
             files: List[str] = [str(source_path)]
         elif not source_path.exists():
             empty_message: str = f"Selected source does not exist: {source_path}"
 
         self._refresh_source_path_label()
-        self._apply_data_file_list(files, empty_message=empty_message)
+        self._apply_data_file_list(
+            files,
+            empty_message=empty_message,
+            confirm_clear_batch=not bool(source_path.is_dir()),
+        )
+        if archive_paths and not bool(getattr(self, "_last_source_load_cancelled", False)):
+            self._queue_idle_archive_scan(archive_paths)
 
     def _clear_main_plot(self, message="No data loaded.") -> None:
         if not hasattr(self, "fig") or not hasattr(self, "canvas"):
@@ -10110,7 +11478,45 @@ class ManualFitGUI(QMainWindow):
 
             try:
                 file_path = self.data_files[idx]
-                self.current_data = read_measurement_csv(file_path)
+                file_name: str = stem_for_file_ref(file_path)
+                load_started_at: float = time.monotonic()
+                last_progress_ui_time: float = 0.0
+
+                def _on_file_load_progress(
+                    message: str, fraction: None | float = None
+                ) -> None:
+                    nonlocal last_progress_ui_time
+                    now: float = time.monotonic()
+                    if (
+                        fraction not in (None, 0.0, 1.0)
+                        and (now - last_progress_ui_time) < 0.06
+                    ):
+                        return
+                    last_progress_ui_time = now
+                    text: str = f"Loading '{file_name}'"
+                    detail: str = str(message or "").strip()
+                    if detail:
+                        text = f"{text}: {detail}"
+                    if fraction is not None:
+                        pct: int = int(
+                            round(max(0.0, min(1.0, float(fraction))) * 100.0)
+                        )
+                        text = f"{text} ({pct}%)"
+                    self.stats_text.setText(text)
+                    QCoreApplication.processEvents()
+
+                cached_frame = self._data_preload_cache.get(str(file_path))
+                if cached_frame is not None:
+                    self.current_data = cached_frame
+                    fit_debug(f"data-preload cache hit: file={stem_for_file_ref(file_path)}")
+                else:
+                    _on_file_load_progress("Preparing...", 0.0)
+                    self.current_data = read_measurement_csv(
+                        file_path,
+                        progress_cb=_on_file_load_progress,
+                    )
+                    self._data_preload_cache[str(file_path)] = self.current_data
+                self._data_preload_failed.discard(str(file_path))
                 # Cache data for faster updates
                 time_src = (
                     "TIME"
@@ -10137,6 +11543,12 @@ class ManualFitGUI(QMainWindow):
                     file_path
                 )
                 self._apply_batch_params_for_file(file_path)
+                # If this file already has a stored fitted row, preserve those
+                # values on load instead of immediately reseeding from bound fields.
+                if has_valid_fit_to_load:
+                    self._mapped_param_seed_file_key = self._fit_task_file_key(file_path)
+                else:
+                    self._mapped_param_seed_file_key = None
                 # Refresh capture mapping controls after restoring any batch row
                 # so per-file seed values are re-applied when no valid fit exists.
                 self._refresh_param_capture_mapping_controls(
@@ -10144,7 +11556,16 @@ class ManualFitGUI(QMainWindow):
                 )
                 self.update_plot(fast=False, preserve_view=False)
                 self._reset_plot_home_view()
+                load_elapsed_s: float = max(0.0, time.monotonic() - load_started_at)
+                self.stats_text.setText(
+                    f"Loaded '{file_name}' ({load_elapsed_s:.2f}s)."
+                )
                 loaded_ok = True
+                if len(self._data_preload_cache) < len(self.data_files):
+                    if getattr(self, "_data_preload_thread", None) is None:
+                        self._start_background_data_preload(
+                            prioritize_file=str(file_path)
+                        )
             except Exception as e:
                 self.current_data = None
                 self.cached_time_data = None
@@ -10153,6 +11574,7 @@ class ManualFitGUI(QMainWindow):
                 self._expression_channel_data_cache = None
                 file_path = self.data_files[idx]
                 file_name: str = stem_for_file_ref(file_path)
+                self._data_preload_failed.add(str(file_path))
                 self._last_file_load_error: str = f"Error loading '{file_name}': {e}"
                 if report_errors:
                     self.stats_text.setText(self._last_file_load_error)
@@ -10203,6 +11625,7 @@ class ManualFitGUI(QMainWindow):
         Included:
           * equation text
           * set of manually fixed parameter keys
+          * set of periodic parameter keys
           * set of manually fixed boundary IDs
           * set of enabled fit channels
         """
@@ -10210,11 +11633,14 @@ class ManualFitGUI(QMainWindow):
         fixed_params: frozenset[str] = frozenset(
             str(k) for k in getattr(self, "_manually_fixed_params", set())
         )
+        periodic_params: frozenset[str] = frozenset(
+            str(k) for k in getattr(self, "_periodic_param_keys", set())
+        )
         fixed_bids = frozenset(getattr(self, "_manually_fixed_boundary_ids", set()))
         enabled_channels: Tuple[Any, ...] = tuple(
             sorted(self._get_enabled_fit_channels())
         )
-        return (expr, fixed_params, fixed_bids, enabled_channels)
+        return (expr, fixed_params, periodic_params, fixed_bids, enabled_channels)
 
     def _restore_fitted_state_if_available(self) -> None:
         """Re-apply the stored batch fit result for the current file.
@@ -10255,6 +11681,10 @@ class ManualFitGUI(QMainWindow):
         if row_idx is None:
             return False
         matched_row = self.batch_results[row_idx]
+        row_is_stale: bool = bool(
+            matched_row.get("_equation_stale")
+            or matched_row.get("_fit_conditions_stale")
+        )
 
         params = fit_get(matched_row, "params")
         if params is None:
@@ -10297,8 +11727,10 @@ class ManualFitGUI(QMainWindow):
             self._sync_slider_from_spinbox(key)
         self._refresh_boundary_state_topology(preserve_existing=True)
         boundary_source_targets = []
+        applied_boundary_targets: Set[str] = set()
+        has_any_stored_boundaries: bool = False
         boundary_ratios = fit_get(matched_row, "boundary_ratios")
-        if boundary_ratios is not None:
+        if (not row_is_stale) and boundary_ratios is not None:
             try:
                 b: np.ndarray[Tuple[int], np.dtype[Any]] = np.asarray(
                     boundary_ratios, dtype=float
@@ -10307,6 +11739,8 @@ class ManualFitGUI(QMainWindow):
                 b: np.ndarray[Tuple[int, ...], np.dtype[Any]] = np.asarray(
                     [], dtype=float
                 )
+            if b.size > 0:
+                has_any_stored_boundaries = True
             applied_target_boundary = False
             row_target: str = str(matched_row.get("y_channel") or "").strip()
             multi: Any | None = getattr(self, "_multi_channel_model", None)
@@ -10318,6 +11752,7 @@ class ManualFitGUI(QMainWindow):
                     ):
                         boundary_changed = True
                     boundary_source_targets.append(row_target)
+                    applied_boundary_targets.add(row_target)
                     applied_target_boundary = True
                 elif b.size > 0 and target_n > 0:
                     fit_debug(
@@ -10340,6 +11775,7 @@ class ManualFitGUI(QMainWindow):
                     primary_target: str | None = self._fit_state.primary_target
                     if primary_target is not None:
                         boundary_source_targets.append(primary_target)
+                        applied_boundary_targets.add(str(primary_target))
                 elif b.size > 0 and expected > 0:
                     fit_debug(
                         "apply-batch-boundary SKIPPED primary (size mismatch): "
@@ -10352,6 +11788,8 @@ class ManualFitGUI(QMainWindow):
         channel_results = fit_get(matched_row, "channel_results")
         multi: Any | None = getattr(self, "_multi_channel_model", None)
         if (
+            (not row_is_stale)
+            and
             isinstance(channel_results, dict)
             and multi is not None
             and multi.is_multi_channel
@@ -10363,12 +11801,52 @@ class ManualFitGUI(QMainWindow):
                     else None
                 )
                 if ch_ratios is not None:
-                    ch_b: np.ndarray[Tuple[int], np.dtype[Any]] = np.asarray(
-                        ch_ratios, dtype=float
-                    ).reshape(-1)
-                    if self._fit_state.set_channel_ratios(ch_target, ch_b):
+                    has_any_stored_boundaries = True
+                    ch_key: str = str(ch_target).strip()
+                    if not ch_key:
+                        continue
+                    try:
+                        ch_b: np.ndarray[Tuple[int], np.dtype[Any]] = np.asarray(
+                            ch_ratios, dtype=float
+                        ).reshape(-1)
+                    except Exception:
+                        continue
+                    expected_n: int = int(self._fit_state.channel_count(ch_key))
+                    if expected_n <= 0:
+                        continue
+                    if ch_b.size != expected_n:
+                        fit_debug(
+                            "apply-batch-boundary SKIPPED channel (size mismatch): "
+                            f"file={file_path} "
+                            f"target={ch_key} "
+                            f"b.size={int(ch_b.size)} "
+                            f"expected={int(expected_n)}"
+                        )
+                        continue
+                    if self._fit_state.set_channel_ratios(ch_key, np.clip(ch_b, 0.0, 1.0)):
                         boundary_changed = True
-                    boundary_source_targets.append(str(ch_target))
+                    boundary_source_targets.append(ch_key)
+                    applied_boundary_targets.add(ch_key)
+
+        # Avoid leaking boundary state from previously loaded files when this row
+        # does not carry per-channel ratios for every target (legacy fit rows).
+        if (
+            (not row_is_stale)
+            and has_any_stored_boundaries
+            and multi is not None
+            and multi.is_multi_channel
+        ):
+            for target in self._fit_state.targets():
+                target_key: str = str(target).strip()
+                if not target_key or target_key in applied_boundary_targets:
+                    continue
+                n_target: int = int(self._fit_state.channel_count(target_key))
+                if n_target <= 0:
+                    continue
+                if self._fit_state.set_channel_ratios(
+                    target_key, default_boundary_ratios(n_target)
+                ):
+                    boundary_changed = True
 
         seen_sources = set()
         ordered_sources = []
@@ -10612,7 +12090,7 @@ class ManualFitGUI(QMainWindow):
 
         source_index = int(getattr(self, "current_file_idx", 0))
         try:
-            self._start_file_fit_task(
+            task_id = self._start_file_fit_task(
                 kind="manual",
                 file_path=current_file,
                 source_index=source_index,
@@ -10642,6 +12120,17 @@ class ManualFitGUI(QMainWindow):
                     )
                 except Exception:
                     pass
+            if procedure is not None:
+                total_steps = len(getattr(procedure, "steps", ()) or ())
+                if total_steps > 0:
+                    task = self.fit_tasks.get(int(task_id))
+                    if task is not None:
+                        task["_progress_started_at"] = float(time.perf_counter())
+                        self._update_manual_procedure_status(
+                            task,
+                            step_done=0,
+                            step_total=int(total_steps),
+                        )
         self._refresh_fit_action_buttons()
 
     def on_fit_finished(self, fit_result) -> None:
@@ -10922,6 +12411,107 @@ class ManualFitGUI(QMainWindow):
         if unique_handles:
             axis.legend(unique_handles, unique_labels, loc=loc)
 
+    def _boundary_marker_entries(self, x_values: Sequence[float]) -> List[Dict[str, Any]]:
+        """Return boundary marker line entries for plotting."""
+        x_arr = np.asarray(x_values, dtype=float).reshape(-1)
+        x_finite = x_arr[np.isfinite(x_arr)]
+        if x_finite.size == 0:
+            return []
+
+        entries: List[Dict[str, Any]] = []
+        multi_model: Any | None = getattr(self, "_multi_channel_model", None)
+
+        if multi_model is not None and multi_model.is_multi_channel:
+            for ch_model in multi_model.channel_models:
+                target = str(ch_model.target_col).strip()
+                if not target or not self._is_channel_visible(target):
+                    continue
+                n_boundaries = max(0, len(ch_model.segment_exprs) - 1)
+                if n_boundaries <= 0:
+                    continue
+                ratios = np.asarray(
+                    self._fit_state.channel_ratios(target), dtype=float
+                ).reshape(-1)
+                if ratios.size != n_boundaries:
+                    ratios = default_boundary_ratios(n_boundaries)
+                x_boundaries = boundary_ratios_to_x_values(
+                    ratios,
+                    x_finite,
+                    n_boundaries,
+                )
+                for bidx, bval in enumerate(np.asarray(x_boundaries, dtype=float).reshape(-1)):
+                    if not np.isfinite(bval):
+                        continue
+                    entries.append(
+                        {
+                            "x": float(bval),
+                            "color": str(self._fit_companion_color(target)),
+                        }
+                    )
+        else:
+            target = str(getattr(self._fit_state, "primary_target", "") or self.y_channel)
+            n_boundaries = int(self._fit_state.channel_count(target))
+            if n_boundaries > 0:
+                ratios = np.asarray(self._fit_state.channel_ratios(target), dtype=float).reshape(
+                    -1
+                )
+                if ratios.size != n_boundaries:
+                    ratios = default_boundary_ratios(n_boundaries)
+                x_boundaries = boundary_ratios_to_x_values(
+                    ratios,
+                    x_finite,
+                    n_boundaries,
+                )
+                for bidx, bval in enumerate(np.asarray(x_boundaries, dtype=float).reshape(-1)):
+                    if not np.isfinite(bval):
+                        continue
+                    entries.append(
+                        {
+                            "x": float(bval),
+                            "color": "#475569",
+                        }
+                    )
+        return entries
+
+    def _draw_boundary_markers_on_axis(
+        self,
+        axis: Axes,
+        entries: Sequence[Mapping[str, Any]],
+    ) -> List[Any]:
+        """Draw boundary markers and return artists for later updates/removal."""
+        artists: List[Any] = []
+        if not entries:
+            return artists
+        for entry in entries:
+            x_val = finite_float_or_none(entry.get("x"))
+            if x_val is None:
+                continue
+            color = str(entry.get("color") or "#64748b")
+            line = axis.axvline(
+                float(x_val),
+                color=color,
+                linestyle="--",
+                linewidth=1.0,
+                alpha=0.55,
+                zorder=3.5,
+            )
+            artists.append(line)
+        return artists
+
+    def _refresh_boundary_markers(self, axis: Axes, x_values: Sequence[float]) -> None:
+        """Recompute and redraw boundary markers from current boundary ratios."""
+        old_artists = self._plot_lines.get("boundary_artists")
+        if isinstance(old_artists, list):
+            for artist in old_artists:
+                try:
+                    artist.remove()
+                except Exception:
+                    pass
+        entries = self._boundary_marker_entries(x_values)
+        self._plot_lines["boundary_artists"] = self._draw_boundary_markers_on_axis(
+            axis, entries
+        )
+
     def _prepare_plot_context(self, params):
         x_data = self._get_channel_data(self.x_channel)
         y_data = self._get_channel_data(self.y_channel)
@@ -11111,6 +12701,7 @@ class ManualFitGUI(QMainWindow):
                 resid_arrays = [series["residuals_display"]]
             r_min, r_max = self._finite_min_max(*resid_arrays)
             self.ax_residual.set_ylim(r_min, r_max)
+        self._refresh_boundary_markers(self.ax, context["x_data"])
         self.canvas.draw_idle()
         return True
 
@@ -11418,6 +13009,7 @@ class ManualFitGUI(QMainWindow):
                     x_max += pad
                 self.ax.set_xlim(x_min, x_max)
             self.ax.grid(True, alpha=0.3)
+            self._refresh_boundary_markers(self.ax, context["x_data"])
             if show_residuals and self.ax_residual is not None:
                 resid_arrays = [
                     v
@@ -11661,6 +13253,11 @@ class ManualFitGUI(QMainWindow):
         batch_filtered_capture_map=None,
         priority=False,
     ):
+        # Preload reads can contend with fit worker data loads (especially for
+        # archive-backed sources). Stop preload before starting any fit task.
+        if getattr(self, "_data_preload_thread", None) is not None:
+            self._stop_background_data_preload(wait_ms=120)
+
         run_mode: str = self._normalize_fit_run_mode(execution_mode)
         task_id: int = self._next_fit_task_id()
         existing_idx: None | int = self._find_batch_result_index_by_file(file_path)
@@ -11723,14 +13320,11 @@ class ManualFitGUI(QMainWindow):
                     existing_row
                 )
         else:
-            # For manual fits, include all existing batch results so the
-            # worker can seed from siblings (files with similar captures
-            # that were fitted in a previous batch run).
-            existing_rows_by_file = {
-                str(row.get("file")): canonicalize_fit_row(row)
-                for row in list(self.batch_results or [])
-                if row.get("file")
-            }
+            # Manual/single-file runs do not use cross-file sibling seeding.
+            # Avoid copying every batch row here because that can be expensive
+            # and delays cancellation before the worker starts.
+            existing_rows_by_file = {}
+            needs_fit_condition_invalidation = False
             if existing_row:
                 existing_rows_by_file[str(file_path)] = canonicalize_fit_row(
                     existing_row
@@ -11809,6 +13403,20 @@ class ManualFitGUI(QMainWindow):
                 proc, _ = self._current_procedure_for_run()
             if proc is None:
                 raise ValueError("No procedure steps defined.")
+            # Manual/single-file runs should honour current GUI seeds.
+            # Keep sibling-seed reuse for batch runs only.
+            if str(kind) != "batch" and bool(getattr(proc, "seed_from_siblings", False)):
+                from procedure import FitProcedure
+
+                proc = FitProcedure(
+                    name=str(getattr(proc, "name", "") or "Procedure"),
+                    steps=tuple(getattr(proc, "steps", ()) or ()),
+                    seed_from_siblings=False,
+                )
+                fit_debug(
+                    "fit-task procedure override: "
+                    "disabled seed_from_siblings for non-batch run"
+                )
 
             if isinstance(batch_procedure_capture_map, Mapping):
                 task_capture_map: Dict[str, str] = {
@@ -11892,6 +13500,7 @@ class ManualFitGUI(QMainWindow):
                 "ordered_param_keys": fit_context["ordered_keys"],
                 "seed_map": fit_context["seed_map"],
                 "bounds_map": fit_context["bounds_map"],
+                "periodic_params": fit_context.get("periodic_params", {}),
                 "boundary_seeds_per_channel": boundary_seeds_per_channel,
                 "x_channel": self.x_channel,
                 "procedure": proc,
@@ -11900,7 +13509,6 @@ class ManualFitGUI(QMainWindow):
                 "boundary_name_groups": dict(
                     self._proc_available_boundary_groups() or []
                 ),
-                "use_jax": self._use_jax_backend,
                 "existing_rows_by_file": existing_rows_by_file,
                 # Single-file/manual auto-fit should start from current GUI values.
                 # Keep sibling-seed reuse only for batch runs.
@@ -11916,12 +13524,12 @@ class ManualFitGUI(QMainWindow):
             "file_key": self._fit_task_file_key(file_path),
             "source_index": int(source_index),
             "procedure_name": (
-                str(getattr(procedure, "name", "") or "Procedure")
+                str(getattr(proc, "name", "") or "Procedure")
                 if run_mode == "procedure"
                 else ""
             ),
             "procedure_step_count": (
-                len(getattr(procedure, "steps", ()) or ())
+                len(getattr(proc, "steps", ()) or ())
                 if run_mode == "procedure"
                 else None
             ),
@@ -11930,6 +13538,7 @@ class ManualFitGUI(QMainWindow):
             ),
             "status": "pending",
             "_pre_fit_r2": finite_float_or_none(getattr(self, "_last_r2", None)),
+            "_progress_started_at": None,
         }
         if str(kind) == "batch":
             existing_r2 = None
@@ -11951,10 +13560,10 @@ class ManualFitGUI(QMainWindow):
                     file_name: str = stem_for_file_ref(file_path)
                     panel.record_external_procedure_start(
                         procedure_name=str(
-                            getattr(procedure, "name", "") or "Procedure"
+                            getattr(proc, "name", "") or "Procedure"
                         ),
                         file_label=file_name,
-                        step_count=len(getattr(procedure, "steps", ()) or ()),
+                        step_count=len(getattr(proc, "steps", ()) or ()),
                     )
 
         # Submit to the single worker thread.
@@ -12037,6 +13646,8 @@ class ManualFitGUI(QMainWindow):
         if task is None:
             return
         task["status"] = "running"
+        if not finite_float_or_none(task.get("_progress_started_at")):
+            task["_progress_started_at"] = float(time.perf_counter())
         # Batch-procedure workers emit a final per-file row on progress and then
         # emit the same row again on finished. Applying both doubles expensive UI
         # work on the main thread.
@@ -12044,6 +13655,7 @@ class ManualFitGUI(QMainWindow):
             str(task.get("kind")) == "batch"
             and self._normalize_fit_run_mode(task.get("execution_mode")) == "procedure"
         ):
+            self._update_batch_procedure_status(current_task=task)
             return
         self._apply_fit_row_update(row)
 
@@ -12108,6 +13720,22 @@ class ManualFitGUI(QMainWindow):
             r2=r2,
             step_result=step_result if isinstance(step_result, dict) else None,
         )
+        task_mode: str = self._normalize_fit_run_mode(task.get("execution_mode"))
+        if task_mode == "procedure":
+            total_steps = int(task.get("procedure_step_count") or 0)
+            done_steps = max(0, int(step_idx) + 1)
+            if str(task.get("kind")) == "manual" and total_steps > 0:
+                self._update_manual_procedure_status(
+                    task,
+                    step_done=done_steps,
+                    step_total=total_steps,
+                )
+            elif str(task.get("kind")) == "batch":
+                self._update_batch_procedure_status(
+                    current_task=task,
+                    step_done=done_steps,
+                    step_total=(total_steps if total_steps > 0 else None),
+                )
 
         # Apply params to spinboxes and update plot on each step completion,
         # but only if this task is for the currently loaded file.
@@ -12226,6 +13854,7 @@ class ManualFitGUI(QMainWindow):
 
     def _apply_step_boundaries_to_ui(self, boundary_ratios: dict) -> None:
         """Push boundary ratios from a procedure step into the fit state."""
+        updated_targets: set[str] = set()
         for ch_target, ratios in boundary_ratios.items():
             try:
                 arr = np.asarray(ratios, dtype=float).reshape(-1)
@@ -12236,6 +13865,12 @@ class ManualFitGUI(QMainWindow):
                 self._fit_state.set_channel_ratios(
                     str(ch_target), np.clip(arr, 0.0, 1.0)
                 )
+                updated_targets.add(str(ch_target))
+        if updated_targets:
+            self._fit_state.apply_link_groups(
+                self._boundary_links_from_map(),
+                prefer_targets=sorted(updated_targets),
+            )
 
     def _on_fit_task_finished(self, task_id, results) -> None:
         task = self.fit_tasks.get(int(task_id))
@@ -12530,6 +14165,8 @@ class ManualFitGUI(QMainWindow):
                 task.get("file_path"),
                 _fit_task_id=None,
             )
+            if self._current_batch_fit_run_mode() == "procedure":
+                self._update_batch_procedure_status()
 
         if kind == "batch" and self.batch_fit_in_progress:
             if bool(getattr(self, "_batch_cancel_requested", False)):
@@ -12544,6 +14181,18 @@ class ManualFitGUI(QMainWindow):
 
         self._refresh_fit_action_buttons()
         self._refresh_batch_controls()
+
+        # Resume background preload once all fit tasks are idle.
+        if (
+            not self.fit_tasks
+            and self.data_files
+            and len(self._data_preload_cache) < len(self.data_files)
+            and getattr(self, "_data_preload_thread", None) is None
+        ):
+            active_file: Any | None = self._current_loaded_file_path()
+            self._start_background_data_preload(
+                prioritize_file=str(active_file) if active_file else None
+            )
 
     def _cancel_unscheduled_batch_rows(self) -> int:
         """Mark queued rows without active tasks as Cancelled."""
@@ -12595,6 +14244,7 @@ class ManualFitGUI(QMainWindow):
         self._batch_cancel_requested = False
         self._batch_progress_done = 0
         self._batch_total_tasks = 0
+        self._batch_progress_started_at = 0.0
         self.update_batch_table()
         if not bool(getattr(self, "_close_shutdown_in_progress", False)):
             self.queue_visible_thumbnail_render()
@@ -12739,11 +14389,14 @@ class ManualFitGUI(QMainWindow):
 
         self.update_batch_table()
         self._batch_total_tasks: int = len(prioritized_items)
+        self._batch_progress_started_at = float(time.perf_counter())
         self._refresh_batch_controls()
         mode_text: str = (
             "procedure mode" if run_mode == "procedure" else "straightforward mode"
         )
         self.stats_text.append(f"Batch fit started ({mode_text}, queued).")
+        if run_mode == "procedure":
+            self._update_batch_procedure_status()
 
         parameter_capture_map: Dict[str, None] = (
             self._effective_param_capture_map_for_fixing()
@@ -13052,6 +14705,7 @@ class ManualFitGUI(QMainWindow):
                 np.ndarray[Tuple[int, ...], np.dtype[Any]]
                 | np.ndarray[Tuple[int], np.dtype[Any]]
             ) = self._as_float_array(fit_get(row, "boundary_values"))
+            row_target: str = str(row.get("y_channel") or "").strip()
             # Build per-channel boundary-value lookup from channel_results.
             ch_results_raw = fit_get(row, "channel_results")
             ch_boundary_values: Dict[str, np.ndarray] = {}
@@ -13076,11 +14730,16 @@ class ManualFitGUI(QMainWindow):
                 else:
                     # Use per-channel boundary values when available.
                     target_col = item.get("target")
-                    bv_arr = (
-                        ch_boundary_values.get(target_col, boundary_values)
-                        if target_col
-                        else boundary_values
-                    )
+                    if target_col:
+                        target_key: str = str(target_col)
+                        if row_target and row_target == target_key:
+                            bv_arr = boundary_values
+                        else:
+                            bv_arr = ch_boundary_values.get(target_key)
+                            if bv_arr is None:
+                                bv_arr = np.asarray([], dtype=float)
+                    else:
+                        bv_arr = boundary_values
                     value: float | None = (
                         float(bv_arr[idx]) if bv_arr.size > idx else None
                     )
@@ -13563,6 +15222,12 @@ class ManualFitGUI(QMainWindow):
             if ident not in seen:
                 seen.add(ident)
                 threads.append(thumb)
+        preload = getattr(self, "_data_preload_thread", None)
+        if preload is not None:
+            ident = int(id(preload))
+            if ident not in seen:
+                seen.add(ident)
+                threads.append(preload)
         return threads
 
     def _request_procedure_close_shutdown(
@@ -13582,6 +15247,8 @@ class ManualFitGUI(QMainWindow):
         self._batch_cancel_requested = True
         self._batch_cancel_pending = True
         self._batch_submission_context = None
+        self._cancel_idle_archive_scan()
+        self._stop_background_data_preload(wait_ms=120)
 
         # Cancel everything on the worker thread and tell it to exit its
         # run-loop.  shutdown() must be called *before* any terminate() so
@@ -13602,6 +15269,11 @@ class ManualFitGUI(QMainWindow):
             except Exception:
                 pass
             if force_terminate and bool(thread.isRunning()):
+                # FitWorkerThread owns an internal QMutex. If terminate() kills it
+                # while that mutex is locked, later cancel_all()/shutdown() calls
+                # in closeEvent can deadlock the GUI thread.
+                if thread is getattr(self, "_fit_worker_thread", None):
+                    continue
                 try:
                     thread.terminate()
                 except Exception:
@@ -13684,20 +15356,49 @@ class ManualFitGUI(QMainWindow):
                 except Exception:
                     pass
         self._shutdown_thread(self.thumb_thread, wait_ms=150, force_terminate=True)
+        self._stop_background_data_preload(wait_ms=150)
         self._close_shutdown_in_progress = False
         self._close_force_accept = False
         self._close_shutdown_deadline = 0.0
         super().closeEvent(event)
 
 
+def _parse_cli_source_path(
+    argv: Sequence[str],
+) -> Tuple[Optional[str], List[str]]:
+    """Parse CLI source-path arguments and return (source_path, qt_argv)."""
+    parser = argparse.ArgumentParser(
+        prog=Path(str(argv[0] if argv else "fit_gui.py")).name,
+        description="Launch the RedPitaya fit GUI.",
+    )
+    parser.add_argument(
+        "source",
+        nargs="?",
+        help="Optional data source to open at startup (folder, archive, or CSV).",
+    )
+    parser.add_argument(
+        "-s",
+        "--source",
+        dest="source_option",
+        help="Data source to open at startup (folder, archive, or CSV).",
+    )
+    parsed, remaining = parser.parse_known_args(list(argv[1:]))
+    source_path = str(parsed.source_option or parsed.source or "").strip() or None
+    qt_argv = [str(argv[0] if argv else "fit_gui.py"), *remaining]
+    return source_path, qt_argv
+
+
 if __name__ == "__main__":
-    app = QApplication(sys.argv)
+    startup_source, qt_argv = _parse_cli_source_path(sys.argv)
+    app = QApplication(qt_argv)
+    app_icon = QIcon()
     if APP_ICON_PATH.exists():
-        icon = QIcon(str(APP_ICON_PATH))
-        if not icon.isNull():
-            app.setWindowIcon(icon)
-    window = ManualFitGUI()
-    window.setWindowIcon(icon)
+        app_icon = QIcon(str(APP_ICON_PATH))
+        if not app_icon.isNull():
+            app.setWindowIcon(app_icon)
+    window = ManualFitGUI(source_path=startup_source)
+    if not app_icon.isNull():
+        window.setWindowIcon(app_icon)
     window.show()
     window.resize(1200, 800)
     sys.exit(app.exec())

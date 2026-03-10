@@ -17,7 +17,6 @@ from itertools import combinations
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
-from scipy.optimize import curve_fit, least_squares
 
 try:
     from numba import njit as _numba_njit
@@ -55,6 +54,16 @@ def njit_or_noop(*jit_args: Any, **jit_kwargs: Any) -> Callable:
 
 ArrayLike = Union[Sequence[float], np.ndarray]
 SegmentCallable = Callable[..., np.ndarray]
+_JAX_FIT_MANAGER: Any = None
+
+
+def _get_jax_fit_manager_cached():
+    global _JAX_FIT_MANAGER
+    if _JAX_FIT_MANAGER is None:
+        from jax_backend import get_jax_fit_manager
+
+        _JAX_FIT_MANAGER = get_jax_fit_manager()
+    return _JAX_FIT_MANAGER
 
 
 @dataclass(frozen=True)
@@ -62,6 +71,9 @@ class SegmentSpec:
     model_func: SegmentCallable
     p0: Sequence[float]
     bounds: Tuple[Sequence[float], Sequence[float]]
+    periodic_mask: Sequence[bool] = ()
+    periodic_periods: Sequence[float] = ()
+    periodic_offsets: Sequence[float] = ()
     n_starts: int = 4
     maxfev: int = 3000
 
@@ -75,7 +87,6 @@ class OrderedPiecewiseConfig:
     local_maxfev: int = 700
     robust_max_nfev: int = 45000
     prefer_jit: bool = True
-    use_jax: bool = False
 
 
 @dataclass
@@ -283,6 +294,58 @@ def _validate_segments(segments: Sequence[SegmentSpec]) -> None:
             raise ValueError(
                 f"Segment {idx} has inconsistent param dimensions (bounds/p0 mismatch)."
             )
+        p_mask = np.asarray(seg.periodic_mask, dtype=bool).reshape(-1)
+        if p_mask.size > 0 and p_mask.size != p0.size:
+            raise ValueError(
+                f"Segment {idx} has periodic_mask length mismatch: "
+                f"{p_mask.size} != {p0.size}."
+            )
+        p_periods = np.asarray(seg.periodic_periods, dtype=float).reshape(-1)
+        if p_periods.size > 0 and p_periods.size != p0.size:
+            raise ValueError(
+                f"Segment {idx} has periodic_periods length mismatch: "
+                f"{p_periods.size} != {p0.size}."
+            )
+        p_offsets = np.asarray(seg.periodic_offsets, dtype=float).reshape(-1)
+        if p_offsets.size > 0 and p_offsets.size != p0.size:
+            raise ValueError(
+                f"Segment {idx} has periodic_offsets length mismatch: "
+                f"{p_offsets.size} != {p0.size}."
+            )
+
+
+def _segment_periodic_arrays(
+    seg: SegmentSpec,
+    n_params: Optional[int] = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return periodic arrays aligned to a segment parameter vector."""
+    if n_params is None:
+        n_params = int(np.asarray(seg.p0, dtype=float).reshape(-1).size)
+    n = int(n_params)
+
+    raw_mask = np.asarray(seg.periodic_mask, dtype=bool).reshape(-1)
+    mask = raw_mask if raw_mask.size > 0 else np.zeros(n, dtype=bool)
+    if mask.size != n:
+        raise ValueError("Segment periodic_mask length must match parameter count.")
+
+    raw_periods = np.asarray(seg.periodic_periods, dtype=float).reshape(-1)
+    periods = raw_periods if raw_periods.size > 0 else np.ones(n, dtype=float)
+    if periods.size != n:
+        raise ValueError("Segment periodic_periods length must match parameter count.")
+
+    raw_offsets = np.asarray(seg.periodic_offsets, dtype=float).reshape(-1)
+    offsets = raw_offsets if raw_offsets.size > 0 else np.zeros(n, dtype=float)
+    if offsets.size != n:
+        raise ValueError("Segment periodic_offsets length must match parameter count.")
+
+    invalid_periods = mask & (~np.isfinite(periods) | (periods <= 0.0))
+    if np.any(invalid_periods):
+        raise ValueError("Periodic periods must be finite and > 0.")
+    invalid_offsets = mask & ~np.isfinite(offsets)
+    if np.any(invalid_offsets):
+        raise ValueError("Periodic offsets must be finite.")
+
+    return mask, np.where(mask, periods, 1.0), np.where(mask, offsets, 0.0)
 
 
 def boundary_ratios_to_pcts(ratios: ArrayLike) -> np.ndarray:
@@ -425,6 +488,31 @@ def _piecewise_bounds_and_p0(
     )
 
 
+def _piecewise_periodic_arrays(
+    segments: Sequence[SegmentSpec],
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    periodic_mask: List[bool] = []
+    periodic_periods: List[float] = []
+    periodic_offsets: List[float] = []
+    for seg in segments:
+        mask, periods, offsets = _segment_periodic_arrays(seg)
+        periodic_mask.extend(mask.tolist())
+        periodic_periods.extend(periods.tolist())
+        periodic_offsets.extend(offsets.tolist())
+
+    m = _n_boundaries(segments)
+    if m > 0:
+        periodic_mask.extend([False] * m)
+        periodic_periods.extend([1.0] * m)
+        periodic_offsets.extend([0.0] * m)
+
+    return (
+        np.asarray(periodic_mask, dtype=bool),
+        np.asarray(periodic_periods, dtype=float),
+        np.asarray(periodic_offsets, dtype=float),
+    )
+
+
 def _auto_blend_width(x_sorted: np.ndarray) -> float:
     """Compute a blend half-width for lerp transitions.
 
@@ -554,11 +642,15 @@ def _fit_segment_local(
     seg_index: int = -1,
     n_starts: Optional[int] = None,
     maxfev: Optional[int] = None,
-    use_jax: bool = False,
 ) -> Tuple[np.ndarray, float]:
     lo = np.asarray(seg.bounds[0], dtype=float).reshape(-1)
     hi = np.asarray(seg.bounds[1], dtype=float).reshape(-1)
     p0 = np.clip(np.asarray(seg.p0, dtype=float).reshape(-1), lo, hi)
+    n_params = int(p0.size)
+    periodic_mask, periodic_periods, periodic_offsets = _segment_periodic_arrays(
+        seg,
+        n_params=n_params,
+    )
 
     if p0.size == 0:
         y_hat = np.asarray(seg.model_func(x_seg), dtype=float).reshape(-1)
@@ -572,45 +664,31 @@ def _fit_segment_local(
         for _ in range(n_try - 1):
             starts.append(rng.uniform(lo, hi))
 
-    # When JAX backend is active, use jaxfit's GPU-accelerated CurveFit
-    # with cached flength instances (avoids JIT re-tracing).
-    _jax_mgr = None
-    if use_jax:
-        try:
-            from jax_backend import get_jax_fit_manager
-
-            _jax_mgr = get_jax_fit_manager()
-        except Exception as _jax_err:
-            try:
-                import fit_log as _fl
-
-                _fl.detail(f"jax fallback (seg {seg_index}): {_jax_err}")
-            except Exception:
-                pass
-            _jax_mgr = None
+    # JAXFit is mandatory for local segment curve fitting.
+    try:
+        _jax_mgr = _get_jax_fit_manager_cached()
+    except Exception as _jax_err:
+        if seg_index >= 0:
+            raise RuntimeError(
+                f"Segment {seg_index} JAX backend unavailable: {_jax_err}"
+            ) from _jax_err
+        raise RuntimeError(f"JAX backend unavailable: {_jax_err}") from _jax_err
 
     best_params: Optional[np.ndarray] = None
     best_sse = float("inf")
     for start in starts:
         try:
-            if _jax_mgr is not None:
-                popt, _pcov = _jax_mgr.curve_fit(
-                    seg.model_func,
-                    x_seg,
-                    y_seg,
-                    p0=np.asarray(start, dtype=float),
-                    bounds=(lo, hi),
-                )
-            else:
-                popt, _pcov = curve_fit(
-                    seg.model_func,
-                    x_seg,
-                    y_seg,
-                    p0=np.asarray(start, dtype=float),
-                    bounds=(lo, hi),
-                    method="trf",
-                    maxfev=use_maxfev,
-                )
+            popt, _pcov = _jax_mgr.curve_fit(
+                seg.model_func,
+                x_seg,
+                y_seg,
+                p0=np.asarray(start, dtype=float),
+                bounds=(lo, hi),
+                periodic_mask=periodic_mask,
+                periodic_periods=periodic_periods,
+                periodic_offsets=periodic_offsets,
+                max_nfev=use_maxfev,
+            )
             y_hat = np.asarray(seg.model_func(x_seg, *popt), dtype=float).reshape(-1)
             sse = _sse_score(y_seg, y_hat)
             if sse < best_sse:
@@ -690,10 +768,14 @@ class _OrderedPiecewiseSolver:
             else OrderedPiecewiseConfig()
         )
         self._use_jit = bool(self.config.prefer_jit)
-        self._use_jax = bool(self.config.use_jax)
         self._base_p0, (self._lower, self._upper) = _piecewise_bounds_and_p0(
             self.segments
         )
+        (
+            self._periodic_mask,
+            self._periodic_periods,
+            self._periodic_offsets,
+        ) = _piecewise_periodic_arrays(self.segments)
 
     def _predict(
         self,
@@ -765,7 +847,6 @@ class _OrderedPiecewiseSolver:
                         seg_index=seg_idx,
                         n_starts=local_n_starts,
                         maxfev=local_maxfev,
-                        use_jax=self._use_jax,
                     )
                 except Exception:
                     failed = True
@@ -833,15 +914,19 @@ class _OrderedPiecewiseSolver:
             diff_step = np.full(p0.size, 1e-6, dtype=float)
             diff_step[-nb:] = _boundary_ratio_diff_step_from_x(x_sorted)
 
-        ls = least_squares(
+        jax_mgr = _get_jax_fit_manager_cached()
+        ls = jax_mgr.least_squares(
             residuals,
             p0,
             bounds=(self._lower, self._upper),
-            method="trf",
+            periodic_mask=self._periodic_mask,
+            periodic_periods=self._periodic_periods,
+            periodic_offsets=self._periodic_offsets,
             loss="soft_l1",
             f_scale=0.5,
             max_nfev=int(self.config.robust_max_nfev),
             diff_step=diff_step,
+            x_scale=1.0,
         )
         popt = np.asarray(ls.x, dtype=float)
         pred = self._predict(x_sorted, popt, _x_min=_xmin, _x_span=_xspan)
@@ -866,7 +951,7 @@ class _OrderedPiecewiseSolver:
             "evaluated_grid_candidates": int(global_seed.get("evaluated", 0)),
             "numba_available": bool(NUMBA_AVAILABLE),
             "jit_enabled": bool(self._use_jit),
-            "jax_enabled": bool(self._use_jax),
+            "jax_enabled": True,
         }
 
         return OrderedPiecewiseResult(
@@ -919,7 +1004,7 @@ def refit_ordered_piecewise_from_seed(
         "selected_stage": selected_stage,
         "numba_available": bool(NUMBA_AVAILABLE),
         "jit_enabled": bool(solver._use_jit),
-        "jax_enabled": bool(solver._use_jax),
+        "jax_enabled": True,
     }
 
     return OrderedPiecewiseResult(

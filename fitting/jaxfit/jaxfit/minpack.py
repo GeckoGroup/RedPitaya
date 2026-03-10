@@ -22,9 +22,11 @@ __all__ = ["CurveFit", "curve_fit"]
 
 
 def curve_fit(f, *args, **kwargs):
-    jcf = CurveFit(f)
-    popt, pcov, _, _, _ = jcf.curve_fit(*args, **kwargs)
-    return popt, pcov
+    jcf = CurveFit()
+    output = jcf.curve_fit(f, *args, **kwargs)
+    if isinstance(output, tuple) and len(output) >= 2:
+        return output[0], output[1]
+    raise ValueError("Unexpected curve_fit output.")
 
 
 def _initialize_feasible(lb: np.ndarray, ub: np.ndarray) -> np.ndarray:
@@ -198,6 +200,126 @@ class CurveFit:
         ydata = np.concatenate([ydata, ypad])
         return xdata, ydata
 
+    @staticmethod
+    def _parse_periodic_mask(periodic, n: int) -> np.ndarray:
+        if periodic is None:
+            return np.zeros(n, dtype=bool)
+        arr = np.asarray(periodic)
+        if arr.ndim == 0:
+            return np.full(n, bool(arr), dtype=bool)
+        mask = np.asarray(arr, dtype=bool).reshape(-1)
+        if mask.size != n:
+            raise ValueError("`periodic` must be scalar or have length equal to `p0`.")
+        return mask
+
+    @staticmethod
+    def _parse_periodic_values(values, n: int, name: str, default: float) -> np.ndarray:
+        if values is None:
+            return np.full(n, float(default), dtype=float)
+        arr = np.asarray(values, dtype=float)
+        if arr.ndim == 0:
+            return np.full(n, float(arr), dtype=float)
+        out = np.asarray(arr, dtype=float).reshape(-1)
+        if out.size != n:
+            raise ValueError(f"{name} must be scalar or have length equal to `p0`.")
+        return out
+
+    @staticmethod
+    def _wrap_periodic_numpy(
+        params: np.ndarray,
+        periodic_mask: np.ndarray,
+        periodic_periods: np.ndarray,
+        periodic_offsets: np.ndarray,
+    ) -> np.ndarray:
+        out = np.asarray(params, dtype=float).reshape(-1).copy()
+        if out.size == 0 or not np.any(periodic_mask):
+            return out
+        mask = np.asarray(periodic_mask, dtype=bool).reshape(-1)
+        out[mask] = periodic_offsets[mask] + np.mod(
+            out[mask] - periodic_offsets[mask], periodic_periods[mask]
+        )
+        return out
+
+    @staticmethod
+    def _wrap_periodic_jnp(
+        params: jnp.ndarray,
+        periodic_mask: jnp.ndarray,
+        periodic_periods: jnp.ndarray,
+        periodic_offsets: jnp.ndarray,
+    ) -> jnp.ndarray:
+        wrapped = periodic_offsets + jnp.mod(params - periodic_offsets, periodic_periods)
+        return jnp.where(periodic_mask, wrapped, params)
+
+    def _prepare_periodic_config(
+        self,
+        p0: np.ndarray,
+        lb: np.ndarray,
+        ub: np.ndarray,
+        periodic,
+        periodic_periods,
+        periodic_offsets,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        n = int(p0.size)
+        periodic_mask = self._parse_periodic_mask(periodic, n)
+        if not np.any(periodic_mask):
+            return (
+                periodic_mask,
+                np.ones(n, dtype=float),
+                np.zeros(n, dtype=float),
+                np.asarray(lb, dtype=float).copy(),
+                np.asarray(ub, dtype=float).copy(),
+                np.asarray(p0, dtype=float).copy(),
+            )
+
+        if periodic_periods is None:
+            periods = np.ones(n, dtype=float)
+            spans = np.asarray(ub, dtype=float) - np.asarray(lb, dtype=float)
+            valid = (
+                periodic_mask
+                & np.isfinite(np.asarray(lb, dtype=float))
+                & np.isfinite(np.asarray(ub, dtype=float))
+                & (spans > 0.0)
+            )
+            if not np.all(valid[periodic_mask]):
+                raise ValueError(
+                    "Periodic parameters require finite bounds with non-zero span "
+                    "when `periodic_periods` is omitted."
+                )
+            periods[periodic_mask] = spans[periodic_mask]
+        else:
+            periods = self._parse_periodic_values(
+                periodic_periods, n, "`periodic_periods`", 1.0
+            )
+            invalid = periodic_mask & (~np.isfinite(periods) | (periods <= 0.0))
+            if np.any(invalid):
+                raise ValueError(
+                    "`periodic_periods` must be finite and > 0 for periodic parameters."
+                )
+            periods = np.where(periodic_mask, periods, 1.0)
+
+        if periodic_offsets is None:
+            offsets = np.zeros(n, dtype=float)
+            lb_arr = np.asarray(lb, dtype=float)
+            finite_lb = periodic_mask & np.isfinite(lb_arr)
+            offsets[finite_lb] = lb_arr[finite_lb]
+        else:
+            offsets = self._parse_periodic_values(
+                periodic_offsets, n, "`periodic_offsets`", 0.0
+            )
+            invalid_offsets = periodic_mask & ~np.isfinite(offsets)
+            if np.any(invalid_offsets):
+                raise ValueError("`periodic_offsets` must be finite for periodic parameters.")
+            offsets = np.where(periodic_mask, offsets, 0.0)
+
+        wrapped_p0 = self._wrap_periodic_numpy(
+            np.asarray(p0, dtype=float), periodic_mask, periods, offsets
+        )
+        fit_lb = np.asarray(lb, dtype=float).copy()
+        fit_ub = np.asarray(ub, dtype=float).copy()
+        fit_lb[periodic_mask] = -np.inf
+        fit_ub[periodic_mask] = np.inf
+        return periodic_mask, periods, offsets, fit_lb, fit_ub, wrapped_p0
+
     def curve_fit(
         self,
         f: Callable,
@@ -210,6 +332,9 @@ class CurveFit:
         bounds: Tuple[np.ndarray, np.ndarray] = (-np.inf, np.inf),
         method: Optional[str] = None,
         jac: Optional[Callable] = None,
+        periodic: Optional[np.ndarray] = None,
+        periodic_periods: Optional[np.ndarray] = None,
+        periodic_offsets: Optional[np.ndarray] = None,
         data_mask: Optional[np.ndarray] = None,
         timeit: bool = False,
         return_eval: bool = False,
@@ -283,6 +408,16 @@ class CurveFit:
             If None (default), the Jacobian will be determined using JAX's automatic
             differentiation (AD) capabilities. We recommend not using an analytical
             Jacobian, as it is usually faster to use AD.
+        periodic : array_like of bool or bool, optional
+            Marks parameters as periodic. For periodic parameters the optimizer
+            runs in an unbounded variable and values are wrapped into one period
+            before model/Jacobian evaluation.
+        periodic_periods : array_like of float or float, optional
+            Period for each parameter. Required for periodic parameters with
+            non-finite bounds; otherwise defaults to ``upper-lower`` bounds span.
+        periodic_offsets : array_like of float or float, optional
+            Wrap origin for periodic parameters. Defaults to the lower bound
+            when finite, else 0.
         kwargs
             Keyword arguments passed to `leastsq` for ``method='lm'`` or
             `least_squares` otherwise.
@@ -369,6 +504,59 @@ class CurveFit:
         lb, ub = prepare_bounds(bounds, n)
         if p0 is None:
             p0 = _initialize_feasible(lb, ub)
+        p0 = np.asarray(p0, dtype=float).reshape(-1)
+        (
+            periodic_mask,
+            periodic_period_vals,
+            periodic_offset_vals,
+            fit_lb,
+            fit_ub,
+            p0,
+        ) = self._prepare_periodic_config(
+            p0,
+            lb,
+            ub,
+            periodic,
+            periodic_periods,
+            periodic_offsets,
+        )
+        fit_bounds = (fit_lb, fit_ub)
+        wrapped_f = f
+        wrapped_jac = jac
+        if np.any(periodic_mask):
+            periodic_mask_jnp = jnp.asarray(periodic_mask)
+            periodic_period_vals_jnp = jnp.asarray(periodic_period_vals)
+            periodic_offset_vals_jnp = jnp.asarray(periodic_offset_vals)
+            n_params = int(p0.size)
+
+            def _wrapped_f(xvals, *params):
+                params_arr = jnp.asarray(params, dtype=jnp.float64)
+                wrapped_params = self._wrap_periodic_jnp(
+                    params_arr,
+                    periodic_mask_jnp,
+                    periodic_period_vals_jnp,
+                    periodic_offset_vals_jnp,
+                )
+                return f(xvals, *tuple(wrapped_params[idx] for idx in range(n_params)))
+
+            wrapped_f = _wrapped_f
+
+            if jac is not None:
+                orig_jac = jac
+
+                def _wrapped_jac(xvals, *params):
+                    params_arr = jnp.asarray(params, dtype=jnp.float64)
+                    wrapped_params = self._wrap_periodic_jnp(
+                        params_arr,
+                        periodic_mask_jnp,
+                        periodic_period_vals_jnp,
+                        periodic_offset_vals_jnp,
+                    )
+                    return orig_jac(
+                        xvals, *tuple(wrapped_params[idx] for idx in range(n_params))
+                    )
+
+                wrapped_jac = _wrapped_jac
 
         if method is None:
             method = "trf"
@@ -481,14 +669,14 @@ class CurveFit:
 
         jnp_data_mask = jnp.array(data_mask, dtype=bool)
         res = self.ls.least_squares(
-            f,
+            wrapped_f,
             p0,
-            jac=jac,
+            jac=wrapped_jac,
             xdata=jnp_xdata,
             ydata=jnp_ydata,
             data_mask=jnp_data_mask,
             transform=transform,
-            bounds=bounds,
+            bounds=fit_bounds,
             method=method,
             timeit=timeit,
             **kwargs,
@@ -496,7 +684,10 @@ class CurveFit:
 
         if not res.success:
             raise RuntimeError("Optimal parameters not found: " + res.message)
-        popt = res.x
+        popt = np.asarray(res.x, dtype=float)
+        popt = self._wrap_periodic_numpy(
+            popt, periodic_mask, periodic_period_vals, periodic_offset_vals
+        )
 
         st = time.time()
         # ysize = len(res.fun)

@@ -29,6 +29,7 @@ from PyQt6.QtCore import (
 from PyQt6.QtGui import QPixmap
 
 from expression import _PARAMETER_NAME_RE
+from periodic_params import normalize_periodic_params
 from model import (
     FitCancelledError,
     boundary_ratios_to_x_values,
@@ -243,6 +244,34 @@ def extract_captures(
 
 _BATCH_PATTERN_MISMATCH_ERROR = "Pattern mismatch: filename does not match pattern."
 _FIT_PARAM_RANGE_ERROR_PREFIX = "Out-of-range fit parameter(s):"
+_SIBLING_SEED_MIN_R2 = 0.0
+_SIBLING_SEED_MIN_R2_MARGIN = 0.25
+_SIBLING_SEED_EXACT_BONUS = 0.25
+
+
+def _sibling_seed_quality_floor(procedure: Any) -> float:
+    """Minimum sibling R² considered safe enough to prefer as a seed."""
+    floor = float(_SIBLING_SEED_MIN_R2)
+    fit_step_thresholds: List[float] = []
+    for step in tuple(getattr(procedure, "steps", ()) or ()):
+        if str(getattr(step, "step_type", "")).strip() != "fit":
+            continue
+        min_r2 = finite_float_or_none(getattr(step, "min_r2", None))
+        if min_r2 is not None:
+            fit_step_thresholds.append(float(min_r2))
+    if fit_step_thresholds:
+        floor = max(
+            floor, float(min(fit_step_thresholds) - float(_SIBLING_SEED_MIN_R2_MARGIN))
+        )
+    return float(np.clip(floor, -1.0, 1.0))
+
+
+def _sibling_seed_score(*, exact_match: bool, distance: float, r2: Optional[float]) -> float:
+    return (
+        (float(_SIBLING_SEED_EXACT_BONUS) if exact_match else 0.0)
+        - float(distance)
+        + float(r2 or 0.0)
+    )
 
 
 def resolve_fixed_params_from_captures(
@@ -460,6 +489,8 @@ def _row_to_sibling_result(
     ``r2`` — the format expected by ``ProcedureContext.sibling_results``.
     """
     if _row_has_error(row):
+        return None
+    if bool(row.get("_equation_stale") or row.get("_fit_conditions_stale")):
         return None
     params_raw = fit_get(row, "params")
     if not has_nonempty_values(params_raw):
@@ -881,10 +912,10 @@ class ProcedureFitWorker(QObject):
         procedure,
         seed_map,
         bounds_map,
+        periodic_params=None,
         boundary_seeds=None,
         bound_values=None,
         boundary_name_groups=None,
-        use_jax=False,
     ):
         super().__init__()
         self.x_data = np.asarray(x_data, dtype=float)
@@ -896,11 +927,11 @@ class ProcedureFitWorker(QObject):
         self.procedure = procedure
         self.seed_map = dict(seed_map)
         self.bounds_map = dict(bounds_map)
+        self.periodic_params = normalize_periodic_params(periodic_params)
         self.boundary_seeds = dict(boundary_seeds or {})
         self.bound_values = dict(bound_values or {})
         self.boundary_name_groups = dict(boundary_name_groups or {})
         self.cancel_requested = False
-        self.use_jax = bool(use_jax)
 
     def request_cancel(self):
         self.cancel_requested = True
@@ -925,13 +956,13 @@ class ProcedureFitWorker(QObject):
                 self.procedure,
                 self.seed_map,
                 self.bounds_map,
+                periodic_params=self.periodic_params,
                 boundary_seeds=self.boundary_seeds,
                 cancel_check=lambda: self.cancel_requested,
                 step_callback=_step_cb,
                 attempt_callback=_attempt_cb,
                 bound_values=self.bound_values,
                 boundary_name_groups=self.boundary_name_groups,
-                use_jax=self.use_jax,
             )
             if self.cancel_requested:
                 self.cancelled.emit()
@@ -973,13 +1004,13 @@ class BatchProcedureFitWorker(QObject):
         ordered_param_keys,
         seed_map,
         bounds_map,
+        periodic_params,
         boundary_seeds_per_channel,
         x_channel,
         procedure,
         smoothing_enabled=False,
         smoothing_window=1,
         boundary_name_groups=None,
-        use_jax=False,
         # -- Cross-file sibling seeding --
         existing_rows_by_file=None,
         use_existing_fit_seed=True,
@@ -1001,16 +1032,19 @@ class BatchProcedureFitWorker(QObject):
         self.ordered_param_keys = list(ordered_param_keys or ())
         self.seed_map = dict(seed_map or {})
         self.bounds_map = dict(bounds_map or {})
+        self.periodic_params = normalize_periodic_params(periodic_params)
         self.boundary_seeds_per_channel = dict(boundary_seeds_per_channel or {})
         self.x_channel = str(x_channel)
         self.procedure = procedure
         self.smoothing_enabled = bool(smoothing_enabled)
         self.smoothing_window = int(smoothing_window)
         self.boundary_name_groups = dict(boundary_name_groups or {})
-        self.boundary_name_groups = dict(boundary_name_groups or {})
         self.cancel_requested = False
-        self.use_jax = bool(use_jax)
         self.use_existing_fit_seed = bool(use_existing_fit_seed)
+        self._sibling_seed_r2_floor = _sibling_seed_quality_floor(self.procedure)
+        self._seed_from_siblings_enabled = bool(
+            getattr(self.procedure, "seed_from_siblings", False)
+        )
 
         # Derive capture_seed_keys from parameter_capture_map (same logic as
         # BatchFitWorker) so sibling matching uses the same dimension keys.
@@ -1028,7 +1062,10 @@ class BatchProcedureFitWorker(QObject):
         # rows the GUI already knows about.
         self._sibling_results: Dict[str, Dict[str, Any]] = {}
         _sibling_skipped = 0
-        if existing_rows_by_file:
+        sibling_prep_enabled = bool(
+            self.use_existing_fit_seed or self._seed_from_siblings_enabled
+        )
+        if sibling_prep_enabled and existing_rows_by_file:
             for file_key, row in dict(existing_rows_by_file).items():
                 sibling = _row_to_sibling_result(row, self.ordered_param_keys)
                 if sibling is not None:
@@ -1041,9 +1078,11 @@ class BatchProcedureFitWorker(QObject):
             f"existing_rows={len(existing_rows_by_file or {})} "
             f"siblings_built={len(self._sibling_results)} "
             f"siblings_skipped={_sibling_skipped} "
+            f"sibling_prep_enabled={sibling_prep_enabled} "
             f"capture_seed_keys={self._capture_seed_keys} "
             f"param_capture_map={dict(self.parameter_capture_map)} "
-            f"seed_from_siblings={getattr(self.procedure, 'seed_from_siblings', '?')}"
+            f"seed_from_siblings={getattr(self.procedure, 'seed_from_siblings', '?')} "
+            f"sibling_seed_r2_floor={self._sibling_seed_r2_floor:.6f}"
         )
 
     def request_cancel(self):
@@ -1161,9 +1200,61 @@ class BatchProcedureFitWorker(QObject):
         file_seed_map = dict(self.seed_map)
         file_boundary_seeds = dict(self.boundary_seeds_per_channel)
         file_key = str(file_path)
+        self_seed_preferred = False
 
-        if self.use_existing_fit_seed and self._sibling_results:
-            # Find best sibling by capture proximity.
+        # Prefer same-file previous fit when available.
+        if self.use_existing_fit_seed:
+            own_prev = self._sibling_results.get(file_key)
+            if isinstance(own_prev, dict):
+                own_r2 = finite_float_or_none(own_prev.get("r2"))
+                if (
+                    own_r2 is not None
+                    and float(own_r2) < float(self._sibling_seed_r2_floor)
+                ):
+                    _fit_log.detail(
+                        "pre-procedure self seed skipped: "
+                        f"r2={float(own_r2):.6f} below floor={self._sibling_seed_r2_floor:.6f}"
+                    )
+                    own_prev = None
+            if isinstance(own_prev, dict):
+                applied_params = 0
+                for key, val in (own_prev.get("params_by_key") or {}).items():
+                    if key in file_seed_map:
+                        try:
+                            v = float(val)
+                        except Exception:
+                            continue
+                        if np.isfinite(v):
+                            file_seed_map[str(key)] = v
+                            applied_params += 1
+                applied_boundaries = 0
+                for ch, ratios in (own_prev.get("boundary_ratios_by_channel") or {}).items():
+                    if ch in file_boundary_seeds and ratios is not None:
+                        try:
+                            file_boundary_seeds[str(ch)] = np.asarray(
+                                ratios, dtype=float
+                            ).reshape(-1)
+                            applied_boundaries += 1
+                        except Exception:
+                            pass
+                if applied_params > 0 or applied_boundaries > 0:
+                    own_r2 = finite_float_or_none(own_prev.get("r2"))
+                    self_seed_preferred = (
+                        own_r2 is not None
+                        and float(own_r2) >= float(self._sibling_seed_r2_floor)
+                    )
+                    _fit_log.detail(
+                        "pre-procedure self seed applied: "
+                        f"r2={own_prev.get('r2')} "
+                        f"params={applied_params} boundaries={applied_boundaries}"
+                    )
+
+        if self.use_existing_fit_seed and self_seed_preferred:
+            _fit_log.detail(
+                "pre-procedure sibling search skipped: self seed passed quality floor"
+            )
+        elif self.use_existing_fit_seed and self._sibling_results:
+            # Find best sibling by capture proximity and fit quality.
             if not self._capture_seed_keys:
                 _fit_log.detail(
                     "pre-procedure sibling search skipped: "
@@ -1178,8 +1269,11 @@ class BatchProcedureFitWorker(QObject):
                     f"n_siblings={len(self._sibling_results)}"
                 )
                 best_sibling: Optional[Dict[str, Any]] = None
-                closest_sibling: Optional[Dict[str, Any]] = None
-                closest_distance: Optional[float] = None
+                best_score: Optional[float] = None
+                best_r2: Optional[float] = None
+                best_distance: float = float(np.inf)
+                best_exact = False
+                best_kind = ""
                 current_sig = _capture_seed_signature(captures, self._capture_seed_keys)
                 _fit_log.detail(f"current signature: {current_sig}")
                 for sib_key, sib in self._sibling_results.items():
@@ -1190,31 +1284,63 @@ class BatchProcedureFitWorker(QObject):
                         continue
                     if not sib.get("params_by_key"):
                         continue
-                    sib_sig = _capture_seed_signature(sib_caps, self._capture_seed_keys)
+                    sib_r2 = finite_float_or_none(sib.get("r2"))
                     if (
+                        sib_r2 is not None
+                        and float(sib_r2) < float(self._sibling_seed_r2_floor)
+                    ):
+                        continue
+                    sib_sig = _capture_seed_signature(sib_caps, self._capture_seed_keys)
+                    exact_match = (
                         current_sig is not None
                         and sib_sig is not None
                         and current_sig == sib_sig
-                    ):
-                        if best_sibling is None or (sib.get("r2") or 0) > (
-                            best_sibling.get("r2") or 0
-                        ):
-                            best_sibling = sib
-                        continue
+                    )
                     dist = _capture_distance(
                         captures, sib_caps, self._capture_seed_keys
                     )
                     if dist is None:
-                        continue
-                    if closest_sibling is None or float(dist) < float(closest_distance):
-                        closest_sibling = sib
-                        closest_distance = float(dist)
-                    elif np.isclose(float(dist), float(closest_distance)) and (
-                        (sib.get("r2") or 0) > (closest_sibling.get("r2") or 0)
-                    ):
-                        closest_sibling = sib
-                        closest_distance = float(dist)
-                chosen = best_sibling or closest_sibling
+                        dist = 1.0
+                    score = _sibling_seed_score(
+                        exact_match=bool(exact_match),
+                        distance=float(dist),
+                        r2=sib_r2,
+                    )
+
+                    replace = False
+                    if best_sibling is None or best_score is None:
+                        replace = True
+                    elif float(score) > float(best_score):
+                        replace = True
+                    elif np.isclose(float(score), float(best_score)):
+                        sib_r2_cmp = (
+                            float(sib_r2) if sib_r2 is not None else float(-np.inf)
+                        )
+                        best_r2_cmp = (
+                            float(best_r2) if best_r2 is not None else float(-np.inf)
+                        )
+                        if sib_r2_cmp > best_r2_cmp:
+                            replace = True
+                        elif np.isclose(sib_r2_cmp, best_r2_cmp):
+                            if bool(exact_match) and not best_exact:
+                                replace = True
+                            elif bool(exact_match) == bool(best_exact) and float(dist) < float(
+                                best_distance
+                            ):
+                                replace = True
+                    if replace:
+                        best_sibling = sib
+                        best_score = float(score)
+                        best_r2 = sib_r2
+                        best_distance = float(dist)
+                        best_exact = bool(exact_match)
+                        best_kind = (
+                            "matching-captures"
+                            if bool(exact_match)
+                            else "closest-captures"
+                        )
+
+                chosen = best_sibling
                 if chosen is not None:
                     applied_params = 0
                     for key, val in (chosen.get("params_by_key") or {}).items():
@@ -1238,22 +1364,18 @@ class BatchProcedureFitWorker(QObject):
                                 applied_boundaries += 1
                             except Exception:
                                 pass
-                    sib_kind = (
-                        "matching-captures"
-                        if best_sibling is not None
-                        else "closest-captures"
-                    )
                     _fit_log.detail(
                         "pre-procedure sibling seed applied: "
-                        f"kind={sib_kind} "
+                        f"kind={best_kind or 'closest-captures'} "
                         f"r2={chosen.get('r2')} "
+                        f"score={best_score if best_score is not None else 'n/a'} "
                         f"params={applied_params} boundaries={applied_boundaries}"
                     )
                 else:
                     _fit_log.detail(
                         "pre-procedure sibling seed: "
                         f"{len(self._sibling_results)} sibling(s) available "
-                        "but no match found"
+                        "but no quality-qualified match found"
                     )
         elif self.use_existing_fit_seed:
             _fit_log.detail(
@@ -1277,13 +1399,13 @@ class BatchProcedureFitWorker(QObject):
                 self.procedure,
                 file_seed_map,
                 dict(self.bounds_map),
+                periodic_params=self.periodic_params,
                 boundary_seeds=file_boundary_seeds,
                 cancel_check=lambda: self.cancel_requested,
                 step_callback=_step_cb,
                 attempt_callback=_attempt_cb,
                 bound_values=dict(bound_values or {}),
                 boundary_name_groups=self.boundary_name_groups,
-                use_jax=self.use_jax,
                 # Cross-file sibling seeding context for procedure retries.
                 captures=captures,
                 sibling_results=dict(self._sibling_results),
@@ -1327,6 +1449,18 @@ class BatchProcedureFitWorker(QObject):
                     entry["boundary_ratios"] = np.asarray(
                         ratios_arr, dtype=float
                     ).copy()
+                    if ratios_arr.size > 0:
+                        try:
+                            entry["boundaries"] = np.asarray(
+                                boundary_ratios_to_x_values(
+                                    ratios_arr,
+                                    x_data,
+                                    int(ratios_arr.size),
+                                ),
+                                dtype=float,
+                            ).reshape(-1)
+                        except Exception:
+                            pass
                 raw_r2 = finite_float_or_none(raw_entry.get("r2"))
                 if raw_r2 is not None:
                     entry["r2"] = float(raw_r2)
