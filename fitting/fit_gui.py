@@ -743,6 +743,10 @@ class ManualFitGUI(QMainWindow):
         self.auto_fit_btn_default_text = "Auto Fit"
         self._auto_fit_run_mode = "fit"
         self._batch_fit_run_mode = "fit"
+        self._fit_compute_mode = self._normalize_fit_compute_mode(
+            os.environ.get("REDPITAYA_JAX_PLATFORM", "gpu")
+        )
+        self._apply_fit_compute_mode_env(self._fit_compute_mode)
         self._auto_fit_mode_actions = {}
         self._batch_fit_mode_actions = {}
         initial_boundary_count = max(
@@ -1768,6 +1772,8 @@ class ManualFitGUI(QMainWindow):
             self.reset_from_batch_btn.setEnabled(not any_running)
         if hasattr(self, "clear_previous_result_btn"):
             self.clear_previous_result_btn.setEnabled(not any_running)
+        if hasattr(self, "fit_compute_mode_btn"):
+            self.fit_compute_mode_btn.setEnabled(not bool(self.fit_tasks))
 
     def _refresh_batch_controls(self):
         if not hasattr(self, "run_batch_btn") or not hasattr(self, "cancel_batch_btn"):
@@ -1934,6 +1940,23 @@ class ManualFitGUI(QMainWindow):
         return "fit"
 
     @staticmethod
+    def _normalize_fit_compute_mode(mode_value) -> str:
+        mode: str = str(mode_value or "").strip().lower()
+        if mode == "cpu":
+            return "cpu"
+        return "gpu"
+
+    @staticmethod
+    def _apply_fit_compute_mode_env(mode_value) -> None:
+        mode: str = ManualFitGUI._normalize_fit_compute_mode(mode_value)
+        os.environ["REDPITAYA_JAX_PLATFORM"] = mode
+
+    @staticmethod
+    def _is_jax_backend_initialized() -> bool:
+        module = sys.modules.get("jax_backend")
+        return bool(module is not None and getattr(module, "_jax_initialized", False))
+
+    @staticmethod
     def _auto_fit_button_text_for_mode(mode_value) -> str:
         mode: str = ManualFitGUI._normalize_fit_run_mode(mode_value)
         return "Run Procedure" if mode == "procedure" else "Auto Fit"
@@ -1948,6 +1971,48 @@ class ManualFitGUI(QMainWindow):
 
     def _current_batch_fit_run_mode(self) -> str:
         return self._normalize_fit_run_mode(getattr(self, "_batch_fit_run_mode", "fit"))
+
+    def _current_fit_compute_mode(self) -> str:
+        return self._normalize_fit_compute_mode(
+            getattr(self, "_fit_compute_mode", "gpu")
+        )
+
+    def _set_fit_compute_mode(
+        self,
+        mode_value,
+        *,
+        autosave=True,
+        show_status=False,
+    ) -> None:
+        mode: str = self._normalize_fit_compute_mode(mode_value)
+        previous_mode: str = self._current_fit_compute_mode()
+        changed: bool = mode != previous_mode
+        self._fit_compute_mode = mode
+        self._apply_fit_compute_mode_env(mode)
+        if hasattr(self, "fit_compute_mode_btn"):
+            checked = mode == "gpu"
+            self.fit_compute_mode_btn.blockSignals(True)
+            self.fit_compute_mode_btn.setChecked(checked)
+            self.fit_compute_mode_btn.setText("GPU" if checked else "CPU")
+            self.fit_compute_mode_btn.blockSignals(False)
+        if show_status and changed and hasattr(self, "stats_text"):
+            mode_label: str = "GPU" if mode == "gpu" else "CPU"
+            if self._is_jax_backend_initialized():
+                self.stats_text.append(
+                    f"Fit compute mode set to {mode_label}. "
+                    "Restart the app to switch backend."
+                )
+            else:
+                self.stats_text.append(f"Fit compute mode set to {mode_label}.")
+        if autosave:
+            self._autosave_fit_details()
+
+    def _on_fit_compute_mode_toggled(self, checked: bool) -> None:
+        self._set_fit_compute_mode(
+            "gpu" if bool(checked) else "cpu",
+            autosave=True,
+            show_status=True,
+        )
 
     @staticmethod
     def _set_mode_actions_enabled(
@@ -5680,8 +5745,25 @@ class ManualFitGUI(QMainWindow):
             handler=self.reset_params_from_batch,
             tooltip="Load parameters for the current file from the batch table row.",
         )
+        self.fit_compute_mode_btn: QPushButton = self._new_button(
+            "GPU",
+            checkable=True,
+            checked=(self._current_fit_compute_mode() == "gpu"),
+            toggled_handler=self._on_fit_compute_mode_toggled,
+            tooltip=(
+                "Fit backend target for JAX (GPU or CPU). "
+                "If JAX is already initialized, restart the app to apply a switch."
+            ),
+            fixed_width=64,
+        )
         fit_actions_row.addWidget(self.auto_fit_btn)
         fit_actions_row.addWidget(self.reset_from_batch_btn)
+        fit_actions_row.addWidget(self.fit_compute_mode_btn)
+        self._set_fit_compute_mode(
+            self._current_fit_compute_mode(),
+            autosave=False,
+            show_status=False,
+        )
 
         fit_actions_row.addStretch(1)
         fit_group_layout.addLayout(fit_actions_row)
@@ -9774,6 +9856,7 @@ class ManualFitGUI(QMainWindow):
                 },
                 "auto_fit_mode": self._current_auto_fit_run_mode(),
                 "batch_fit_mode": self._current_batch_fit_run_mode(),
+                "fit_compute_mode": self._current_fit_compute_mode(),
                 "smoothing_enabled": bool(getattr(self, "smoothing_enabled", False)),
                 "smoothing_window": int(getattr(self, "smoothing_window", 1) or 1),
                 "capture_pattern": (
@@ -10246,6 +10329,11 @@ class ManualFitGUI(QMainWindow):
             self._set_batch_fit_mode(
                 gui.get("batch_fit_mode", self._batch_fit_run_mode),
                 autosave=False,
+            )
+            self._set_fit_compute_mode(
+                gui.get("fit_compute_mode", self._fit_compute_mode),
+                autosave=False,
+                show_status=False,
             )
 
             if hasattr(self, "smoothing_toggle_btn"):
@@ -13259,6 +13347,7 @@ class ManualFitGUI(QMainWindow):
             self._stop_background_data_preload(wait_ms=120)
 
         run_mode: str = self._normalize_fit_run_mode(execution_mode)
+        self._apply_fit_compute_mode_env(self._current_fit_compute_mode())
         task_id: int = self._next_fit_task_id()
         existing_idx: None | int = self._find_batch_result_index_by_file(file_path)
         existing_row = (
