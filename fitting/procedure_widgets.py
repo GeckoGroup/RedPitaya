@@ -163,6 +163,7 @@ class ProcedureHost:
         return {}
 
     def proc_build_fit_context(self, fixed_params=None) -> dict:
+        _ = fixed_params
         return {}
 
     def proc_get_multi_channel_model(self) -> Optional[MultiChannelModelDefinition]:
@@ -254,7 +255,7 @@ class StepResultsTable(QWidget):
         "skipped": QColor("#f1f5f9"),  # Gray
     }
 
-    def populate(self, step_results: list, procedure_steps: list):
+    def populate(self, step_results: list):
         """Fill the table from a list of step result dicts."""
         self.table.setRowCount(0)
         if not step_results:
@@ -541,11 +542,11 @@ class ProcedurePanel(QWidget):
             self._last_step_results = [
                 dict(item) for item in step_results if isinstance(item, Mapping)
             ]
-            self._results_table.populate(self._last_step_results, self._procedure_steps)
+            self._results_table.populate(self._last_step_results)
             self._rebuild_live_key_changes(self._last_step_results)
         else:
             self._last_step_results = []
-            self._results_table.populate([], self._procedure_steps)
+            self._results_table.populate([])
             self._clear_run_log()
 
         stopped = result_map.get("stopped_at_step")
@@ -593,6 +594,7 @@ class ProcedurePanel(QWidget):
 
     def request_close_shutdown(self, *, force_terminate: bool = False) -> None:
         """Request cancellation of an active procedure run during window close."""
+        _ = bool(force_terminate)
         task_id = getattr(self, "_procedure_task_id", None)
         if task_id is not None:
             worker_thread = getattr(self.host, "_fit_worker_thread", None)
@@ -769,7 +771,7 @@ class ProcedurePanel(QWidget):
 
     def _restore_run_state_ui(self) -> None:
         self._status_label.setText(str(self._last_status_text or ""))
-        self._results_table.populate(self._last_step_results, self._procedure_steps)
+        self._results_table.populate(self._last_step_results)
         if self._last_step_results:
             self._rebuild_live_key_changes(self._last_step_results)
         else:
@@ -793,7 +795,9 @@ class ProcedurePanel(QWidget):
         for step_type, step_label in available_step_types():
             action = self._add_step_menu.addAction(step_label)
             action.setData(step_type)
-            action.triggered.connect(lambda checked, st=step_type: self._add_step(st))
+            action.triggered.connect(
+                lambda _checked, st=step_type: self._add_step(st)
+            )
         self._add_step_btn.setMenu(self._add_step_menu)
         header.addWidget(self._add_step_btn)
         self._template_btn = QPushButton("Templates")
@@ -936,9 +940,7 @@ class ProcedurePanel(QWidget):
         # Fallback generic card.
         return self._build_generic_card(idx, step)
 
-    def _card_shell(
-        self, idx: int, step: ProcedureStepBase, type_label: str
-    ) -> Tuple[QGroupBox, QVBoxLayout]:
+    def _card_shell(self, idx: int, type_label: str) -> Tuple[QGroupBox, QVBoxLayout]:
         """Create the common card frame with title row and move/remove buttons."""
         card = QGroupBox()
         card.setObjectName("procStepCard")
@@ -961,14 +963,14 @@ class ProcedurePanel(QWidget):
         for icon_text, delta in [("▲", -1), ("▼", 1)]:
             btn = self._make_button(
                 icon_text,
-                handler=lambda checked, i=idx, d=delta: self._move_step(i, d),
+                handler=lambda _checked, i=idx, d=delta: self._move_step(i, d),
                 fixed_width=24,
                 tooltip="Move step",
             )
             title_row.addWidget(btn)
         remove_btn = self._make_button(
             "✕",
-            handler=lambda checked, i=idx: self._remove_step(i),
+            handler=lambda _checked, i=idx: self._remove_step(i),
             fixed_width=24,
             tooltip="Remove step",
             style_sheet="QPushButton { color: #dc2626; } QPushButton:hover { background: #fee2e2; }",
@@ -1040,7 +1042,7 @@ class ProcedurePanel(QWidget):
     # ── Fit step card ─────────────────────────────────────────────
 
     def _build_fit_step_card(self, idx: int, step: FitStep) -> QWidget:
-        card, vlayout = self._card_shell(idx, step, "Fit")
+        card, vlayout = self._card_shell(idx, "Fit")
         all_params = self.host.proc_available_params()
         all_channels = self.host.proc_available_channels()
         capture_keys = self.host.proc_available_capture_keys()
@@ -1294,7 +1296,7 @@ class ProcedurePanel(QWidget):
     # ── Set Parameter step card ───────────────────────────────────
 
     def _build_set_param_card(self, idx: int, step: SetParameterStep) -> QWidget:
-        card, vlayout = self._card_shell(idx, step, "Set Parameter")
+        card, vlayout = self._card_shell(idx, "Set Parameter")
         all_params = self.host.proc_available_params()
         selected_keys = [
             str(a.target_key) for a in step.assignments if str(a.target_key)
@@ -1439,7 +1441,7 @@ class ProcedurePanel(QWidget):
     # ── Set Boundaries step card ──────────────────────────────────
 
     def _build_set_boundaries_card(self, idx: int, step: SetBoundariesStep) -> QWidget:
-        card, vlayout = self._card_shell(idx, step, "Set Boundaries")
+        card, vlayout = self._card_shell(idx, "Set Boundaries")
         groups = self.host.proc_available_boundary_groups() or []
         available_names = [str(name) for name, _members in groups if str(name).strip()]
         selected_names = [
@@ -1578,7 +1580,7 @@ class ProcedurePanel(QWidget):
     # ── Randomize Seeds step card ─────────────────────────────────
 
     def _build_randomize_card(self, idx: int, step: RandomizeSeedsStep) -> QWidget:
-        card, vlayout = self._card_shell(idx, step, "Randomize Seeds")
+        card, vlayout = self._card_shell(idx, "Randomize Seeds")
         all_params = self.host.proc_available_params()
 
         row = QHBoxLayout()
@@ -1616,7 +1618,7 @@ class ProcedurePanel(QWidget):
     # ── Generic fallback card ─────────────────────────────────────
 
     def _build_generic_card(self, idx: int, step: ProcedureStepBase) -> QWidget:
-        card, vlayout = self._card_shell(idx, step, step.step_type)
+        card, vlayout = self._card_shell(idx, step.step_type)
         vlayout.addWidget(
             self._make_label(
                 f"<i>Step type '{step.step_type}' has no custom editor.</i>",
@@ -2638,7 +2640,7 @@ class ProcedurePanel(QWidget):
         while len(self._last_step_results) <= step_idx_int:
             self._last_step_results.append({})
         self._last_step_results[step_idx_int] = dict(step_result)
-        self._results_table.populate(self._last_step_results, self._procedure_steps)
+        self._results_table.populate(self._last_step_results)
 
         line = self._format_step_key_change_line(
             step_idx_int,
@@ -2667,7 +2669,7 @@ class ProcedurePanel(QWidget):
             ]
         else:
             self._last_step_results = []
-        self._results_table.populate(self._last_step_results, self._procedure_steps)
+        self._results_table.populate(self._last_step_results)
         self._rebuild_live_key_changes(self._last_step_results)
 
         stopped = result.get("stopped_at_step")

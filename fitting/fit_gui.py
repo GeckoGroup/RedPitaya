@@ -384,7 +384,7 @@ class ProcedureLivePanel(QWidget):
             top_row.addWidget(text_lbl, 1)
 
             r2_lbl = QLabel("")
-            r2_lbl.setMinimumWidth(100)
+            r2_lbl.setMinimumWidth(180)
             r2_lbl.setAlignment(
                 Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
             )
@@ -439,6 +439,22 @@ class ProcedureLivePanel(QWidget):
 
         self._steps_layout.addStretch()
 
+    @staticmethod
+    def _format_per_channel_r2(per_channel_r2: Optional[Mapping[str, Any]]) -> str:
+        """Render per-channel R² mapping as compact text."""
+        if not isinstance(per_channel_r2, Mapping) or not per_channel_r2:
+            return ""
+        parts: List[str] = []
+        for raw_channel in sorted(per_channel_r2.keys(), key=lambda key: str(key)):
+            channel_key: str = str(raw_channel).strip()
+            if not channel_key:
+                continue
+            r2_val = finite_float_or_none(per_channel_r2.get(raw_channel))
+            if r2_val is None:
+                continue
+            parts.append(f"{channel_key}={float(r2_val):.6f}")
+        return ", ".join(parts)
+
     def update_step(
         self,
         step_idx: int,
@@ -460,16 +476,34 @@ class ProcedureLivePanel(QWidget):
         if status in ("pass", "fail", "skipped"):
             row["attempt_widget"].hide()
 
+        per_channel_text = ""
+        if isinstance(step_result, dict):
+            per_channel_text = self._format_per_channel_r2(
+                step_result.get("per_channel_r2")
+            )
+
         # R² display on the heading line
         if r2 is not None:
-            r2_color = "#16a34a" if r2 > 0.99 else "#d97706" if r2 > 0.95 else "#dc2626"
-            row["r2"].setText(f"R\u00b2={r2:.6f}")
+            r2_color = (
+                "#16a34a" if r2 > 0.99 else "#d97706" if r2 > 0.95 else "#dc2626"
+            )
+            summary = f"R\u00b2={r2:.6f}"
+            if per_channel_text:
+                summary = f"{summary} | {per_channel_text}"
+            row["r2"].setText(summary)
+            row["r2"].setToolTip(summary if per_channel_text else "")
             row["r2"].setStyleSheet(f"{self._FONT_STEP_BOLD} color: {r2_color};")
         elif status in ("pass", "fail", "skipped"):
             msg = ""
             if step_result and step_result.get("message"):
                 msg = str(step_result["message"])
-            row["r2"].setText(msg or status)
+            summary = msg or status
+            if per_channel_text:
+                summary = (
+                    f"{summary} | {per_channel_text}" if summary else per_channel_text
+                )
+            row["r2"].setText(summary)
+            row["r2"].setToolTip(summary if per_channel_text else "")
             row["r2"].setStyleSheet(f"{self._FONT_STEP} color: {color};")
 
         # Elapsed time
@@ -497,11 +531,7 @@ class ProcedureLivePanel(QWidget):
         is_new_best: bool,
         strategy: str,
         elapsed: float = 0.0,
-        retry_r2_history: Optional[List[float]] = None,
-        channels: Optional[List[str]] = None,
-        free_params: Optional[List[str]] = None,
-        fixed_params: Optional[List[str]] = None,
-        step_label: str = "",
+        per_channel_r2: Optional[Mapping[str, Any]] = None,
     ):
         """Update the step heading R² live; show attempt detail rows only when retries occur."""
         if step_idx < 0 or step_idx >= len(self._step_rows):
@@ -518,6 +548,7 @@ class ProcedureLivePanel(QWidget):
 
         # Always update the heading R² with the current best
         display_r2 = best_r2 if best_r2 is not None else r2
+        per_channel_text = self._format_per_channel_r2(per_channel_r2)
         if display_r2 is not None:
             r2_color = (
                 "#16a34a"
@@ -526,8 +557,16 @@ class ProcedureLivePanel(QWidget):
                 if display_r2 > 0.95
                 else "#dc2626"
             )
-            row["r2"].setText(f"R\u00b2={display_r2:.6f}")
+            summary = f"R\u00b2={display_r2:.6f}"
+            if per_channel_text:
+                summary = f"{summary} | {per_channel_text}"
+            row["r2"].setText(summary)
+            row["r2"].setToolTip(summary if per_channel_text else "")
             row["r2"].setStyleSheet(f"{self._FONT_STEP_BOLD} color: {r2_color};")
+        elif per_channel_text:
+            row["r2"].setText(per_channel_text)
+            row["r2"].setToolTip(per_channel_text)
+            row["r2"].setStyleSheet(f"{self._FONT_STEP} {self._COLOR_SECONDARY}")
 
         # Show elapsed on heading
         if elapsed > 0:
@@ -542,6 +581,8 @@ class ProcedureLivePanel(QWidget):
             parts.append(strategy)
         if r2 is not None:
             parts.append(f"R\u00b2={r2:.6f}")
+        if per_channel_text:
+            parts.append(per_channel_text)
         if is_new_best and attempt > 0:
             parts.append("\u2605")
         if elapsed > 0:
@@ -660,8 +701,8 @@ class ManualFitGUI(QMainWindow):
         self.param_row_tail_spacers = []
         self._param_slider_steps = 2000
         self._param_name_width = 88
-        self._param_bound_width = 72
-        self._param_value_width = 78
+        self._param_bound_width = 88
+        self._param_value_width = 94
         self._show_plot_param_bounds = False
         self._fit_option_label_width = 64
         self._param_tail_placeholder_width = 0
@@ -738,7 +779,6 @@ class ManualFitGUI(QMainWindow):
             "TIME": "V",
         }
         self.x_channel = "TIME"
-        self.y_channel = "CH2"
         self.last_popt = None
         self.auto_fit_btn_default_text = "Auto Fit"
         self._auto_fit_run_mode = "fit"
@@ -861,7 +901,7 @@ class ManualFitGUI(QMainWindow):
         if app is not None:
             app.installEventFilter(self)
 
-        # Parameter initial values default to ParameterSpec.default (clipped to bounds).
+        # Parameter initial values default to the midpoint of each parameter range.
         self.defaults = self._default_param_values(self.param_specs)
 
         # Optimization: timer for debouncing updates
@@ -2100,8 +2140,44 @@ class ManualFitGUI(QMainWindow):
             high = float(spec.max_value)
             if low > high:
                 low, high = high, low
-            defaults.append(float(np.clip(float(spec.default), low, high)))
+            defaults.append(self._param_default_from_limits(low, high))
         return defaults
+
+    @staticmethod
+    def _param_decimals_from_limits(
+        low, high, *, sig_figs: int = 6, max_decimals: int = 12
+    ) -> int:
+        low_f = float(low)
+        high_f = float(high)
+        span = abs(high_f - low_f)
+        scale_candidates = [abs(low_f), abs(high_f), span]
+        finite_scales = [value for value in scale_candidates if np.isfinite(value)]
+        scale = max(finite_scales) if finite_scales else 0.0
+        if scale <= 0.0:
+            sig_fig_decimals: int = int(sig_figs - 1)
+        else:
+            order = int(np.floor(np.log10(scale)))
+            sig_fig_decimals = int(sig_figs - 1 - order)
+        decimals = max(2, sig_fig_decimals)
+        return int(min(max_decimals, decimals))
+
+    @staticmethod
+    def _param_step_from_limits(low, high, decimals: int) -> float:
+        precision_step = 10.0 ** (-int(decimals))
+        span = abs(float(high) - float(low))
+        if (not np.isfinite(span)) or span <= 0.0:
+            return float(precision_step)
+        span_order = int(np.floor(np.log10(span)))
+        span_step = 10.0 ** (span_order - 4)
+        return float(max(precision_step, span_step))
+
+    @staticmethod
+    def _param_default_from_limits(low, high) -> float:
+        low_f = float(low)
+        high_f = float(high)
+        if low_f > high_f:
+            low_f, high_f = high_f, low_f
+        return float(0.5 * (low_f + high_f))
 
     def _apply_param_spec_defaults_to_controls(self) -> bool:
         defaults = self._default_param_values(self.param_specs)
@@ -2154,6 +2230,8 @@ class ManualFitGUI(QMainWindow):
         *,
         minimum=None,
         maximum=None,
+        precision_min=None,
+        precision_max=None,
         width=72,
         object_name=None,
         tooltip=None,
@@ -2167,9 +2245,16 @@ class ManualFitGUI(QMainWindow):
             maximum = float(spec.max_value)
         low = float(min(minimum, maximum))
         high = float(max(minimum, maximum))
-        spinbox.setDecimals(int(spec.decimals))
+        precision_low = float(low if precision_min is None else precision_min)
+        precision_high = float(high if precision_max is None else precision_max)
+        if precision_low > precision_high:
+            precision_low, precision_high = precision_high, precision_low
+        decimals = self._param_decimals_from_limits(precision_low, precision_high)
+        spinbox.setDecimals(int(decimals))
         spinbox.setRange(low, high)
-        spinbox.setSingleStep(float(spec.inferred_step))
+        spinbox.setSingleStep(
+            self._param_step_from_limits(precision_low, precision_high, decimals)
+        )
         spinbox.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
         spinbox.setKeyboardTracking(False)
         spinbox.setAlignment(Qt.AlignmentFlag.AlignRight)
@@ -2527,12 +2612,51 @@ class ManualFitGUI(QMainWindow):
         """Return list of target channel names that are enabled for fitting."""
         multi_model: Any | None = getattr(self, "_multi_channel_model", None)
         if multi_model is None:
-            return [self.y_channel]
+            primary_target: str = self._primary_target_channel()
+            return [primary_target] if primary_target else []
         targets: List[Any] = list(multi_model.target_channels)
         enabled: List[Any] = [
             t for t in targets if self._fit_channel_enabled.get(t, True)
         ]
         return enabled if enabled else targets  # fallback: keep all if none checked
+
+    def _primary_target_channel(self) -> str:
+        """Return the current primary fit target channel."""
+        state: Any | None = getattr(self, "_fit_state", None)
+        if state is not None:
+            state_target: str = str(getattr(state, "primary_target", "") or "").strip()
+            if state_target:
+                return state_target
+
+        multi_model: Any | None = getattr(self, "_multi_channel_model", None)
+        if multi_model is not None:
+            primary_model: Any | None = getattr(multi_model, "primary", None)
+            primary_target: str = str(
+                getattr(primary_model, "target_col", "") or ""
+            ).strip()
+            if primary_target:
+                return primary_target
+            target_channels: List[str] = [
+                str(channel).strip()
+                for channel in list(getattr(multi_model, "target_channels", []) or [])
+            ]
+            target_channels = [channel for channel in target_channels if channel]
+            if target_channels:
+                return target_channels[0]
+
+        model_def: Any | None = getattr(self, "_piecewise_model", None)
+        model_target: str = str(getattr(model_def, "target_col", "") or "").strip()
+        if model_target:
+            return model_target
+
+        available_channels: List[str] = list(self._available_channel_names())
+        if not available_channels:
+            return ""
+        if self.x_channel in available_channels and len(available_channels) > 1:
+            for channel in available_channels:
+                if channel != self.x_channel:
+                    return channel
+        return str(available_channels[0]).strip()
 
     def _sync_fit_panel_top_spacing(self) -> None:
         spacer: Any | None = getattr(self, "fit_panel_top_spacer", None)
@@ -3438,27 +3562,6 @@ class ManualFitGUI(QMainWindow):
     def _ordered_param_keys(self) -> List[str]:
         return [spec.key for spec in self.param_specs]
 
-    def _infer_fit_result_target_channel(self, fit_result) -> str:
-        """Infer the most specific target channel represented by a fit result."""
-        default_target: str = str(getattr(self, "y_channel", "") or "").strip()
-        if not isinstance(fit_result, Mapping):
-            return default_target
-        channel_results = fit_result.get("channel_results")
-        if not isinstance(channel_results, Mapping) or not channel_results:
-            return default_target
-
-        channels_with_r2: List[str] = []
-        for ch_target, ch_result in channel_results.items():
-            if not isinstance(ch_result, Mapping):
-                continue
-            if finite_float_or_none(ch_result.get("r2")) is not None:
-                channels_with_r2.append(str(ch_target))
-        if len(channels_with_r2) == 1:
-            return channels_with_r2[0]
-        if len(channel_results) == 1:
-            return str(next(iter(channel_results.keys())))
-        return default_target
-
     def _channel_display_name(self, channel_name) -> str:
         key = str(channel_name)
         alias: str = str(self.channels.get(key, "")).strip()
@@ -4033,24 +4136,32 @@ class ManualFitGUI(QMainWindow):
                 low: float = high
 
         updated_specs = []
+        updated_decimals = self._param_decimals_from_limits(low, high)
         for spec in self.param_specs:
             if spec.key != key:
                 updated_specs.append(spec)
                 continue
-            clipped_default = float(np.clip(float(spec.default), low, high))
+            midpoint_default = self._param_default_from_limits(low, high)
             updated_specs.append(
                 ParameterSpec(
                     key=spec.key,
                     symbol=spec.symbol,
                     description=spec.description,
-                    default=clipped_default,
+                    default=midpoint_default,
                     min_value=float(low),
                     max_value=float(high),
-                    decimals=int(spec.decimals),
+                    decimals=int(updated_decimals),
                 )
             )
         self.param_specs = updated_specs
         self.defaults = self._default_param_values(self.param_specs)
+
+        updated_step = self._param_step_from_limits(low, high, updated_decimals)
+        for box in (min_box, max_box, value_box):
+            box.blockSignals(True)
+            box.setDecimals(int(updated_decimals))
+            box.setSingleStep(float(updated_step))
+            box.blockSignals(False)
 
         value_box.blockSignals(True)
         value_box.setMinimum(low)
@@ -4089,7 +4200,7 @@ class ManualFitGUI(QMainWindow):
             and bool(respect_enabled_channels)
         ):
             enabled_channels = self._get_enabled_fit_channels()
-            current_target: str = str(getattr(self, "y_channel", "") or "").strip()
+            current_target: str = self._primary_target_channel()
             if (
                 bool(include_current_target)
                 and current_target
@@ -4227,7 +4338,7 @@ class ManualFitGUI(QMainWindow):
                 if spec is None:
                     missing_keys.append(key_text)
                     continue
-                seed = float(spec.default)
+                seed = self._param_default_from_limits(spec.min_value, spec.max_value)
             seed_map[key_text] = _coerce_to_param_bounds(key_text, float(seed))
         if missing_keys:
             missing_text: str = ", ".join(dict.fromkeys(missing_keys))
@@ -4262,17 +4373,6 @@ class ManualFitGUI(QMainWindow):
                     )
 
         self._refresh_boundary_state_topology(preserve_existing=True)
-        n_boundaries: int = max(0, len(active_model_def.segment_exprs) - 1)
-        if single_channel_target is not None:
-            boundary_seed_raw = self._fit_state.channel_ratios(single_channel_target)
-        else:
-            boundary_seed_raw = self._fit_state.primary_ratios()
-        boundary_seed: np.ndarray[Tuple[int, ...], np.dtype[Any]] = np.asarray(
-            boundary_seed_raw, dtype=float
-        )
-        if boundary_seed.size != n_boundaries:
-            boundary_seed = default_boundary_ratios(n_boundaries)
-
         # Procedure workers consume per-channel boundary seeds for all fit modes.
         boundary_seeds_per_channel: Dict[str, np.ndarray] = {}
         if active_multi_model is not None and active_multi_model.is_multi_channel:
@@ -4292,9 +4392,14 @@ class ManualFitGUI(QMainWindow):
                 else getattr(active_model_def, "target_col", "")
             ).strip()
             if seed_target:
-                boundary_seeds_per_channel[seed_target] = np.asarray(
-                    boundary_seed, dtype=float
+                seed_count: int = max(0, len(active_model_def.segment_exprs) - 1)
+                seed_values: np.ndarray[Tuple[int], np.dtype[Any]] = np.asarray(
+                    self._fit_state.channel_ratios(seed_target),
+                    dtype=float,
                 ).reshape(-1)
+                if seed_values.size != seed_count:
+                    seed_values = default_boundary_ratios(seed_count)
+                boundary_seeds_per_channel[seed_target] = seed_values
 
         fixed_boundary_ratios, fixed_boundary_ratios_by_channel = (
             self._fixed_boundary_maps_for_fit()
@@ -4354,7 +4459,6 @@ class ManualFitGUI(QMainWindow):
             "periodic_params": periodic_by_key,
             "model_def": active_model_def,
             "multi_channel_model": active_multi_model,
-            "boundary_seed": boundary_seed,
             "boundary_seeds_per_channel": boundary_seeds_per_channel,
             "fixed_params": fit_fixed_map,
             "fixed_boundary_ratios": fixed_boundary_ratios,
@@ -4437,7 +4541,7 @@ class ManualFitGUI(QMainWindow):
             and multi_model is not None
             and multi_model.is_multi_channel
         ):
-            selected_target: str = str(getattr(self, "y_channel", "") or "").strip()
+            selected_target: str = self._primary_target_channel()
             for ch_model in multi_model.channel_models:
                 if str(ch_model.target_col) == selected_target:
                     model_def = ch_model
@@ -4931,7 +5035,7 @@ class ManualFitGUI(QMainWindow):
         if rhs_expression:
             try:
                 _target, seg_exprs = self._parse_equation_text(
-                    f"{target_col or self.y_channel} = {rhs_expression}",
+                    f"{target_col or self._primary_target_channel()} = {rhs_expression}",
                     strict=True,
                 )
                 for seg_expr in seg_exprs:
@@ -5423,6 +5527,8 @@ class ManualFitGUI(QMainWindow):
                 low,
                 minimum=-_bound_range,
                 maximum=_bound_range,
+                precision_min=low,
+                precision_max=high,
                 width=80,
                 object_name="paramBoundBox",
                 tooltip=f"Lower bound for {key}",
@@ -5437,6 +5543,8 @@ class ManualFitGUI(QMainWindow):
                 high,
                 minimum=-_bound_range,
                 maximum=_bound_range,
+                precision_min=low,
+                precision_max=high,
                 width=80,
                 object_name="paramBoundBox",
                 tooltip=f"Upper bound for {key}",
@@ -6044,7 +6152,7 @@ class ManualFitGUI(QMainWindow):
         else:
             if strict:
                 raise ValueError("Use equation form: TARGET = seg1 ; seg2 ; ... ; segN")
-            lhs_text = self.y_channel
+            lhs_text = self._primary_target_channel()
             rhs_text: str = equation
 
         if not is_valid_parameter_name(lhs_text):
@@ -6247,7 +6355,10 @@ class ManualFitGUI(QMainWindow):
             str(spec.key): spec for spec in list(new_param_specs or [])
         }
         fallback_by_key: Dict[str, float] = {
-            str(spec.key): float(spec.default) for spec in list(new_param_specs or [])
+            str(spec.key): self._param_default_from_limits(
+                spec.min_value, spec.max_value
+            )
+            for spec in list(new_param_specs or [])
         }
         remapped_rows: int = 0
         for idx, raw_row in enumerate(rows):
@@ -6323,7 +6434,6 @@ class ManualFitGUI(QMainWindow):
             existing_specs: Dict[str, ParameterSpec] = {
                 spec.key: spec for spec in self.param_specs
             }
-            current_values = self.get_current_param_map()
 
             try:
                 channel_equations = self._parse_multi_equation_text(
@@ -6332,12 +6442,11 @@ class ManualFitGUI(QMainWindow):
                 # Primary target is the first channel equation.
                 target_col = channel_equations[0][0]
                 segment_exprs = channel_equations[0][1]
-                self.y_channel = target_col
-                if self.x_channel == self.y_channel:
+                if self.x_channel == target_col:
                     available = [
                         col
                         for col in self._available_channel_names()
-                        if col != self.y_channel
+                        if col != target_col
                     ]
                     if available:
                         self.x_channel = available[0]
@@ -6364,22 +6473,20 @@ class ManualFitGUI(QMainWindow):
                     if existing is not None:
                         symbol_hint: str = existing.symbol
                         description: str = existing.description
-                        decimals: int = existing.decimals
                         min_val, max_val = bounds_map.get(
                             key, (existing.min_value, existing.max_value)
                         )
                     else:
                         symbol_hint: str = key
                         description: str = f"Parameter {key}"
-                        decimals = 6
                         min_val, max_val = -10.0, 10.0
 
                     min_val = float(min_val)
                     max_val = float(max_val)
                     if min_val > max_val:
                         min_val, max_val = max_val, min_val
-                    default_val = float(current_values.get(key, 0.0))
-                    default_val = float(np.clip(default_val, min_val, max_val))
+                    decimals = self._param_decimals_from_limits(min_val, max_val)
+                    default_val = self._param_default_from_limits(min_val, max_val)
                     new_specs.append(
                         ParameterSpec(
                             key=key,
@@ -6508,8 +6615,6 @@ class ManualFitGUI(QMainWindow):
                         fit_set(row, "params", None)
                         fit_set(row, "r2", None)
                         fit_set(row, "error", None)
-                        fit_set(row, "boundary_ratios", None)
-                        fit_set(row, "boundary_values", None)
                         fit_set(row, "channel_results", None)
                         row["plot_full"] = None
                         row["plot"] = None
@@ -6588,6 +6693,8 @@ class ManualFitGUI(QMainWindow):
             spec.min_value,
             minimum=-_bound_range,
             maximum=_bound_range,
+            precision_min=spec.min_value,
+            precision_max=spec.max_value,
             width=self._param_bound_width,
             object_name="paramBoundBox",
             tooltip="Lower bound",
@@ -6614,6 +6721,8 @@ class ManualFitGUI(QMainWindow):
             spec.max_value,
             minimum=-_bound_range,
             maximum=_bound_range,
+            precision_min=spec.min_value,
+            precision_max=spec.max_value,
             width=self._param_bound_width,
             object_name="paramBoundBox",
             tooltip="Upper bound",
@@ -6634,6 +6743,8 @@ class ManualFitGUI(QMainWindow):
             np.clip(default_val, low, high),
             minimum=low,
             maximum=high,
+            precision_min=low,
+            precision_max=high,
             width=self._param_value_width,
             object_name="paramValueBox",
             tooltip="Current value",
@@ -6853,10 +6964,11 @@ class ManualFitGUI(QMainWindow):
                 if key not in self.channel_units:
                     self.channel_units[key] = ""
 
+            primary_target: str = self._primary_target_channel()
             x_fallback: None | str = "TIME" if "TIME" in channel_columns else None
             if x_fallback is None:
                 for col in channel_columns:
-                    if col != self.y_channel:
+                    if col != primary_target:
                         x_fallback = col
                         break
                 if x_fallback is None:
@@ -6864,26 +6976,22 @@ class ManualFitGUI(QMainWindow):
             x_choice = (
                 self.x_channel if self.x_channel in channel_columns else x_fallback
             )
-            y_choice = (
-                self.y_channel
-                if self.y_channel in channel_columns
-                else ("CH2" if "CH2" in channel_columns else channel_columns[0])
-            )
-            if x_choice == y_choice and len(channel_columns) > 1:
+            if x_choice == primary_target and len(channel_columns) > 1:
                 for col in channel_columns:
-                    if col != y_choice:
+                    if col != primary_target:
                         x_choice = col
                         break
             self.x_channel = x_choice
-            self.y_channel = y_choice
             if hasattr(self, "function_input"):
                 expr_text: str = self._expression_editor_text()
                 if expr_text:
                     try:
-                        _old_target, seg_exprs = self._parse_equation_text(
+                        resolved_target, seg_exprs = self._parse_equation_text(
                             expr_text, strict=False
                         )
-                        normalized: str = f"{self.y_channel} = {' ; '.join(seg_exprs)}"
+                        normalized: str = (
+                            f"{resolved_target} = {' ; '.join(seg_exprs)}"
+                        )
                         if normalized != expr_text:
                             self.current_expression: str = normalized
                             self._set_expression_editor_text(normalized)
@@ -7035,10 +7143,16 @@ class ManualFitGUI(QMainWindow):
         if not data:
             return
         self.x_channel = str(data)
-        if self.x_channel == self.y_channel and self.current_data is not None:
+        primary_target: str = self._primary_target_channel()
+        if self.x_channel == primary_target and self.current_data is not None:
             for col in self._available_channel_names():
-                if col != self.x_channel:
-                    self.y_channel = col
+                if col != primary_target:
+                    self.x_channel = col
+                    idx: int = self.x_channel_combo.findData(self.x_channel)
+                    if idx >= 0:
+                        self.x_channel_combo.blockSignals(True)
+                        self.x_channel_combo.setCurrentIndex(idx)
+                        self.x_channel_combo.blockSignals(False)
                     break
         self._sync_breakpoint_sliders_from_state()
         self._rebuild_channel_visibility_toggles()
@@ -7548,7 +7662,8 @@ class ManualFitGUI(QMainWindow):
         model: Any | None = getattr(self, "_piecewise_model", None)
         if model is not None:
             return [model.target_col]
-        return [self.y_channel]
+        primary_target: str = self._primary_target_channel()
+        return [primary_target] if primary_target else []
 
     def _proc_available_boundary_groups(self):
         """Return boundary groups as [(name, ((target, idx), ...)), ...]."""
@@ -7594,8 +7709,6 @@ class ManualFitGUI(QMainWindow):
         return bool(
             has_nonempty_values(fit_get(row, "params"))
             or (finite_float_or_none(fit_get(row, "r2")) is not None)
-            or has_nonempty_values(fit_get(row, "boundary_ratios"))
-            or has_nonempty_values(fit_get(row, "boundary_values"))
             or bool(fit_get(row, "channel_results"))
             or bool(row.get("_procedure_result"))
         )
@@ -7835,11 +7948,6 @@ class ManualFitGUI(QMainWindow):
                 np.ndarray[Tuple[int, ...], np.dtype[Any]]
                 | np.ndarray[Tuple[int], np.dtype[Any]]
             ) = self._as_float_array(fit_get(row, "params"))
-            boundary_values: (
-                np.ndarray[Tuple[int, ...], np.dtype[Any]]
-                | np.ndarray[Tuple[int], np.dtype[Any]]
-            ) = self._as_float_array(fit_get(row, "boundary_values"))
-            row_target: str = str(row.get("y_channel") or "").strip()
             boundary_targets: Set[str] = {
                 str(item.get("target") or "").strip()
                 for item in param_columns
@@ -7860,16 +7968,11 @@ class ManualFitGUI(QMainWindow):
                 else:
                     target_col = str(item.get("target") or "").strip()
                     if target_col:
-                        if row_target and row_target == target_col:
-                            # Keep the fitted row target authoritative; legacy
-                            # channel_results payloads can contain stale copies.
-                            bv_arr = boundary_values
-                        else:
-                            bv_arr = ch_boundary_values.get(target_col)
-                            if bv_arr is None:
-                                bv_arr = np.asarray([], dtype=float)
+                        bv_arr = ch_boundary_values.get(target_col)
+                        if bv_arr is None:
+                            bv_arr = np.asarray([], dtype=float)
                     else:
-                        bv_arr = boundary_values
+                        bv_arr = np.asarray([], dtype=float)
                     value: float | None = (
                         float(bv_arr[idx])
                         if bv_arr.size > idx
@@ -9677,17 +9780,14 @@ class ManualFitGUI(QMainWindow):
             value: float = (
                 float(value_box.value())
                 if value_box is not None
-                else float(spec.default)
+                else self._param_default_from_limits(low, high)
             )
             serialized.append(
                 {
                     "key": str(spec.key),
                     "symbol": str(spec.symbol),
-                    "description": str(spec.description),
-                    "default": float(np.clip(float(spec.default), low, high)),
                     "min_value": float(low),
                     "max_value": float(high),
-                    "decimals": int(spec.decimals),
                     "value": float(np.clip(value, low, high)),
                     "fixed": bool(spec.key in manually_fixed),
                     "periodic": bool(spec.key in periodic_keys),
@@ -9711,19 +9811,11 @@ class ManualFitGUI(QMainWindow):
                 else None
             )
             captures: Dict[Any, Any] = dict(row.get("captures") or {})
-            boundary_ratios: None | List[float] = self._float_list_or_none(
-                fit_get(row, "boundary_ratios")
-            )
-            boundary_values: None | List[float] = self._float_list_or_none(
-                fit_get(row, "boundary_values")
-            )
             # Skip rows with no meaningful saved data.
             if (
                 params is None
                 and r2 is None
                 and error is None
-                and boundary_ratios is None
-                and boundary_values is None
                 and not fit_get(row, "channel_results")
             ):
                 continue
@@ -9740,14 +9832,6 @@ class ManualFitGUI(QMainWindow):
                 fit_results_payload["r2"] = r2
             if error is not None:
                 fit_results_payload["error"] = error
-            if boundary_ratios is not None:
-                fit_results_payload["boundary_ratios"] = boundary_ratios
-            if boundary_values is not None:
-                fit_results_payload["boundary_values"] = boundary_values
-            # Preserve the y_channel so boundary application knows the target.
-            row_y_channel: str = str(row.get("y_channel") or "").strip()
-            if row_y_channel:
-                entry["y_channel"] = row_y_channel
             # Serialize per-channel boundary results from channel_results.
             ch_results = fit_get(row, "channel_results")
             if isinstance(ch_results, dict) and ch_results:
@@ -9820,9 +9904,6 @@ class ManualFitGUI(QMainWindow):
 
     def _collect_fit_details_payload(self):
         self._refresh_boundary_state_topology(preserve_existing=True)
-        ratios: None | List[float] = self._float_list_or_none(
-            self._fit_state.primary_ratios()
-        )
         # Multi-channel boundary ratios (per channel).
         boundary_ratios_per_channel = {}
         multi: Any | None = getattr(self, "_multi_channel_model", None)
@@ -9840,12 +9921,11 @@ class ManualFitGUI(QMainWindow):
         batch_rows = self._serialize_fit_batch_rows()
         payload = {
             "format": "manual_fit_gui_details",
-            "version": 10,
+            "version": 15,
             "saved_at_utc": datetime.now(timezone.utc).isoformat(),
             "gui": {
                 "equation": str(getattr(self, "current_expression", "")).strip(),
                 "x_channel": str(getattr(self, "x_channel", "")).strip(),
-                "y_channel": str(getattr(self, "y_channel", "")).strip(),
                 "channel_display_names": {
                     str(key): str(self.channels.get(key, "")).strip()
                     for key in channel_keys
@@ -9876,7 +9956,6 @@ class ManualFitGUI(QMainWindow):
                         self._current_param_capture_map() or {}
                     ).items()
                 },
-                "boundary_ratios": ratios if ratios is not None else [],
                 "boundary_ratios_per_channel": boundary_ratios_per_channel,
                 "boundary_name_map": {
                     f"{t}:{i}": str(name)
@@ -10007,7 +10086,6 @@ class ManualFitGUI(QMainWindow):
                     source_index=source_index,
                     file_path=file_ref,
                     x_channel=self.x_channel,
-                    y_channel=self.y_channel,
                     captures={},
                 )
 
@@ -10027,12 +10105,6 @@ class ManualFitGUI(QMainWindow):
             row["file"] = file_ref
             row["captures"] = dict(raw_row.get("captures") or row.get("captures") or {})
             row["x_channel"] = self.x_channel
-            row["y_channel"] = self.y_channel
-            # Restore per-row y_channel early so boundary data is associated with
-            # the correct target channel.
-            saved_y: str = str(raw_row.get("y_channel") or "").strip()
-            if saved_y:
-                row["y_channel"] = saved_y
             raw_fit_results = dict(raw_row.get("fit_results") or {})
             fit_set(
                 row,
@@ -10066,24 +10138,6 @@ class ManualFitGUI(QMainWindow):
                             padded[idx] = float(value)
                     fit_set(row, "params", padded)
 
-            boundary_ratios: (
-                np.ndarray[Tuple[int, ...], np.dtype[Any]]
-                | np.ndarray[Tuple[int], np.dtype[Any]]
-            ) = self._as_float_array(raw_fit_results.get("boundary_ratios"))
-            if boundary_ratios.size > 0:
-                fit_set(row, "boundary_ratios", np.clip(boundary_ratios, 0.0, 1.0))
-            else:
-                fit_set(row, "boundary_ratios", None)
-
-            boundary_values: (
-                np.ndarray[Tuple[int, ...], np.dtype[Any]]
-                | np.ndarray[Tuple[int], np.dtype[Any]]
-            ) = self._as_float_array(raw_fit_results.get("boundary_values"))
-            if boundary_values.size > 0:
-                fit_set(row, "boundary_values", boundary_values)
-            else:
-                fit_set(row, "boundary_values", None)
-
             saved_ch_results = raw_fit_results.get("channel_results")
             if isinstance(saved_ch_results, Mapping):
                 normalized_ch_results = {}
@@ -10109,37 +10163,12 @@ class ManualFitGUI(QMainWindow):
             else:
                 fit_set(row, "channel_results", None)
 
-            # If legacy rows only saved per-channel boundaries, mirror the row target
-            # boundary ratios to top-level fields used by file-load restore.
-            row_target: str = str(row.get("y_channel") or "").strip()
-            if row_target and fit_get(row, "boundary_ratios") is None:
-                normalized_ch_results = fit_get(row, "channel_results")
-                if isinstance(normalized_ch_results, Mapping):
-                    target_entry = normalized_ch_results.get(row_target)
-                    if isinstance(target_entry, Mapping):
-                        target_ratios = self._as_float_array(
-                            target_entry.get("boundary_ratios")
-                        )
-                        if target_ratios.size > 0:
-                            fit_set(
-                                row,
-                                "boundary_ratios",
-                                np.clip(target_ratios, 0.0, 1.0),
-                            )
-                        if fit_get(row, "boundary_values") is None:
-                            target_boundaries = self._as_float_array(
-                                target_entry.get("boundaries")
-                            )
-                            if target_boundaries.size > 0:
-                                fit_set(row, "boundary_values", target_boundaries)
-
             row["plot_full"] = None
             row["plot"] = None
             row["plot_render_size"] = None
             row["plot_has_fit"] = has_nonempty_values(fit_get(row, "params"))
             has_imported_fit: bool = bool(
                 row.get("plot_has_fit")
-                or has_nonempty_values(fit_get(row, "boundary_ratios"))
                 or bool(fit_get(row, "channel_results"))
             )
             if has_imported_fit:
@@ -10155,9 +10184,6 @@ class ManualFitGUI(QMainWindow):
             row["_source_index"] = int(source_index)
             row["file"] = file_ref
             row["x_channel"] = self.x_channel
-            # Preserve fitted y_channel if available, otherwise use current.
-            if not str(row.get("y_channel") or "").strip():
-                row["y_channel"] = self.y_channel
             ordered_rows.append(row)
 
         self.batch_results = ordered_rows
@@ -10188,7 +10214,6 @@ class ManualFitGUI(QMainWindow):
 
         self._fit_details_restore_in_progress = True
         try:
-            expression_applied = False
             if expression_text:
                 self.current_expression: str = expression_text
                 self._set_expression_editor_text(expression_text)
@@ -10199,7 +10224,6 @@ class ManualFitGUI(QMainWindow):
                         f"equation={expression_text!r}"
                     )
                     raise ValueError("Failed to apply stored equation.")
-                expression_applied = True
 
             imported_params = list(payload.get("parameters") or [])
             if imported_params:
@@ -10228,24 +10252,14 @@ class ManualFitGUI(QMainWindow):
                         max_value = float(fallback.max_value)
                     if min_value > max_value:
                         min_value, max_value = max_value, min_value
-                    default_value: float | None = finite_float_or_none(
-                        entry.get("default")
+                    default_value = self._param_default_from_limits(
+                        min_value, max_value
                     )
-                    if default_value is None:
-                        default_value = float(fallback.default)
-                    default_value = float(np.clip(default_value, min_value, max_value))
-                    decimals = entry.get("decimals")
-                    try:
-                        decimals = int(decimals)
-                    except Exception:
-                        decimals = int(fallback.decimals)
-                    decimals: int = max(0, min(12, decimals))
+                    decimals = self._param_decimals_from_limits(min_value, max_value)
                     spec_by_key[key] = ParameterSpec(
                         key=key,
                         symbol=str(entry.get("symbol") or fallback.symbol),
-                        description=str(
-                            entry.get("description") or fallback.description
-                        ),
+                        description=str(fallback.description),
                         default=default_value,
                         min_value=min_value,
                         max_value=max_value,
@@ -10287,7 +10301,7 @@ class ManualFitGUI(QMainWindow):
                         max_box.setValue(float(high))
                         value: float | None = finite_float_or_none(state.get("value"))
                         if value is None:
-                            value = float(spec.default)
+                            value = self._param_default_from_limits(low, high)
                         spinbox.setValue(float(np.clip(value, low, high)))
 
             saved_channel_names = gui.get("channel_display_names")
@@ -10313,14 +10327,11 @@ class ManualFitGUI(QMainWindow):
                     self.channel_units[key] = unit_text
 
             x_channel: str = str(gui.get("x_channel") or "").strip()
-            y_channel: str = str(gui.get("y_channel") or "").strip()
             channel_names = list(self._available_channel_names())
             if x_channel in channel_names and hasattr(self, "x_channel_combo"):
                 idx: int = self.x_channel_combo.findData(x_channel)
                 if idx >= 0:
                     self.x_channel_combo.setCurrentIndex(idx)
-            if (not expression_applied) and y_channel in channel_names:
-                self.y_channel: str = y_channel
 
             self._set_auto_fit_mode(
                 gui.get("auto_fit_mode", self._auto_fit_run_mode),
@@ -10360,20 +10371,6 @@ class ManualFitGUI(QMainWindow):
             self._refresh_param_capture_mapping_controls()
 
             self._refresh_boundary_state_topology(preserve_existing=True)
-            ratio_values = fit_get(gui, "boundary_ratios")
-            if ratio_values is not None:
-                ratios: (
-                    np.ndarray[Tuple[int, ...], np.dtype[Any]]
-                    | np.ndarray[Tuple[int], np.dtype[Any]]
-                ) = self._as_float_array(ratio_values)
-                expected: int = max(
-                    0,
-                    len(self._piecewise_model.segment_exprs) - 1
-                    if self._piecewise_model is not None
-                    else 0,
-                )
-                if ratios.size == expected:
-                    self._fit_state.set_primary_ratios(np.clip(ratios, 0.0, 1.0))
 
             # Restore per-channel boundary ratios for multi-channel.
             saved_per_channel = gui.get("boundary_ratios_per_channel")
@@ -10541,7 +10538,7 @@ class ManualFitGUI(QMainWindow):
         fit_debug("fit-details: equation reset to default after load failure")
 
     def _warn_fit_details_failed(
-        self, path: Path, backup: Path | None, reason: str, exc: Exception
+        self, backup: Path | None, reason: str, exc: Exception
     ) -> None:
         """Show a warning popup when fit_details loading fails."""
         error_detail = f"{type(exc).__name__}: {exc}"
@@ -10591,9 +10588,7 @@ class ManualFitGUI(QMainWindow):
                 f"path={path} error={type(exc).__name__}: {exc}"
             )
             self._reset_to_default_equation()
-            self._warn_fit_details_failed(
-                path, backup, "Failed to read fit details", exc
-            )
+            self._warn_fit_details_failed(backup, "Failed to read fit details", exc)
             return False
         try:
             self._apply_fit_details_payload(
@@ -10609,9 +10604,7 @@ class ManualFitGUI(QMainWindow):
                 f"path={path} error={type(exc).__name__}: {exc}"
             )
             self._reset_to_default_equation()
-            self._warn_fit_details_failed(
-                path, backup, "Failed to apply fit details", exc
-            )
+            self._warn_fit_details_failed(backup, "Failed to apply fit details", exc)
             return False
 
     def _attempt_fit_details_autoload_once(self, *, reason: str = "") -> bool:
@@ -10649,42 +10642,11 @@ class ManualFitGUI(QMainWindow):
         row_params: List[float] = [
             float(params_by_key.get(key, 0.0)) for key in ordered_keys
         ]
-        result_target: str = self._infer_fit_result_target_channel(fit_result)
         row_r2: float | None = (
             float(fit_result["r2"])
             if fit_result is not None and fit_result.get("r2") is not None
             else None
         )
-        boundary_vals = (
-            fit_result.get("boundary_ratios") if isinstance(fit_result, dict) else None
-        )
-        if boundary_vals is not None:
-            try:
-                boundary_vals: np.ndarray[Tuple[int], np.dtype[Any]] = np.asarray(
-                    boundary_vals, dtype=float
-                ).reshape(-1)
-            except Exception:
-                boundary_vals = None
-        boundary_x_vals = None
-        if boundary_vals is not None:
-            try:
-                x_values = self._get_channel_data(self.x_channel)
-                n_boundaries: int = int(np.asarray(boundary_vals, dtype=float).size)
-                multi_model: Any | None = getattr(self, "_multi_channel_model", None)
-                if multi_model is not None and multi_model.is_multi_channel:
-                    for ch_model in multi_model.channel_models:
-                        if str(ch_model.target_col) == str(result_target):
-                            n_boundaries = max(0, len(ch_model.segment_exprs) - 1)
-                            break
-                elif self._piecewise_model is not None:
-                    n_boundaries = max(0, len(self._piecewise_model.segment_exprs) - 1)
-                boundary_x_vals = boundary_ratios_to_x_values(
-                    boundary_vals,
-                    x_values,
-                    n_boundaries,
-                )
-            except Exception:
-                boundary_x_vals = None
 
         row_idx: None | int = self._find_batch_result_index_by_file(file_path)
         if row_idx is None:
@@ -10707,7 +10669,6 @@ class ManualFitGUI(QMainWindow):
                 source_index=len(self.batch_results),
                 file_path=file_path,
                 x_channel=self.x_channel,
-                y_channel=result_target or self.y_channel,
                 captures=captures,
                 pattern_error=pattern_error,
             )
@@ -10718,8 +10679,6 @@ class ManualFitGUI(QMainWindow):
 
         fit_set(row, "params", list(row_params))
         fit_set(row, "r2", row_r2)
-        fit_set(row, "boundary_ratios", boundary_vals)
-        fit_set(row, "boundary_values", boundary_x_vals)
 
         # Preserve known per-channel fit quality/boundaries across subset fits.
         def _normalize_channel_results(raw_results) -> Dict[str, Dict[str, Any]]:
@@ -10754,17 +10713,6 @@ class ManualFitGUI(QMainWindow):
                 else None
             )
         )
-        if not candidate_channel_results:
-            fallback_target: str = str(result_target or self.y_channel).strip()
-            fallback_entry: Dict[str, Any] = {}
-            if row_r2 is not None:
-                fallback_entry["r2"] = float(row_r2)
-            if boundary_vals is not None:
-                fallback_entry["boundary_ratios"] = np.asarray(
-                    boundary_vals, dtype=float
-                ).reshape(-1)
-            if fallback_target and fallback_entry:
-                candidate_channel_results[fallback_target] = fallback_entry
         for target, entry in candidate_channel_results.items():
             merged_channel_results[str(target)] = dict(entry)
         fit_set(
@@ -10773,7 +10721,6 @@ class ManualFitGUI(QMainWindow):
             merged_channel_results if merged_channel_results else None,
         )
         row["x_channel"] = self.x_channel
-        row["y_channel"] = result_target or self.y_channel
         row["plot_full"] = None
         row["plot"] = None
         row["plot_render_size"] = None
@@ -10880,7 +10827,6 @@ class ManualFitGUI(QMainWindow):
             source_index=source_index,
             file_path=file_path,
             x_channel=self.x_channel,
-            y_channel=self.y_channel,
             captures=captures,
             params=fit_get(existing_row, "params") if preserve_fit_result else None,
             r2=fit_get(existing_row, "r2") if preserve_fit_result else None,
@@ -10893,18 +10839,16 @@ class ManualFitGUI(QMainWindow):
             plot_render_size=(
                 existing_plot_render_size if existing_plot_full is not None else None
             ),
-            boundary_ratios=(
-                fit_get(existing_row, "boundary_ratios")
-                if preserve_fit_result
-                else None
-            ),
-            boundary_values=(
-                fit_get(existing_row, "boundary_values")
-                if preserve_fit_result
-                else None
-            ),
             pattern_error=pattern_error,
             equation_stale=bool(existing_row.get("_equation_stale")),
+        )
+        existing_ch_results = (
+            fit_get(existing_row, "channel_results") if preserve_fit_result else None
+        )
+        fit_set(
+            row,
+            "channel_results",
+            existing_ch_results if isinstance(existing_ch_results, Mapping) else None,
         )
         return self._apply_param_range_validation_to_row(row)
 
@@ -11525,10 +11469,9 @@ class ManualFitGUI(QMainWindow):
             if hasattr(self, "x_channel")
             else "X"
         )
+        primary_target: str = self._primary_target_channel()
         self.ax.set_ylabel(
-            self._channel_axis_label(self.y_channel)
-            if hasattr(self, "y_channel")
-            else "Signal"
+            self._channel_axis_label(primary_target) if primary_target else "Signal"
         )
         if message:
             self.ax.text(
@@ -11817,60 +11760,6 @@ class ManualFitGUI(QMainWindow):
         boundary_source_targets = []
         applied_boundary_targets: Set[str] = set()
         has_any_stored_boundaries: bool = False
-        boundary_ratios = fit_get(matched_row, "boundary_ratios")
-        if (not row_is_stale) and boundary_ratios is not None:
-            try:
-                b: np.ndarray[Tuple[int], np.dtype[Any]] = np.asarray(
-                    boundary_ratios, dtype=float
-                ).reshape(-1)
-            except Exception:
-                b: np.ndarray[Tuple[int, ...], np.dtype[Any]] = np.asarray(
-                    [], dtype=float
-                )
-            if b.size > 0:
-                has_any_stored_boundaries = True
-            applied_target_boundary = False
-            row_target: str = str(matched_row.get("y_channel") or "").strip()
-            multi: Any | None = getattr(self, "_multi_channel_model", None)
-            if row_target and multi is not None and multi.is_multi_channel:
-                target_n: int = self._fit_state.channel_count(row_target)
-                if b.size == target_n:
-                    if self._fit_state.set_channel_ratios(
-                        row_target, np.clip(b, 0.0, 1.0)
-                    ):
-                        boundary_changed = True
-                    boundary_source_targets.append(row_target)
-                    applied_boundary_targets.add(row_target)
-                    applied_target_boundary = True
-                elif b.size > 0 and target_n > 0:
-                    fit_debug(
-                        "apply-batch-boundary SKIPPED (size mismatch): "
-                        f"file={file_path} "
-                        f"row_target={row_target} "
-                        f"b.size={int(b.size)} "
-                        f"expected={int(target_n)}"
-                    )
-            if not applied_target_boundary:
-                expected: int = max(
-                    0,
-                    len(self._piecewise_model.segment_exprs) - 1
-                    if self._piecewise_model is not None
-                    else 0,
-                )
-                if b.size == expected:
-                    if self._fit_state.set_primary_ratios(np.clip(b, 0.0, 1.0)):
-                        boundary_changed = True
-                    primary_target: str | None = self._fit_state.primary_target
-                    if primary_target is not None:
-                        boundary_source_targets.append(primary_target)
-                        applied_boundary_targets.add(str(primary_target))
-                elif b.size > 0 and expected > 0:
-                    fit_debug(
-                        "apply-batch-boundary SKIPPED primary (size mismatch): "
-                        f"file={file_path} "
-                        f"b.size={int(b.size)} "
-                        f"expected={int(expected)}"
-                    )
 
         # Restore per-channel boundary ratios from batch row (multi-channel).
         channel_results = fit_get(matched_row, "channel_results")
@@ -11917,7 +11806,7 @@ class ManualFitGUI(QMainWindow):
                     applied_boundary_targets.add(ch_key)
 
         # Avoid leaking boundary state from previously loaded files when this row
-        # does not carry per-channel ratios for every target (legacy fit rows).
+        # does not carry per-channel ratios for every target.
         if (
             (not row_is_stale)
             and has_any_stored_boundaries
@@ -12006,8 +11895,6 @@ class ManualFitGUI(QMainWindow):
         fit_set(row, "params", None)
         fit_set(row, "r2", None)
         fit_set(row, "error", None)
-        fit_set(row, "boundary_ratios", None)
-        fit_set(row, "boundary_values", None)
         fit_set(row, "channel_results", None)
         row["plot_full"] = None
         row["plot"] = None
@@ -12227,16 +12114,6 @@ class ManualFitGUI(QMainWindow):
         if model_def is None:
             self.on_fit_failed("No compiled piecewise model.")
             return
-        result_target: str = self._infer_fit_result_target_channel(fit_result)
-        if result_target and result_target != str(self.y_channel):
-            available_channels: List[str] = list(self._numeric_channel_columns())
-            if result_target in available_channels:
-                self.y_channel = result_target
-                if self.x_channel == self.y_channel and len(available_channels) > 1:
-                    for col in available_channels:
-                        if col != self.y_channel:
-                            self.x_channel = col
-                            break
         multi_model: Any | None = getattr(self, "_multi_channel_model", None)
         ordered_keys: List[str] = list(
             multi_model.global_param_names
@@ -12288,17 +12165,6 @@ class ManualFitGUI(QMainWindow):
                 self._last_per_channel_r2 = per_ch_r2
                 if ch_r2_parts:
                     self.stats_text.append(f"Per-channel R²: {', '.join(ch_r2_parts)}")
-        elif (
-            isinstance(fit_result, dict)
-            and fit_result.get("boundary_ratios") is not None
-        ):
-            self._fit_state.set_primary_ratios(
-                np.asarray(fit_result.get("boundary_ratios"), dtype=float),
-            )
-            self._fit_state.apply_link_groups(
-                self._boundary_links_from_map(),
-                source_target=self._fit_state.primary_target,
-            )
         self._sync_breakpoint_sliders_from_state()
 
         # Block spinbox signals while setting values to prevent intermediate
@@ -12537,7 +12403,10 @@ class ManualFitGUI(QMainWindow):
                         }
                     )
         else:
-            target = str(getattr(self._fit_state, "primary_target", "") or self.y_channel)
+            target = str(
+                getattr(self._fit_state, "primary_target", "")
+                or self._primary_target_channel()
+            )
             n_boundaries = int(self._fit_state.channel_count(target))
             if n_boundaries > 0:
                 ratios = np.asarray(self._fit_state.channel_ratios(target), dtype=float).reshape(
@@ -12602,7 +12471,8 @@ class ManualFitGUI(QMainWindow):
 
     def _prepare_plot_context(self, params):
         x_data = self._get_channel_data(self.x_channel)
-        y_data = self._get_channel_data(self.y_channel)
+        primary_target: str = self._primary_target_channel()
+        y_data = self._get_channel_data(primary_target)
         n_points: int = len(x_data)
         if n_points == 0:
             return None
@@ -12621,7 +12491,7 @@ class ManualFitGUI(QMainWindow):
 
         # Determine which channel targets are being fitted.
         multi_model: Any | None = getattr(self, "_multi_channel_model", None)
-        fit_target_channels = [self.y_channel]
+        fit_target_channels = [primary_target]
         if multi_model is not None and multi_model.is_multi_channel:
             fit_target_channels: List[Any] = list(multi_model.target_channels)
 
@@ -12913,8 +12783,12 @@ class ManualFitGUI(QMainWindow):
             if self.ax_residual is not None:
                 self.ax_residual.clear()
 
+            primary_target: str = self._primary_target_channel()
             self._plot_lines = {}
-            fit_target_channels = context.get("fit_target_channels", [self.y_channel])
+            fit_target_channels = context.get(
+                "fit_target_channels",
+                [primary_target] if primary_target else [],
+            )
             for idx, (channel_name, values) in enumerate(
                 context.get("plot_channel_displays", {}).items()
             ):
@@ -12952,13 +12826,13 @@ class ManualFitGUI(QMainWindow):
                     )
                     self._plot_lines[f"fitted_{ch_target}"] = fitted_line
                 # Expose the primary fit line under the standard key.
-                if self.y_channel in channel_fitted:
-                    primary_fit_line = self._plot_lines.get(f"fitted_{self.y_channel}")
+                if primary_target in channel_fitted:
+                    primary_fit_line = self._plot_lines.get(f"fitted_{primary_target}")
                     if primary_fit_line is not None:
                         self._plot_lines["fitted"] = primary_fit_line
             else:
                 # Single-channel: use companion colour.
-                fit_color: str = self._fit_companion_color(self.y_channel)
+                fit_color: str = self._fit_companion_color(primary_target)
                 (fitted_line,) = self.ax.plot(
                     context["x_display"],
                     series["fitted_display"],
@@ -13043,7 +12917,8 @@ class ManualFitGUI(QMainWindow):
                         )
                     )
                     r2_value: None | float = compute_r2(context["y_data"], fitted_full)
-                    per_channel_r2[self.y_channel] = r2_value
+                    if primary_target:
+                        per_channel_r2[primary_target] = r2_value
                 self._last_r2: None | float = r2_value
                 self._last_per_channel_r2 = per_channel_r2
             else:
@@ -13079,7 +12954,9 @@ class ManualFitGUI(QMainWindow):
                 ]
                 self.ax.set_ylabel(" / ".join(ch_labels))
             else:
-                self.ax.set_ylabel(self._channel_axis_label(self.y_channel))
+                self.ax.set_ylabel(
+                    self._channel_axis_label(primary_target) if primary_target else "Signal"
+                )
             x_vals: np.ndarray[Tuple[int, ...], np.dtype[Any]] = np.asarray(
                 context["x_display"], dtype=float
             )
@@ -13304,7 +13181,6 @@ class ManualFitGUI(QMainWindow):
                 source_index=source_index,
                 file_path=file_path,
                 x_channel=self.x_channel,
-                y_channel=self.y_channel,
                 captures=captures,
                 pattern_error=pattern_error,
             )
@@ -13347,6 +13223,11 @@ class ManualFitGUI(QMainWindow):
             self._stop_background_data_preload(wait_ms=120)
 
         run_mode: str = self._normalize_fit_run_mode(execution_mode)
+        single_proc_sibling_context_requested = (
+            str(kind) != "batch"
+            and run_mode == "procedure"
+            and bool(getattr(procedure, "seed_from_siblings", False))
+        )
         self._apply_fit_compute_mode_env(self._current_fit_compute_mode())
         task_id: int = self._next_fit_task_id()
         existing_idx: None | int = self._find_batch_result_index_by_file(file_path)
@@ -13376,14 +13257,25 @@ class ManualFitGUI(QMainWindow):
                         )
                     except Exception:
                         pass
-                boundary_seed: np.ndarray[Tuple[int], np.dtype[Any]] = np.asarray(
-                    fit_context.get("boundary_seed", []), dtype=float
-                ).reshape(-1)
-                if boundary_seed.size > 0:
+                seed_boundaries_by_channel = dict(
+                    fit_context.get("boundary_seeds_per_channel") or {}
+                )
+                if seed_boundaries_by_channel:
+                    seeded_channel_results: Dict[str, Dict[str, Any]] = {}
+                    for raw_target, raw_ratios in seed_boundaries_by_channel.items():
+                        target_key: str = str(raw_target).strip()
+                        if not target_key:
+                            continue
+                        ratios_arr = self._as_float_array(raw_ratios)
+                        if ratios_arr.size <= 0:
+                            continue
+                        seeded_channel_results[target_key] = {
+                            "boundary_ratios": np.clip(ratios_arr, 0.0, 1.0)
+                        }
                     fit_set(
                         overridden,
-                        "boundary_ratios",
-                        np.clip(boundary_seed, 0.0, 1.0),
+                        "channel_results",
+                        seeded_channel_results if seeded_channel_results else None,
                     )
                 existing_row = overridden
         needs_fit_condition_invalidation = True
@@ -13409,11 +13301,26 @@ class ManualFitGUI(QMainWindow):
                     existing_row
                 )
         else:
-            # Manual/single-file runs do not use cross-file sibling seeding.
-            # Avoid copying every batch row here because that can be expensive
-            # and delays cancellation before the worker starts.
-            existing_rows_by_file = {}
-            needs_fit_condition_invalidation = False
+            # Manual/single-file runs normally avoid copying the full batch table
+            # for responsiveness.  When a single procedure explicitly enables
+            # sibling seeding, include the current batch table so capture-matched
+            # siblings are available to the worker.
+            if single_proc_sibling_context_requested:
+                existing_rows_by_file = {
+                    str(row.get("file")): canonicalize_fit_row(row)
+                    for row in list(self.batch_results or [])
+                    if row.get("file")
+                }
+                needs_fit_condition_invalidation = False
+                fit_debug(
+                    "fit-task sibling context: "
+                    "enabled for single procedure run "
+                    f"rows={len(existing_rows_by_file)} "
+                    f"file={file_path}"
+                )
+            else:
+                existing_rows_by_file = {}
+                needs_fit_condition_invalidation = False
             if existing_row:
                 existing_rows_by_file[str(file_path)] = canonicalize_fit_row(
                     existing_row
@@ -13492,19 +13399,25 @@ class ManualFitGUI(QMainWindow):
                 proc, _ = self._current_procedure_for_run()
             if proc is None:
                 raise ValueError("No procedure steps defined.")
-            # Manual/single-file runs should honour current GUI seeds.
-            # Keep sibling-seed reuse for batch runs only.
+            # If procedure sibling-seeding is enabled and this is a non-batch
+            # run, ensure we have a sibling context even when the caller did not
+            # pre-populate one.
             if str(kind) != "batch" and bool(getattr(proc, "seed_from_siblings", False)):
-                from procedure import FitProcedure
-
-                proc = FitProcedure(
-                    name=str(getattr(proc, "name", "") or "Procedure"),
-                    steps=tuple(getattr(proc, "steps", ()) or ()),
-                    seed_from_siblings=False,
-                )
+                if len(existing_rows_by_file) <= 1:
+                    existing_rows_by_file = {
+                        str(row.get("file")): canonicalize_fit_row(row)
+                        for row in list(self.batch_results or [])
+                        if row.get("file")
+                    }
+                    if existing_row:
+                        existing_rows_by_file[str(file_path)] = canonicalize_fit_row(
+                            existing_row
+                        )
                 fit_debug(
-                    "fit-task procedure override: "
-                    "disabled seed_from_siblings for non-batch run"
+                    "fit-task sibling context: "
+                    "single procedure seed_from_siblings enabled "
+                    f"rows={len(existing_rows_by_file)} "
+                    f"file={file_path}"
                 )
 
             if isinstance(batch_procedure_capture_map, Mapping):
@@ -13577,6 +13490,12 @@ class ManualFitGUI(QMainWindow):
         if proc_multi_model is None:
             raise ValueError("No compiled model available for fit.")
 
+        use_existing_fit_seed = str(kind) == "batch" or (
+            run_mode == "procedure"
+            and str(kind) != "batch"
+            and bool(getattr(proc, "seed_from_siblings", False))
+        )
+
         descriptor = {
             "worker_kind": "procedure_batch",
             "worker_args": {
@@ -13599,9 +13518,7 @@ class ManualFitGUI(QMainWindow):
                     self._proc_available_boundary_groups() or []
                 ),
                 "existing_rows_by_file": existing_rows_by_file,
-                # Single-file/manual auto-fit should start from current GUI values.
-                # Keep sibling-seed reuse only for batch runs.
-                "use_existing_fit_seed": str(kind) == "batch",
+                "use_existing_fit_seed": bool(use_existing_fit_seed),
             },
         }
 
@@ -13730,7 +13647,7 @@ class ManualFitGUI(QMainWindow):
         self._refresh_batch_controls()
         return int(task_id)
 
-    def _on_fit_task_progress(self, task_id, completed, total, row) -> None:
+    def _on_fit_task_progress(self, task_id, _completed, _total, row) -> None:
         task = self.fit_tasks.get(int(task_id))
         if task is None:
             return
@@ -13878,11 +13795,7 @@ class ManualFitGUI(QMainWindow):
             is_new_best=is_new_best,
             strategy=strategy,
             elapsed=float(info.get("elapsed", 0) or 0),
-            retry_r2_history=info.get("retry_r2_history"),
-            channels=info.get("channels"),
-            free_params=info.get("free_params"),
-            fixed_params=info.get("fixed_params"),
-            step_label=str(info.get("step_label", "") or ""),
+            per_channel_r2=info.get("per_channel_r2"),
         )
 
         # Apply this attempt's params to the plot — only for the current file.
@@ -14217,7 +14130,7 @@ class ManualFitGUI(QMainWindow):
                     panel.record_external_procedure_cancelled(file_label=file_name)
         self._finish_fit_task(int(task_id))
 
-    def _finish_fit_task(self, task_id, *, force_terminate=False) -> None:
+    def _finish_fit_task(self, task_id) -> None:
         task = self.fit_tasks.pop(int(task_id), None)
         if task is None:
             return
@@ -14607,7 +14520,7 @@ class ManualFitGUI(QMainWindow):
                     _fit_status="Cancelled",
                     _fit_task_id=None,
                 )
-            self._finish_fit_task(int(task_id), force_terminate=True)
+            self._finish_fit_task(int(task_id))
         self._cancel_unscheduled_batch_rows()
         remaining = sum(
             1 for t in self.fit_tasks.values() if str(t.get("kind")) == "batch"
@@ -14790,11 +14703,6 @@ class ManualFitGUI(QMainWindow):
                 np.ndarray[Tuple[int, ...], np.dtype[Any]]
                 | np.ndarray[Tuple[int], np.dtype[Any]]
             ) = self._as_float_array(fit_get(row, "params"))
-            boundary_values: (
-                np.ndarray[Tuple[int, ...], np.dtype[Any]]
-                | np.ndarray[Tuple[int], np.dtype[Any]]
-            ) = self._as_float_array(fit_get(row, "boundary_values"))
-            row_target: str = str(row.get("y_channel") or "").strip()
             # Build per-channel boundary-value lookup from channel_results.
             ch_results_raw = fit_get(row, "channel_results")
             ch_boundary_values: Dict[str, np.ndarray] = {}
@@ -14821,14 +14729,11 @@ class ManualFitGUI(QMainWindow):
                     target_col = item.get("target")
                     if target_col:
                         target_key: str = str(target_col)
-                        if row_target and row_target == target_key:
-                            bv_arr = boundary_values
-                        else:
-                            bv_arr = ch_boundary_values.get(target_key)
-                            if bv_arr is None:
-                                bv_arr = np.asarray([], dtype=float)
+                        bv_arr = ch_boundary_values.get(target_key)
+                        if bv_arr is None:
+                            bv_arr = np.asarray([], dtype=float)
                     else:
-                        bv_arr = boundary_values
+                        bv_arr = np.asarray([], dtype=float)
                     value: float | None = (
                         float(bv_arr[idx]) if bv_arr.size > idx else None
                     )
@@ -15097,7 +15002,7 @@ class ManualFitGUI(QMainWindow):
         self.thumb_render_in_progress = False
         self._pending_thumbnail_rows.clear()
 
-    def _on_thumbnail_rendered(self, idx, total, row_idx) -> None:
+    def _on_thumbnail_rendered(self, _idx, _total, row_idx) -> None:
         """Update table cell when thumbnail is rendered."""
         if row_idx < len(self.batch_results):
             row = self.batch_results[row_idx]
@@ -15205,7 +15110,6 @@ class ManualFitGUI(QMainWindow):
             for source_index, row in enumerate(self.batch_results):
                 row["_source_index"] = source_index
                 row["x_channel"] = self.x_channel
-                row["y_channel"] = self.y_channel
                 extracted: Dict[str, str] | None = extract_captures(
                     stem_for_file_ref(row["file"]),
                     capture_config.regex,

@@ -995,6 +995,7 @@ def _execute_fit_step(step: FitStep, context: ProcedureContext) -> StepResult:
             return
         attempt_params = dict(result.get("params_by_key") or {})
         attempt_boundary_ratios_out: Dict[str, Any] = {}
+        attempt_per_channel_r2: Dict[str, Optional[float]] = {}
         ch_res = result.get("channel_results")
         if isinstance(ch_res, Mapping):
             for ch_t, ch_r in ch_res.items():
@@ -1005,6 +1006,14 @@ def _execute_fit_step(step: FitStep, context: ProcedureContext) -> StepResult:
                     attempt_boundary_ratios_out[str(ch_t)] = (
                         np.asarray(br, dtype=float).reshape(-1).tolist()
                     )
+                ch_r2 = ch_r.get("r2")
+                if ch_r2 is not None:
+                    try:
+                        val = float(ch_r2)
+                    except Exception:
+                        val = None
+                    if val is not None and np.isfinite(val):
+                        attempt_per_channel_r2[str(ch_t)] = float(val)
         elif result.get("boundary_ratios") is not None and len(enabled_models) == 1:
             ch_t = str(enabled_models[0].target_col)
             attempt_boundary_ratios_out[ch_t] = (
@@ -1028,6 +1037,7 @@ def _execute_fit_step(step: FitStep, context: ProcedureContext) -> StepResult:
                     "step_label": step_label,
                     "params_by_key": attempt_params,
                     "boundary_ratios": attempt_boundary_ratios_out,
+                    "per_channel_r2": dict(attempt_per_channel_r2),
                     "channels": list(sorted(enabled_targets)),
                     "free_params": list(step_free_for_log),
                     "fixed_params": list(step_fixed_filtered.keys()),

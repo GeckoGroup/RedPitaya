@@ -312,7 +312,6 @@ def make_batch_result_row(
     source_index,
     file_path,
     x_channel,
-    y_channel,
     captures=None,
     params=None,
     r2=None,
@@ -321,8 +320,6 @@ def make_batch_result_row(
     plot=None,
     plot_has_fit=None,
     plot_render_size=None,
-    boundary_ratios=None,
-    boundary_values=None,
     pattern_error=None,
     equation_stale=False,
     fit_status=None,
@@ -335,7 +332,6 @@ def make_batch_result_row(
         "file": file_path,
         "captures": dict(captures or {}),
         "x_channel": x_channel,
-        "y_channel": y_channel,
         "plot_full": plot_full,
         "plot": plot,
         "plot_has_fit": plot_has_fit,
@@ -352,8 +348,6 @@ def make_batch_result_row(
     fit_set(row, "params", params)
     fit_set(row, "r2", r2)
     fit_set(row, "error", error)
-    fit_set(row, "boundary_ratios", boundary_ratios)
-    fit_set(row, "boundary_values", boundary_values)
     fit_set(row, "channel_results", None)
     return row
 
@@ -368,8 +362,35 @@ def render_batch_thumbnail(
     """Render a row thumbnail pixmap, including all channels and fitted curve."""
     try:
         data = read_measurement_csv(row["file"])
-        x_col = row.get("x_channel") or data.columns[0]
-        y_col = row.get("y_channel") or data.columns[1]
+        column_lookup: Dict[str, Any] = {}
+        for col in data.columns:
+            key = str(col).strip()
+            if key and key not in column_lookup:
+                column_lookup[key] = col
+        if not column_lookup:
+            raise ValueError("No usable columns found in data.")
+
+        x_key: str = str(row.get("x_channel") or "").strip()
+        if x_key not in column_lookup:
+            x_key = next(iter(column_lookup.keys()))
+        x_col = column_lookup[x_key]
+
+        y_key: str = ""
+        ch_results = fit_get(row, "channel_results")
+        if isinstance(ch_results, Mapping):
+            for raw_target in ch_results.keys():
+                candidate = str(raw_target).strip()
+                if candidate in column_lookup and candidate != x_key:
+                    y_key = candidate
+                    break
+        if not y_key:
+            for candidate in column_lookup.keys():
+                if candidate != x_key:
+                    y_key = candidate
+                    break
+        if not y_key:
+            y_key = x_key
+        y_col = column_lookup[y_key]
 
         x_data = data[x_col].to_numpy(dtype=float, copy=True)
         y_data = data[y_col].to_numpy(dtype=float, copy=True)
@@ -411,8 +432,8 @@ def render_batch_thumbnail(
         fig.subplots_adjust(left=0.08, right=0.98, top=0.92, bottom=0.16)
         ax = fig.add_subplot(111)
         plot_channel_names = []
-        if y_col in column_data:
-            plot_channel_names.append(str(y_col))
+        if y_key in column_data:
+            plot_channel_names.append(str(y_key))
         for column in data.columns:
             key = str(column).strip()
             if (
@@ -428,7 +449,7 @@ def render_batch_thumbnail(
             channel_values = np.asarray(column_data[channel_name], dtype=float)
             if channel_values.size != x_data.size:
                 continue
-            is_target = str(channel_name) == str(y_col)
+            is_target = str(channel_name) == str(y_key)
             ax.plot(
                 x_data,
                 channel_values,
@@ -446,11 +467,32 @@ def render_batch_thumbnail(
         else:
             params_arr = np.asarray([], dtype=float)
         if params_arr.size > 0:
+            render_boundary_ratios = None
+            ch_results = fit_get(row, "channel_results")
+            if isinstance(ch_results, Mapping):
+                ch_entry = ch_results.get(y_key)
+                if not isinstance(ch_entry, Mapping):
+                    y_key_norm: str = str(y_key).strip()
+                    for raw_target, raw_entry in ch_results.items():
+                        if str(raw_target).strip() == y_key_norm and isinstance(
+                            raw_entry, Mapping
+                        ):
+                            ch_entry = raw_entry
+                            break
+                if isinstance(ch_entry, Mapping):
+                    raw_ratios = ch_entry.get("boundary_ratios")
+                    if raw_ratios is not None:
+                        try:
+                            render_boundary_ratios = np.asarray(
+                                raw_ratios, dtype=float
+                            ).reshape(-1)
+                        except Exception:
+                            render_boundary_ratios = None
             fitted_y = model_func(
                 x_data,
                 *params_arr.tolist(),
                 column_data=column_data,
-                boundary_ratios=fit_get(row, "boundary_ratios"),
+                boundary_ratios=render_boundary_ratios,
             )
             ax.plot(x_data, fitted_y, linewidth=1.25, color=FIT_CURVE_COLOR)
 
@@ -533,17 +575,6 @@ def _row_to_sibling_result(
                         ).reshape(-1)
                     except Exception:
                         pass
-    if not boundary_ratios_by_channel:
-        br = fit_get(row, "boundary_ratios")
-        if br is not None:
-            y_ch = str(row.get("y_channel") or "").strip()
-            if y_ch:
-                try:
-                    boundary_ratios_by_channel[y_ch] = np.asarray(
-                        br, dtype=float
-                    ).reshape(-1)
-                except Exception:
-                    pass
 
     return {
         "captures": captures,
@@ -556,7 +587,6 @@ def _row_to_sibling_result(
 def _result_to_sibling(
     captures: Mapping[str, Any],
     result: Mapping[str, Any],
-    multi_channel_model: Any,
 ) -> Dict[str, Any]:
     """Convert a procedure pipeline result to the normalised sibling-result dict."""
     params_by_key = dict(result.get("params_by_key") or {})
@@ -1067,7 +1097,10 @@ class BatchProcedureFitWorker(QObject):
         )
         if sibling_prep_enabled and existing_rows_by_file:
             for file_key, row in dict(existing_rows_by_file).items():
-                sibling = _row_to_sibling_result(row, self.ordered_param_keys)
+                sibling = _row_to_sibling_result(
+                    row,
+                    self.ordered_param_keys,
+                )
                 if sibling is not None:
                     self._sibling_results[str(file_key)] = sibling
                 else:
@@ -1152,7 +1185,6 @@ class BatchProcedureFitWorker(QObject):
                 source_index,
                 file_path,
                 self.x_channel,
-                "",
                 pattern_error=_BATCH_PATTERN_MISMATCH_ERROR,
             )
 
@@ -1166,7 +1198,6 @@ class BatchProcedureFitWorker(QObject):
                 source_index,
                 file_path,
                 self.x_channel,
-                "",
                 captures=captures,
                 error=error,
             )
@@ -1179,7 +1210,6 @@ class BatchProcedureFitWorker(QObject):
                 source_index,
                 file_path,
                 self.x_channel,
-                "",
                 captures=captures,
                 error=str(exc),
             )
@@ -1188,13 +1218,9 @@ class BatchProcedureFitWorker(QObject):
                 source_index,
                 file_path,
                 self.x_channel,
-                "",
                 captures=captures,
                 error="Failed to load data.",
             )
-
-        # Determine primary target channel.
-        primary_target = self.multi_channel_model.primary.target_col
 
         # --- Cross-file seeding: override seed_map from best sibling ---
         file_seed_map = dict(self.seed_map)
@@ -1418,7 +1444,6 @@ class BatchProcedureFitWorker(QObject):
                 source_index,
                 file_path,
                 self.x_channel,
-                primary_target,
                 captures=captures,
                 error=str(exc),
             )
@@ -1431,8 +1456,6 @@ class BatchProcedureFitWorker(QObject):
         )
 
         r2 = result.get("r2")
-        boundary_ratios = None
-        boundary_values = None
         ch_results_raw = result.get("channel_results") or {}
         ch_results: Dict[str, Dict[str, Any]] = {}
         if isinstance(ch_results_raw, Mapping):
@@ -1466,44 +1489,14 @@ class BatchProcedureFitWorker(QObject):
                     entry["r2"] = float(raw_r2)
                 if entry:
                     ch_results[str(raw_target)] = entry
-        if primary_target in ch_results:
-            ch_r = ch_results[primary_target]
-            br = ch_r.get("boundary_ratios")
-            if br is not None:
-                boundary_ratios = np.asarray(br, dtype=float).reshape(-1)
-                n_boundaries = max(
-                    0,
-                    len(
-                        getattr(
-                            getattr(self.multi_channel_model, "primary", None),
-                            "segment_exprs",
-                            (),
-                        )
-                        or ()
-                    )
-                    - 1,
-                )
-                if n_boundaries <= 0:
-                    n_boundaries = int(boundary_ratios.size)
-                try:
-                    boundary_values = boundary_ratios_to_x_values(
-                        boundary_ratios,
-                        x_data,
-                        n_boundaries,
-                    )
-                except Exception:
-                    pass
 
         row = make_batch_result_row(
             source_index,
             file_path,
             self.x_channel,
-            primary_target,
             captures=captures,
             params=param_array,
             r2=r2,
-            boundary_ratios=boundary_ratios,
-            boundary_values=boundary_values,
         )
         if ch_results:
             fit_set(row, "channel_results", ch_results)
@@ -1516,7 +1509,7 @@ class BatchProcedureFitWorker(QObject):
         # --- Write-back: make this result available as a sibling for subsequent
         # files in the same batch run. ---
         if not _row_has_error(row):
-            sibling = _result_to_sibling(captures, result, self.multi_channel_model)
+            sibling = _result_to_sibling(captures, result)
             self._sibling_results[file_key] = sibling
 
         return row

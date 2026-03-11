@@ -10,8 +10,6 @@ FIT_RESULT_KEYS = (
     "params",
     "r2",
     "error",
-    "boundary_ratios",
-    "boundary_values",
     "channel_results",
 )
 _FIT_RESULT_KEY_SET = set(FIT_RESULT_KEYS)

@@ -192,6 +192,10 @@ def step_done(
     message: str = "",
 ) -> None:
     parts = [_status_icon(status)]
+    if r2 is not None:
+        parts.append(_r2(r2))
+    if retries_used > 0:
+        parts.append(_dim(f"retries={int(retries_used)}"))
     if elapsed > 0:
         parts.append(_t(elapsed))
     if message:
