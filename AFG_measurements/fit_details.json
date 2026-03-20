@@ -1,7 +1,7 @@
 {
   "format": "manual_fit_gui_details",
   "version": 15,
-  "saved_at_utc": "2026-03-11T13:57:19.134454+00:00",
+  "saved_at_utc": "2026-03-11T14:45:09.963896+00:00",
   "gui": {
     "equation": "CH2 = V_0 ; abs(A_MI*sin(A_mod*sin(2*pi*f_mod*x+pi*(phi + phi_delta))+pi*phi_MI))**2+V_MI0 ; V_0\nCH3 = V_off ; V_on*sin(2*pi*f_mod*x+pi*phi) ; V_off\nCH4 = TTL_0 ; TTL_1",
     "x_channel": "TIME",
@@ -43,15 +43,15 @@
     },
     "boundary_ratios_per_channel": {
       "CH2": [
-        0.10781210405217138,
-        0.7207236473078067
+        0.26192700178020795,
+        0.498525072540866
       ],
       "CH3": [
-        0.10967544995825299,
-        0.7201387901570739
+        0.2623988652685544,
+        0.49852008066148523
       ],
       "CH4": [
-        0.10781210405217138
+        0.26196745770337015
       ]
     },
     "boundary_name_map": {
@@ -69,7 +69,7 @@
     "manually_fixed_params": [],
     "main_splitter_sizes": [
       508,
-      432
+      229
     ],
     "param_fit_splitter_sizes": [
       812,
@@ -459,7 +459,7 @@
       "symbol": "V_{0}",
       "min_value": 0.0,
       "max_value": 10.0,
-      "value": 2.089,
+      "value": 3.7618,
       "fixed": false,
       "periodic": false
     },
@@ -468,7 +468,7 @@
       "symbol": "A_{MI}",
       "min_value": 0.0,
       "max_value": 10.0,
-      "value": 2.0451,
+      "value": 1.9685,
       "fixed": false,
       "periodic": false
     },
@@ -477,7 +477,7 @@
       "symbol": "A_{mod}",
       "min_value": 0.0,
       "max_value": 10.0,
-      "value": 0.8371,
+      "value": 0.9839,
       "fixed": false,
       "periodic": false
     },
@@ -486,7 +486,7 @@
       "symbol": "f_{mod}",
       "min_value": 0.0,
       "max_value": 1100000.0,
-      "value": 233949.58,
+      "value": 101982.22,
       "fixed": false,
       "periodic": false
     },
@@ -495,7 +495,7 @@
       "symbol": "\\phi",
       "min_value": 0.0,
       "max_value": 2.0,
-      "value": 0.87143,
+      "value": 0.59699,
       "fixed": false,
       "periodic": true
     },
@@ -504,7 +504,7 @@
       "symbol": "\\phi_{delta}",
       "min_value": -0.5,
       "max_value": 0.0,
-      "value": -0.188173,
+      "value": -0.085176,
       "fixed": false,
       "periodic": true
     },
@@ -513,7 +513,7 @@
       "symbol": "\\phi_{MI}",
       "min_value": 0.0,
       "max_value": 2.0,
-      "value": 0.15155,
+      "value": 1.70724,
       "fixed": false,
       "periodic": true
     },
@@ -522,7 +522,7 @@
       "symbol": "V_{MI0}",
       "min_value": 0.0,
       "max_value": 7.0,
-      "value": 1.2298,
+      "value": 1.28634,
       "fixed": false,
       "periodic": false
     },
@@ -531,7 +531,7 @@
       "symbol": "V_{off}",
       "min_value": -1.0,
       "max_value": 1.0,
-      "value": -0.01125,
+      "value": -0.01664,
       "fixed": false,
       "periodic": false
     },
@@ -540,7 +540,7 @@
       "symbol": "V_{on}",
       "min_value": 3.0,
       "max_value": 8.0,
-      "value": 5.11693,
+      "value": 5.08512,
       "fixed": false,
       "periodic": false
     },
@@ -549,7 +549,7 @@
       "symbol": "TTL_{0}",
       "min_value": -1.0,
       "max_value": 1.0,
-      "value": 0.08522,
+      "value": 0.12253,
       "fixed": false,
       "periodic": false
     },
@@ -558,7 +558,7 @@
       "symbol": "TTL_{1}",
       "min_value": 4.0,
       "max_value": 6.0,
-      "value": 4.15539,
+      "value": 4.16487,
       "fixed": false,
       "periodic": false
     }

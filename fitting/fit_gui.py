@@ -14,7 +14,7 @@ import time
 import warnings
 from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Literal, Optional, Self, Sequence, Set, Tuple
+from typing import Any, Dict, List, Literal, Optional, Sequence, Set, Tuple
 
 from matplotlib.gridspec import GridSpec
 import numpy as np
@@ -7573,7 +7573,7 @@ class ManualFitGUI(QMainWindow):
 
     def _make_procedure_host(self) -> ProcedureHost:
         """Create a ProcedureHost adapter that delegates to this GUI."""
-        gui: Self = self
+        gui = self
 
         class _Host(ProcedureHost):
             def proc_available_params(self) -> List[Any] | List[str]:
