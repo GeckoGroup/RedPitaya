@@ -1,0 +1,541 @@
+{
+  "format": "manual_fit_gui_details",
+  "version": 15,
+  "saved_at_utc": "2026-03-20T16:00:54.630173+00:00",
+  "gui": {
+    "equation": "CH2 = V_0 ; abs(A_MI*sin(A_mod*sin(2*pi*f_mod*x+pi*(phi + phi_delta))+pi*phi_MI))**2+V_MI0 ; V_0\nCH3 = V_off ; V_on*sin(2*pi*f_mod*x+pi*phi) ; V_off\nCH4 = TTL_0 ; TTL_1 ; TTL_0",
+    "x_channel": "TIME",
+    "channel_display_names": {
+      "TIME": "Time",
+      "CH2": "MI output",
+      "CH3": "Sig Gen",
+      "CH4": "Trigger"
+    },
+    "channel_units": {
+      "TIME": "s",
+      "CH2": "V",
+      "CH3": "V",
+      "CH4": "V"
+    },
+    "auto_fit_mode": "procedure",
+    "batch_fit_mode": "procedure",
+    "fit_compute_mode": "cpu",
+    "smoothing_enabled": false,
+    "smoothing_window": 101,
+    "capture_pattern": "{freq}Hz_SINE_Red Pitaya{id=0|_v}",
+    "capture_to_param": {
+      "freq": "f_mod",
+      "id": null
+    },
+    "param_to_capture": {
+      "V_0": null,
+      "A_MI": null,
+      "A_mod": null,
+      "f_mod": "freq",
+      "phi": null,
+      "phi_delta": null,
+      "phi_MI": null,
+      "V_MI0": null,
+      "V_off": null,
+      "V_on": null,
+      "TTL_0": null,
+      "TTL_1": null
+    },
+    "boundary_ratios_per_channel": {
+      "CH2": [
+        0.09511073449590007,
+        0.49628238679591963
+      ],
+      "CH3": [
+        0.09507842651976389,
+        0.4963658413380693
+      ],
+      "CH4": [
+        0.09511073449590007,
+        0.49628238679591963
+      ]
+    },
+    "boundary_name_map": {
+      "CH2:0": "X\u2080",
+      "CH2:1": "X\u2081",
+      "CH4:0": "X\u2080\u2082",
+      "CH3:0": "X\u2080\u2081",
+      "CH3:1": "X\u2081\u2081",
+      "CH4:1": "X\u2081\u2082"
+    },
+    "fixed_boundary_ids": [
+      "CH2:0",
+      "CH2:1",
+      "CH3:0",
+      "CH4:0"
+    ],
+    "manually_fixed_params": [],
+    "main_splitter_sizes": [
+      508,
+      469
+    ],
+    "param_fit_splitter_sizes": [
+      1532,
+      340
+    ],
+    "analysis_state": {
+      "x_field": "freq",
+      "selected_params": [
+        "A_mod",
+        "phi_delta"
+      ],
+      "mode": "separate",
+      "show_points": true,
+      "show_series_line": false,
+      "show_fit_lines": false,
+      "show_legend": true,
+      "log_x": true,
+      "math_enabled": false,
+      "math_left": "CH4:X_1",
+      "math_op": "-",
+      "math_right": "CH2:X_1"
+    },
+    "procedure": {
+      "name": "Procedure",
+      "steps": [
+        {
+          "step_type": "fit",
+          "channels": [
+            "CH4"
+          ],
+          "min_r2": 0.98,
+          "max_retries": 3,
+          "on_fail": "continue"
+        },
+        {
+          "step_type": "set_boundaries",
+          "assignments": [
+            {
+              "target_name": "X\u2080",
+              "source_kind": "boundary",
+              "source_name": "X\u2080\u2082",
+              "expression": "",
+              "on_missing": "fail"
+            },
+            {
+              "target_name": "X\u2080\u2081",
+              "source_kind": "boundary",
+              "source_name": "X\u2080\u2082",
+              "expression": "",
+              "on_missing": "fail"
+            },
+            {
+              "target_name": "X\u2081",
+              "source_kind": "boundary",
+              "source_name": "X\u2081\u2082",
+              "expression": "",
+              "on_missing": "fail"
+            },
+            {
+              "target_name": "X\u2081\u2081",
+              "source_kind": "boundary",
+              "source_name": "X\u2081\u2082",
+              "expression": "",
+              "on_missing": "fail"
+            }
+          ]
+        },
+        {
+          "step_type": "fit",
+          "channels": [
+            "CH3"
+          ],
+          "bound_params": {
+            "f_mod": "freq"
+          },
+          "min_r2": 0.95,
+          "max_retries": 5,
+          "locked_boundary_names": [
+            "X\u2080\u2081",
+            "X\u2081\u2081"
+          ],
+          "on_fail": "continue"
+        },
+        {
+          "step_type": "fit",
+          "channels": [
+            "CH2"
+          ],
+          "free_params": [
+            "A_MI",
+            "A_mod",
+            "TTL_0",
+            "TTL_1",
+            "V_0",
+            "V_MI0",
+            "V_off",
+            "V_on",
+            "phi_MI",
+            "phi_delta"
+          ],
+          "fixed_params": [
+            "f_mod",
+            "phi"
+          ],
+          "min_r2": 0.99,
+          "max_retries": 10,
+          "retry_scale": 0.2,
+          "locked_boundary_names": [
+            "X\u2080",
+            "X\u2081"
+          ],
+          "on_fail": "continue"
+        },
+        {
+          "step_type": "fit",
+          "channels": [],
+          "min_r2": 0.999,
+          "max_retries": 3,
+          "on_fail": "continue"
+        }
+      ],
+      "seed_from_siblings": true,
+      "last_step_results": [
+        {
+          "boundary_ratios": {
+            "CH4": [
+              0.09511073449590007,
+              0.4962823867959197
+            ]
+          },
+          "channels": [
+            "CH4"
+          ],
+          "fixed_params": [],
+          "free_params": [
+            "TTL_0",
+            "TTL_1"
+          ],
+          "label": "R\u00b2=0.999802",
+          "message": "R\u00b2=0.999802",
+          "params_by_key": {
+            "TTL_0": 0.1341928159301535,
+            "TTL_1": 4.170185696700143
+          },
+          "per_channel_r2": null,
+          "r2": 0.9998018840788624,
+          "retries_used": 0,
+          "retry_r2_history": [
+            0.9998018840788624
+          ],
+          "status": "pass",
+          "step_index": 0,
+          "step_type": "fit"
+        },
+        {
+          "boundary_ratios": {
+            "CH2": [
+              0.09511073449590007,
+              0.4962823867959197
+            ],
+            "CH3": [
+              0.09511073449590007,
+              0.4962823867959197
+            ]
+          },
+          "channels": [],
+          "fixed_params": [],
+          "free_params": [],
+          "label": "Set 4 boundary group(s).",
+          "message": "Set 4 boundary group(s).",
+          "params_by_key": {
+            "A_MI": 4.071,
+            "A_mod": 1.675,
+            "TTL_0": 0.1341928159301535,
+            "TTL_1": 4.170185696700143,
+            "V_0": 3.97,
+            "V_MI0": 0.50696,
+            "V_off": 0.0071887180293286335,
+            "V_on": 3.941938591680253,
+            "f_mod": 1669.6762014700714,
+            "phi": 1.6558996717379566,
+            "phi_MI": 1.50361,
+            "phi_delta": -1.5e-05
+          },
+          "per_channel_r2": null,
+          "r2": null,
+          "retries_used": 0,
+          "retry_r2_history": [],
+          "status": "pass",
+          "step_index": 1,
+          "step_type": "set_boundaries"
+        },
+        {
+          "boundary_ratios": {
+            "CH3": [
+              0.09511073449590007,
+              0.4962823867959197
+            ]
+          },
+          "channels": [
+            "CH3"
+          ],
+          "fixed_params": [],
+          "free_params": [
+            "phi",
+            "f_mod",
+            "V_on",
+            "V_off"
+          ],
+          "label": "R\u00b2=0.999629",
+          "message": "R\u00b2=0.999629",
+          "params_by_key": {
+            "V_off": 0.007898901794913484,
+            "V_on": 3.935782605854603,
+            "f_mod": 1669.5198206514262,
+            "phi": 1.6583001499867032
+          },
+          "per_channel_r2": null,
+          "r2": 0.9996287061654042,
+          "retries_used": 0,
+          "retry_r2_history": [
+            0.9996287061654042
+          ],
+          "status": "pass",
+          "step_index": 2,
+          "step_type": "fit"
+        },
+        {
+          "boundary_ratios": {
+            "CH2": [
+              0.09511073449590007,
+              0.4962823867959197
+            ]
+          },
+          "channels": [
+            "CH2"
+          ],
+          "fixed_params": [
+            "phi",
+            "f_mod"
+          ],
+          "free_params": [
+            "A_MI",
+            "A_mod",
+            "TTL_0",
+            "TTL_1",
+            "V_0",
+            "V_MI0",
+            "V_off",
+            "V_on",
+            "phi_MI",
+            "phi_delta"
+          ],
+          "label": "R\u00b2=0.998056",
+          "message": "R\u00b2=0.998056",
+          "params_by_key": {
+            "A_MI": 1.9261713699168348,
+            "A_mod": 1.2004695002833226,
+            "V_0": 4.42369129816731,
+            "V_MI0": 1.1968278837583273,
+            "f_mod": 1669.5198206514262,
+            "phi": 1.6583001499867032,
+            "phi_MI": 1.6137614376126743,
+            "phi_delta": -0.05167472251849692
+          },
+          "per_channel_r2": null,
+          "r2": 0.9980562312079132,
+          "retries_used": 0,
+          "retry_r2_history": [
+            0.9980562312079132
+          ],
+          "status": "pass",
+          "step_index": 3,
+          "step_type": "fit"
+        },
+        {
+          "boundary_ratios": {
+            "CH2": [
+              0.09511073449590007,
+              0.4962823867959197
+            ],
+            "CH3": [
+              0.09507842651976389,
+              0.4963658413380694
+            ],
+            "CH4": [
+              0.09511073449590007,
+              0.4962823867959197
+            ]
+          },
+          "channels": [
+            "CH2",
+            "CH3",
+            "CH4"
+          ],
+          "fixed_params": [
+            "A_MI",
+            "V_MI0",
+            "V_on",
+            "phi",
+            "f_mod",
+            "A_mod",
+            "V_0",
+            "phi_delta",
+            "TTL_1",
+            "TTL_0",
+            "phi_MI",
+            "V_off"
+          ],
+          "free_params": [],
+          "label": "R\u00b2=0.999162",
+          "message": "R\u00b2=0.999162",
+          "params_by_key": {
+            "A_MI": 1.9261713699168348,
+            "A_mod": 1.2004695002833226,
+            "TTL_0": 0.1341928159301535,
+            "TTL_1": 4.170185696700143,
+            "V_0": 4.42369129816731,
+            "V_MI0": 1.1968278837583273,
+            "V_off": 0.007898901794913484,
+            "V_on": 3.935782605854603,
+            "f_mod": 1669.5198206514262,
+            "phi": 1.6583001499867032,
+            "phi_MI": 1.6137614376126743,
+            "phi_delta": -0.05167472251849692
+          },
+          "per_channel_r2": {
+            "CH2": 0.9980562312079132,
+            "CH3": 0.9996287061654042,
+            "CH4": 0.9998018840788624
+          },
+          "r2": 0.9991622738173933,
+          "retries_used": 0,
+          "retry_r2_history": [
+            0.9991622738173933
+          ],
+          "status": "pass",
+          "step_index": 4,
+          "step_type": "fit"
+        }
+      ],
+      "latest_key_changes": [
+        "R\u00b2=0.999802: TTL_0=0.134193, TTL_1=4.17019",
+        "R\u00b2=0.999629: phi=1.6583, f_mod=1669.52, V_on=3.93578, V_off=0.0078989",
+        "R\u00b2=0.998056: A_MI=1.92617, A_mod=1.20047, V_0=4.42369, V_MI0=1.19683, phi_MI=1.61376, phi_delta=-0.0516747"
+      ],
+      "run_log": [
+        "R\u00b2=0.999802: TTL_0=0.134193, TTL_1=4.17019",
+        "R\u00b2=0.999629: phi=1.6583, f_mod=1669.52, V_on=3.93578, V_off=0.0078989",
+        "R\u00b2=0.998056: A_MI=1.92617, A_mod=1.20047, V_0=4.42369, V_MI0=1.19683, phi_MI=1.61376, phi_delta=-0.0516747"
+      ],
+      "last_status": "Procedure complete [1670.0Hz_SINE_Red Pitaya]. R\u00b2=0.999162"
+    }
+  },
+  "parameters": [
+    {
+      "key": "V_0",
+      "symbol": "V_{0}",
+      "min_value": 0.0,
+      "max_value": 10.0,
+      "value": 4.4237,
+      "fixed": false,
+      "periodic": false
+    },
+    {
+      "key": "A_MI",
+      "symbol": "A_{MI}",
+      "min_value": 0.0,
+      "max_value": 10.0,
+      "value": 1.9262,
+      "fixed": false,
+      "periodic": false
+    },
+    {
+      "key": "A_mod",
+      "symbol": "A_{mod}",
+      "min_value": 0.0,
+      "max_value": 10.0,
+      "value": 1.2005,
+      "fixed": false,
+      "periodic": false
+    },
+    {
+      "key": "f_mod",
+      "symbol": "f_{mod}",
+      "min_value": 0.0,
+      "max_value": 1100000.0,
+      "value": 1669.52,
+      "fixed": false,
+      "periodic": false
+    },
+    {
+      "key": "phi",
+      "symbol": "\\phi",
+      "min_value": 0.0,
+      "max_value": 2.0,
+      "value": 1.6583,
+      "fixed": false,
+      "periodic": true
+    },
+    {
+      "key": "phi_delta",
+      "symbol": "\\phi_{delta}",
+      "min_value": -0.5,
+      "max_value": 0.0,
+      "value": -0.051675,
+      "fixed": false,
+      "periodic": true
+    },
+    {
+      "key": "phi_MI",
+      "symbol": "\\phi_{MI}",
+      "min_value": 0.0,
+      "max_value": 2.0,
+      "value": 1.61376,
+      "fixed": false,
+      "periodic": true
+    },
+    {
+      "key": "V_MI0",
+      "symbol": "V_{MI0}",
+      "min_value": 0.0,
+      "max_value": 7.0,
+      "value": 1.19683,
+      "fixed": false,
+      "periodic": false
+    },
+    {
+      "key": "V_off",
+      "symbol": "V_{off}",
+      "min_value": -1.0,
+      "max_value": 1.0,
+      "value": 0.0079,
+      "fixed": false,
+      "periodic": false
+    },
+    {
+      "key": "V_on",
+      "symbol": "V_{on}",
+      "min_value": 3.0,
+      "max_value": 8.0,
+      "value": 3.93578,
+      "fixed": false,
+      "periodic": false
+    },
+    {
+      "key": "TTL_0",
+      "symbol": "TTL_{0}",
+      "min_value": -1.0,
+      "max_value": 1.0,
+      "value": 0.13419,
+      "fixed": false,
+      "periodic": false
+    },
+    {
+      "key": "TTL_1",
+      "symbol": "TTL_{1}",
+      "min_value": 4.0,
+      "max_value": 6.0,
+      "value": 4.17019,
+      "fixed": false,
+      "periodic": false
+    }
+  ],
+  "batch_results": []
+}

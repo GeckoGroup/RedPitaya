@@ -1,0 +1,5 @@
+This was the initial measurements taken using the redpitaya, we saw issues with noise and consistency
+
+We fixed two things after thi:
+- Replaced blown caps on amplifier board
+- Reduced voltage from 10.56V peak to peak to 8V
