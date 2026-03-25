@@ -1,8 +1,7 @@
 """Procedure panel widget — extracted from fit_gui.py.
 
 Provides ``ProcedurePanel``, a self-contained QWidget that implements the
-Procedures tab: step card editor, run/cancel controls, results table, and
-status display.
+Procedures tab step-card editor and procedure controls.
 """
 
 from __future__ import annotations
@@ -29,13 +28,9 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QDialog,
     QDialogButtonBox,
-    QTableWidget,
-    QTableWidgetItem,
-    QHeaderView,
     QMenu,
 )
 from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QColor
 
 from model import (
     MultiChannelModelDefinition,
@@ -211,98 +206,6 @@ class ProcedureHost:
         return "."
 
 
-# ---------------------------------------------------------------------------
-# Step results table widget
-# ---------------------------------------------------------------------------
-
-
-class StepResultsTable(QWidget):
-    """Table showing per-step results after a procedure run."""
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(2)
-
-        self.table = QTableWidget()
-        self.table.setColumnCount(7)
-        self.table.setHorizontalHeaderLabels(
-            [
-                "#",
-                "Label",
-                "Type",
-                "Status",
-                "R²",
-                "Retries",
-                "Key Changes",
-            ]
-        )
-        self.table.horizontalHeader().setStretchLastSection(True)
-        self.table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.ResizeMode.ResizeToContents
-        )
-        self.table.setAlternatingRowColors(True)
-        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self.table.verticalHeader().setVisible(False)
-        self.table.setMaximumHeight(180)
-        layout.addWidget(self.table)
-
-    _STATUS_COLORS = {
-        "pass": QColor("#dcfce7"),  # Green
-        "fail": QColor("#fee2e2"),  # Red
-        "skipped": QColor("#f1f5f9"),  # Gray
-    }
-
-    def populate(self, step_results: list):
-        """Fill the table from a list of step result dicts."""
-        self.table.setRowCount(0)
-        if not step_results:
-            return
-
-        self.table.setRowCount(len(step_results))
-        for row_idx, sr in enumerate(step_results):
-            step_idx = sr.get("step_index", row_idx)
-            step_type = sr.get("step_type", "fit")
-            label = sr.get("label", f"Step {step_idx + 1}")
-            status = sr.get("status", "pass")
-            r2 = sr.get("r2")
-            retries = sr.get("retries_used", 0)
-            params = sr.get("params_by_key") or {}
-
-            # Format key changes: show up to 4 params.
-            free_keys = sr.get("free_params") or []
-            change_parts = []
-            for k in free_keys[:4]:
-                v = params.get(k)
-                if v is not None:
-                    change_parts.append(f"{k}={v:.4g}")
-            key_changes = ", ".join(change_parts)
-            if len(free_keys) > 4:
-                key_changes += f" (+{len(free_keys) - 4})"
-
-            items = [
-                QTableWidgetItem(str(step_idx + 1)),
-                QTableWidgetItem(str(label)),
-                QTableWidgetItem(str(step_type)),
-                QTableWidgetItem(str(status).upper()),
-                QTableWidgetItem(f"{r2:.6f}" if r2 is not None else "N/A"),
-                QTableWidgetItem(str(retries) if retries > 0 else ""),
-                QTableWidgetItem(key_changes),
-            ]
-
-            bg = self._STATUS_COLORS.get(status, QColor("#ffffff"))
-            for col, item in enumerate(items):
-                item.setBackground(bg)
-                self.table.setItem(row_idx, col, item)
-
-
-# ---------------------------------------------------------------------------
-# ProcedurePanel — the main widget
-# ---------------------------------------------------------------------------
-
-
 class ProcedurePanel(QWidget):
     """Self-contained Procedure tab widget.
 
@@ -323,11 +226,6 @@ class ProcedurePanel(QWidget):
         self._procedure_task_id = None
         self._run_btn = None
         self._cancel_btn = None
-        self._procedure_log_lines: List[str] = []
-        self._procedure_log_max_lines = 200
-        self._live_prev_params_by_key: Dict[str, float] = {}
-        self._last_step_results: List[dict] = []
-        self._last_status_text = ""
         self._build_ui()
         self._rebuild_step_cards()
 
@@ -479,118 +377,16 @@ class ProcedurePanel(QWidget):
             cb.blockSignals(True)
             cb.setChecked(self._seed_from_siblings)
             cb.blockSignals(False)
-        raw_step_results = data.get("last_step_results")
-        if isinstance(raw_step_results, (list, tuple)):
-            self._last_step_results = [
-                dict(item) for item in raw_step_results if isinstance(item, Mapping)
-            ]
-        else:
-            self._last_step_results = []
-        self._clear_run_log()
-        raw_key_changes = data.get("latest_key_changes")
-        if isinstance(raw_key_changes, (list, tuple)):
-            self._procedure_log_lines = [
-                str(line).strip() for line in raw_key_changes if str(line).strip()
-            ][-int(self._procedure_log_max_lines) :]
-        self._last_status_text = str(data.get("last_status") or "")
         self.prune_invalid_params()
         self._rebuild_step_cards()
-        self._restore_run_state_ui()
 
     def serialize_procedure(self) -> dict:
         """Return serialised procedure dict for persistence."""
-        payload = self.build_procedure().serialize()
-        if self._last_step_results:
-            payload["last_step_results"] = [
-                self._json_safe_value(item) for item in list(self._last_step_results)
-            ]
-        if self._procedure_log_lines:
-            payload["latest_key_changes"] = list(self._procedure_log_lines)
-            payload["run_log"] = list(self._procedure_log_lines)
-        if self._last_status_text:
-            payload["last_status"] = str(self._last_status_text)
-        return payload
-
-    def record_external_procedure_start(
-        self,
-        *,
-        procedure_name: str,
-        file_label: str = "",
-        step_count: Optional[int] = None,
-    ) -> None:
-        """Update live UI state for procedure runs started outside this panel."""
-        proc_name = str(procedure_name).strip() or "Procedure"
-        file_name = str(file_label).strip()
-        file_text = f" [{file_name}]" if file_name else ""
-        steps_text = (
-            f" ({int(step_count)} steps)"
-            if step_count is not None and int(step_count) > 0
-            else ""
-        )
-        self._clear_run_log()
-        self._set_status_text(f"Running {proc_name}{steps_text}{file_text}...")
-        self.host.proc_autosave()
-
-    def record_external_procedure_result(
-        self, result: Mapping, *, file_label: str = ""
-    ) -> None:
-        """Show and persist procedure output produced by external run paths."""
-        result_map = dict(result or {})
-        file_name = str(file_label).strip()
-        step_results = result_map.get("step_results")
-        if isinstance(step_results, (list, tuple)):
-            self._last_step_results = [
-                dict(item) for item in step_results if isinstance(item, Mapping)
-            ]
-            self._results_table.populate(self._last_step_results)
-            self._rebuild_live_key_changes(self._last_step_results)
-        else:
-            self._last_step_results = []
-            self._results_table.populate([])
-            self._clear_run_log()
-
-        stopped = result_map.get("stopped_at_step")
-        r2 = _finite_float_or_none(result_map.get("r2"))
-        file_text = f" [{file_name}]" if file_name else ""
-        if stopped is not None:
-            try:
-                step_no = int(stopped) + 1
-                msg = f"Procedure stopped early at step {step_no}{file_text}."
-            except Exception:
-                msg = f"Procedure stopped early{file_text}."
-        else:
-            r2_text = f" R²={r2:.6f}" if r2 is not None else ""
-            msg = f"Procedure complete{file_text}.{r2_text}".strip()
-        self._set_status_text(msg)
-        self.host.proc_autosave()
-
-    def record_external_procedure_failure(
-        self, message: str, *, file_label: str = ""
-    ) -> None:
-        file_name = str(file_label).strip()
-        msg = str(message).strip() or "Procedure failed."
-        display_msg = f"Procedure failed [{file_name}]: {msg}" if file_name else msg
-        self._set_status_text(display_msg)
-        self.host.proc_autosave()
-
-    def record_external_procedure_cancelled(self, *, file_label: str = "") -> None:
-        file_name = str(file_label).strip()
-        file_text = f" [{file_name}]" if file_name else ""
-        msg = f"Procedure cancelled{file_text}."
-        self._set_status_text(msg)
-        self.host.proc_autosave()
-
-    def clear_run_history(self) -> None:
-        self._clear_run_log()
-        self._last_step_results = []
-        self._last_status_text = ""
-        self._restore_run_state_ui()
+        return self.build_procedure().serialize()
 
     def refresh_display_context(self) -> None:
         """Refresh card labels/tooltips after host display-name changes."""
         self._rebuild_step_cards()
-        # Keep status/results widgets in sync with current step ordering.
-        self._restore_run_state_ui()
 
     def request_close_shutdown(self, *, force_terminate: bool = False) -> None:
         """Request cancellation of an active procedure run during window close."""
@@ -610,172 +406,6 @@ class ProcedurePanel(QWidget):
             self._run_btn.setEnabled(True)
         if self._cancel_btn is not None:
             self._cancel_btn.setEnabled(False)
-
-    def _set_status_text(self, text: str) -> None:
-        self._last_status_text = str(text or "").strip()
-        self._status_label.setText(self._last_status_text)
-
-    def _coerce_params_by_key(self, params_by_key) -> Dict[str, float]:
-        out: Dict[str, float] = {}
-        if not isinstance(params_by_key, Mapping):
-            return out
-        for key, raw_value in params_by_key.items():
-            numeric = _finite_float_or_none(raw_value)
-            if numeric is None:
-                continue
-            out[str(key)] = float(numeric)
-        return out
-
-    @classmethod
-    def _json_safe_value(cls, value):
-        if isinstance(value, np.ndarray):
-            return np.asarray(value).reshape(-1).tolist()
-        if isinstance(value, np.generic):
-            try:
-                return value.item()
-            except Exception:
-                return str(value)
-        if isinstance(value, Mapping):
-            return {
-                str(key): cls._json_safe_value(raw_val)
-                for key, raw_val in dict(value).items()
-            }
-        if isinstance(value, (list, tuple)):
-            return [cls._json_safe_value(item) for item in value]
-        return value
-
-    @staticmethod
-    def _dedupe_str_values(values) -> List[str]:
-        seen: set = set()
-        ordered: List[str] = []
-        for raw in values or ():
-            key = str(raw).strip()
-            if not key or key in seen:
-                continue
-            seen.add(key)
-            ordered.append(key)
-        return ordered
-
-    def _step_candidate_keys(self, step_idx: int, step_result: Mapping) -> List[str]:
-        free_params = self._dedupe_str_values(step_result.get("free_params") or ())
-        if free_params:
-            return free_params
-        step_obj: ProcedureStepBase | None = None
-        if 0 <= int(step_idx) < len(self._procedure_steps):
-            step_obj = self._procedure_steps[int(step_idx)]
-        if isinstance(step_obj, SetParameterStep):
-            return self._dedupe_str_values(
-                assignment.target_key for assignment in step_obj.assignments
-            )
-        if isinstance(step_obj, RandomizeSeedsStep) and step_obj.params:
-            return self._dedupe_str_values(step_obj.params)
-        return []
-
-    def _format_step_key_change_line(
-        self,
-        step_idx: int,
-        step_result: Mapping,
-        *,
-        previous_params: Optional[Mapping[str, float]] = None,
-    ) -> None | str:
-        params_by_key = self._coerce_params_by_key(step_result.get("params_by_key"))
-        if not params_by_key:
-            return None
-        keys = self._step_candidate_keys(step_idx, step_result)
-        if not keys and previous_params:
-            changed = []
-            for key, value in params_by_key.items():
-                prev = _finite_float_or_none(previous_params.get(key))
-                if prev is None:
-                    continue
-                if not np.isclose(
-                    float(value), float(prev), rtol=1e-9, atol=1e-12, equal_nan=False
-                ):
-                    changed.append(str(key))
-            keys = self._dedupe_str_values(changed)
-        if not keys:
-            return None
-
-        value_parts: List[str] = []
-        for key in keys:
-            if key not in params_by_key:
-                continue
-            value_parts.append(f"{key}={params_by_key[key]:.6g}")
-        if not value_parts:
-            return None
-        max_shown = 6
-        suffix = ""
-        if len(value_parts) > max_shown:
-            suffix = f" (+{len(value_parts) - max_shown})"
-            value_parts = value_parts[:max_shown]
-        label = str(step_result.get("label") or f"Step {int(step_idx) + 1}")
-        return f"{label}: {', '.join(value_parts)}{suffix}"
-
-    def _rebuild_live_key_changes(self, step_results: List[Mapping]) -> None:
-        lines: List[str] = []
-        prev_params: Dict[str, float] = {}
-        for fallback_idx, raw_result in enumerate(step_results):
-            if not isinstance(raw_result, Mapping):
-                continue
-            raw_step_idx = raw_result.get("step_index", fallback_idx)
-            try:
-                step_idx = int(raw_step_idx)
-            except Exception:
-                step_idx = int(fallback_idx)
-            line = self._format_step_key_change_line(
-                step_idx,
-                raw_result,
-                previous_params=prev_params,
-            )
-            if line:
-                lines.append(line)
-            params_by_key = self._coerce_params_by_key(raw_result.get("params_by_key"))
-            if params_by_key:
-                prev_params = params_by_key
-        self._live_prev_params_by_key = dict(prev_params)
-        self._procedure_log_lines = lines[-int(self._procedure_log_max_lines) :]
-        self._render_run_log()
-
-    def _clear_run_log(self) -> None:
-        self._procedure_log_lines = []
-        self._live_prev_params_by_key = {}
-        self._render_run_log()
-
-    def _render_run_log(self) -> None:
-        log_widget = getattr(self, "_results_log", None)
-        if log_widget is None:
-            return
-        log_widget.setPlainText("\n".join(self._procedure_log_lines))
-        scrollbar = log_widget.verticalScrollBar()
-        if scrollbar is not None:
-            scrollbar.setValue(scrollbar.maximum())
-
-    def _append_run_log_line(
-        self,
-        line: str,
-        *,
-        section_key: Optional[str] = None,
-        section_title: str = "",
-    ) -> None:
-        text = str(line or "").strip()
-        if not text:
-            return
-        _ = section_key
-        _ = section_title
-        self._procedure_log_lines.append(text)
-        if len(self._procedure_log_lines) > int(self._procedure_log_max_lines):
-            self._procedure_log_lines = self._procedure_log_lines[
-                -int(self._procedure_log_max_lines) :
-            ]
-        self._render_run_log()
-
-    def _restore_run_state_ui(self) -> None:
-        self._status_label.setText(str(self._last_status_text or ""))
-        self._results_table.populate(self._last_step_results)
-        if self._last_step_results:
-            self._rebuild_live_key_changes(self._last_step_results)
-        else:
-            self._render_run_log()
 
     # ── UI construction ───────────────────────────────────────────
 
@@ -834,13 +464,6 @@ class ProcedurePanel(QWidget):
         self._step_scroll.setWidget(self._step_container)
         layout.addWidget(self._step_scroll, 1)
 
-        # Status label.
-        self._status_label = self._make_label("", object_name="statusLabel")
-        layout.addWidget(self._status_label)
-
-        # Step results table.
-        self._results_table = StepResultsTable()
-        layout.addWidget(self._results_table)
 
     # ── Widget helpers ────────────────────────────────────────────
 
@@ -2629,29 +2252,9 @@ class ProcedurePanel(QWidget):
 
         r2_text = f"R²={r2:.6f}" if r2 is not None else ""
         retry_text = f" ({retries} retries)" if retries > 0 else ""
-        self._set_status_text(
-            f"Completed {label}: {status.upper()} {r2_text}{retry_text}"
-        )
         self.host.proc_log(
             f"  {label} [{step_type}]: {status.upper()} {r2_text}{retry_text}"
         )
-
-        step_idx_int = int(step_idx)
-        while len(self._last_step_results) <= step_idx_int:
-            self._last_step_results.append({})
-        self._last_step_results[step_idx_int] = dict(step_result)
-        self._results_table.populate(self._last_step_results)
-
-        line = self._format_step_key_change_line(
-            step_idx_int,
-            step_result,
-            previous_params=self._live_prev_params_by_key,
-        )
-        if line:
-            self._append_run_log_line(line)
-        params_by_key = self._coerce_params_by_key(step_result.get("params_by_key"))
-        if params_by_key:
-            self._live_prev_params_by_key = params_by_key
 
     def _on_finished(self, result):
         self._procedure_running = False
@@ -2661,28 +2264,15 @@ class ProcedurePanel(QWidget):
         if self._cancel_btn is not None:
             self._cancel_btn.setEnabled(False)
 
-        # Populate results table.
-        step_results = result.get("step_results") or []
-        if isinstance(step_results, (list, tuple)):
-            self._last_step_results = [
-                dict(item) for item in step_results if isinstance(item, Mapping)
-            ]
-        else:
-            self._last_step_results = []
-        self._results_table.populate(self._last_step_results)
-        self._rebuild_live_key_changes(self._last_step_results)
-
         stopped = result.get("stopped_at_step")
         if stopped is not None:
-            msg = f"Procedure stopped early at step {stopped + 1} (R² threshold)."
-            self._set_status_text(msg)
-            self.host.proc_log(msg)
+            self.host.proc_log(
+                f"Procedure stopped early at step {stopped + 1} (R² threshold)."
+            )
         else:
             r2 = result.get("r2")
             r2_text = f"R²={r2:.6f}" if r2 is not None else ""
-            msg = f"Procedure complete. {r2_text}".strip()
-            self._set_status_text(msg)
-            self.host.proc_log(msg)
+            self.host.proc_log(f"Procedure complete. {r2_text}".strip())
 
         self.host.proc_on_fit_finished(result)
         self.host.proc_autosave()
@@ -2694,9 +2284,7 @@ class ProcedurePanel(QWidget):
             self._run_btn.setEnabled(True)
         if self._cancel_btn is not None:
             self._cancel_btn.setEnabled(False)
-        msg = f"Procedure failed: {error_msg}"
-        self._set_status_text(msg)
-        self.host.proc_log(msg)
+        self.host.proc_log(f"Procedure failed: {error_msg}")
         self.host.proc_autosave()
 
     def _on_cancelled(self):
@@ -2706,6 +2294,5 @@ class ProcedurePanel(QWidget):
             self._run_btn.setEnabled(True)
         if self._cancel_btn is not None:
             self._cancel_btn.setEnabled(False)
-        self._set_status_text("Procedure cancelled.")
         self.host.proc_log("Procedure cancelled.")
         self.host.proc_autosave()

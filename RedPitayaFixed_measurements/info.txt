@@ -1,0 +1,1 @@
+This is two acquisitions from the fixed RedPitaya, we are getting weird double triggering behaviour from leaving the TTL high during the burst, it looks like we need to take it low within a single period maybe? 

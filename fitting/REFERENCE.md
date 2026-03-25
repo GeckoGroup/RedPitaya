@@ -131,7 +131,7 @@ fit_gui.py  ManualFitGUI
   how results feed forward between steps.
 
 - **StepResult** — Also a frozen dataclass. The pipeline collects these and
-  reports them via `step_callback`. The GUI's results table reads them.
+  reports them via `step_callback` for live procedure progress updates.
 
 ### 1.6 Serialisation Format
 

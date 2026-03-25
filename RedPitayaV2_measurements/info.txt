@@ -1,3 +1,0 @@
-This was the second set of measurements taken using the redpitaya
-
-Seems good but the triggering is causing two bursts at some frequencies so we replaced this data with a fixed version

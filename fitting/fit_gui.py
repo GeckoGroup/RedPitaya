@@ -91,6 +91,7 @@ from data_io import (
     is_supported_archive_path,
     open_archive_csv_member_stream,
     read_measurement_csv,
+    split_archive_file_ref,
     stem_for_file_ref,
 )
 from fit_results import canonicalize_fit_row, fit_get, fit_set
@@ -165,6 +166,24 @@ from fit_state import BoundaryState
 switch_backend("Qt5Agg")
 
 APP_ICON_PATH = Path(__file__).resolve().parents[1] / "assets" / "redpitaya_icon.png"
+ANALYSIS_ARCHIVE_MARKERS: Tuple[str, ...] = (
+    "o",
+    "x",
+    "+",
+    "s",
+    "D",
+    "^",
+    "v",
+    "P",
+    "X",
+    "*",
+    "<",
+    ">",
+    "1",
+    "2",
+    "3",
+    "4",
+)
 
 
 class _ScrollEatFilter(QObject):
@@ -484,9 +503,7 @@ class ProcedureLivePanel(QWidget):
 
         # R² display on the heading line
         if r2 is not None:
-            r2_color = (
-                "#16a34a" if r2 > 0.99 else "#d97706" if r2 > 0.95 else "#dc2626"
-            )
+            r2_color = "#16a34a" if r2 > 0.99 else "#d97706" if r2 > 0.95 else "#dc2626"
             summary = f"R\u00b2={r2:.6f}"
             if per_channel_text:
                 summary = f"{summary} | {per_channel_text}"
@@ -653,7 +670,9 @@ class ProcedureLivePanel(QWidget):
 class DataPreloadWorker(QObject):
     """Background CSV reader that preloads file frames for faster navigation."""
 
-    file_loaded = pyqtSignal(int, str, object, object)  # (session, file_ref, frame, error)
+    file_loaded = pyqtSignal(
+        int, str, object, object
+    )  # (session, file_ref, frame, error)
     finished = pyqtSignal(int)  # (session)
 
     def __init__(self, session_id: int, file_refs) -> None:
@@ -1729,9 +1748,7 @@ class ManualFitGUI(QMainWindow):
             if remaining > 0:
                 preview += f"\n... +{remaining} more"
             tooltip.append(f"Selected files ({len(selected_paths)}):\n{preview}")
-        tooltip.append(
-            "Click to choose a folder, an archive, or one/more CSV files."
-        )
+        tooltip.append("Click to choose a folder, an archive, or one/more CSV files.")
         self.source_path_label.setToolTip("\n\n".join(tooltip))
 
     def _sync_file_navigation_buttons(self):
@@ -1925,7 +1942,8 @@ class ManualFitGUI(QMainWindow):
             running_tasks = [
                 task
                 for task in self.fit_tasks.values()
-                if str(task.get("kind")) == "batch" and str(task.get("status")) == "running"
+                if str(task.get("kind")) == "batch"
+                and str(task.get("status")) == "running"
             ]
             if running_tasks:
                 file_label = stem_for_file_ref(running_tasks[0].get("file_path"))
@@ -5567,7 +5585,9 @@ class ManualFitGUI(QMainWindow):
             )
             grid.addWidget(min_box, row_idx, 1)
             grid.addWidget(max_box, row_idx, 2)
-            grid.addWidget(periodic_cb, row_idx, 3, alignment=Qt.AlignmentFlag.AlignHCenter)
+            grid.addWidget(
+                periodic_cb, row_idx, 3, alignment=Qt.AlignmentFlag.AlignHCenter
+            )
             self._model_param_min_spinboxes[key] = min_box
             self._model_param_max_spinboxes[key] = max_box
             self._model_param_periodic_checkboxes[key] = periodic_cb
@@ -6622,9 +6642,11 @@ class ManualFitGUI(QMainWindow):
                         row["plot_has_fit"] = None
                         row["_equation_stale"] = False
                 else:
-                    remapped_rows: int = self._remap_batch_result_params_on_model_change(
-                        old_param_keys=old_param_keys,
-                        new_param_specs=self.param_specs,
+                    remapped_rows: int = (
+                        self._remap_batch_result_params_on_model_change(
+                            old_param_keys=old_param_keys,
+                            new_param_specs=self.param_specs,
+                        )
                     )
                     for row in self.batch_results:
                         row["_equation_stale"] = True
@@ -6989,9 +7011,7 @@ class ManualFitGUI(QMainWindow):
                         resolved_target, seg_exprs = self._parse_equation_text(
                             expr_text, strict=False
                         )
-                        normalized: str = (
-                            f"{resolved_target} = {' ; '.join(seg_exprs)}"
-                        )
+                        normalized: str = f"{resolved_target} = {' ; '.join(seg_exprs)}"
                         if normalized != expr_text:
                             self.current_expression: str = normalized
                             self._set_expression_editor_text(normalized)
@@ -7461,6 +7481,17 @@ class ManualFitGUI(QMainWindow):
             tooltip="Use logarithmic scaling on the X axis.",
         )
         axis_row.addWidget(self.analysis_log_x_btn)
+
+        self.analysis_archive_markers_btn: QPushButton = self._new_button(
+            "Archive Markers",
+            checkable=True,
+            checked=False,
+            toggled_handler=self.update_batch_analysis_plot,
+            tooltip=(
+                "Use different point markers for files coming from different archives."
+            ),
+        )
+        axis_row.addWidget(self.analysis_archive_markers_btn)
         axis_row.addStretch(1)
         layout.addLayout(axis_row)
 
@@ -7974,9 +8005,7 @@ class ManualFitGUI(QMainWindow):
                     else:
                         bv_arr = np.asarray([], dtype=float)
                     value: float | None = (
-                        float(bv_arr[idx])
-                        if bv_arr.size > idx
-                        else None
+                        float(bv_arr[idx]) if bv_arr.size > idx else None
                     )
                 record[str(item["key"])] = value
             record["R2"] = fit_get(row, "r2")
@@ -8447,6 +8476,7 @@ class ManualFitGUI(QMainWindow):
             "show_fit_lines": True,
             "show_legend": True,
             "log_x": False,
+            "archive_markers": False,
             "math_enabled": False,
             "math_left": None,
             "math_op": "-",
@@ -8470,6 +8500,10 @@ class ManualFitGUI(QMainWindow):
             state["show_legend"] = bool(self.analysis_legend_btn.isChecked())
         if hasattr(self, "analysis_log_x_btn"):
             state["log_x"] = bool(self.analysis_log_x_btn.isChecked())
+        if hasattr(self, "analysis_archive_markers_btn"):
+            state["archive_markers"] = bool(
+                self.analysis_archive_markers_btn.isChecked()
+            )
         if hasattr(self, "analysis_math_enable_btn"):
             state["math_enabled"] = bool(self.analysis_math_enable_btn.isChecked())
         if hasattr(self, "analysis_math_left_combo"):
@@ -8510,6 +8544,7 @@ class ManualFitGUI(QMainWindow):
             ("analysis_fit_line_btn", "show_fit_lines"),
             ("analysis_legend_btn", "show_legend"),
             ("analysis_log_x_btn", "log_x"),
+            ("analysis_archive_markers_btn", "archive_markers"),
         )
         for attr_name, state_key in toggle_fields:
             btn: Any | None = getattr(self, attr_name, None)
@@ -8782,6 +8817,80 @@ class ManualFitGUI(QMainWindow):
         if len(matches) == 1:
             return matches[0]
         return None
+
+    @staticmethod
+    def _analysis_point_source(file_ref) -> Tuple[str, str]:
+        file_text: str = str(file_ref or "").strip()
+        archive_ref = split_archive_file_ref(file_text)
+        if archive_ref is None:
+            return ("__files__", "Files")
+
+        archive_path, _member = archive_ref
+        archive_name: str = str(Path(archive_path).name).strip() or "Archive"
+        try:
+            archive_key: str = str(
+                Path(archive_path).expanduser().resolve(strict=False)
+            )
+        except Exception:
+            archive_key = str(Path(archive_path).expanduser())
+        return (f"archive::{archive_key}", archive_name)
+
+    def _analysis_archive_marker_styles(self) -> Dict[str, Dict[str, str]]:
+        styles: Dict[str, Dict[str, str]] = {}
+        for record in list(getattr(self, "analysis_records", []) or []):
+            file_ref = self._analysis_record_file_ref(record)
+            source_key, source_label = self._analysis_point_source(file_ref)
+            if source_key in styles:
+                continue
+            styles[source_key] = {
+                "label": source_label,
+                "marker": ANALYSIS_ARCHIVE_MARKERS[
+                    len(styles) % len(ANALYSIS_ARCHIVE_MARKERS)
+                ],
+            }
+        if not styles:
+            styles["__files__"] = {
+                "label": "Files",
+                "marker": ANALYSIS_ARCHIVE_MARKERS[0],
+            }
+        return styles
+
+    def _analysis_group_scatter_points_by_source(
+        self,
+        x_values,
+        y_values,
+        point_colors,
+        file_refs,
+        source_styles,
+    ) -> List[Dict[str, Any]]:
+        groups_by_key: Dict[str, Dict[str, Any]] = {}
+        groups: List[Dict[str, Any]] = []
+        default_marker: str = ANALYSIS_ARCHIVE_MARKERS[0]
+
+        for x_val, y_val, point_color, file_ref in zip(
+            x_values, y_values, point_colors, file_refs
+        ):
+            source_key, source_label = self._analysis_point_source(file_ref)
+            source_style: Dict[str, str] = dict(source_styles.get(source_key) or {})
+            group = groups_by_key.get(source_key)
+            if group is None:
+                group = {
+                    "key": source_key,
+                    "label": str(source_style.get("label") or source_label or "Files"),
+                    "marker": str(source_style.get("marker") or default_marker),
+                    "x": [],
+                    "y": [],
+                    "colors": [],
+                    "file_refs": [],
+                }
+                groups_by_key[source_key] = group
+                groups.append(group)
+            group["x"].append(float(x_val))
+            group["y"].append(float(y_val))
+            group["colors"].append(tuple(point_color))
+            group["file_refs"].append(file_ref)
+
+        return groups
 
     @staticmethod
     def _format_hover_number(value) -> str:
@@ -9186,8 +9295,8 @@ class ManualFitGUI(QMainWindow):
             return (int(valid[0]), float("inf"))
 
         try:
-            display_xy: np.ndarray[Tuple[int, ...], np.dtype[Any]] = axis.transData.transform(
-                offsets[valid, :2]
+            display_xy: np.ndarray[Tuple[int, ...], np.dtype[Any]] = (
+                axis.transData.transform(offsets[valid, :2])
             )
             ex = float(mouse_event.x)
             ey = float(mouse_event.y)
@@ -9319,6 +9428,13 @@ class ManualFitGUI(QMainWindow):
         show_series_line: bool = self.analysis_show_series_line_btn.isChecked()
         show_fit_lines: bool = self.analysis_fit_line_btn.isChecked()
         show_legend: bool = self.analysis_legend_btn.isChecked()
+        use_archive_markers: bool = bool(
+            getattr(self, "analysis_archive_markers_btn", None)
+            and self.analysis_archive_markers_btn.isChecked()
+        )
+        source_marker_styles: Dict[str, Dict[str, str]] = (
+            self._analysis_archive_marker_styles() if use_archive_markers else {}
+        )
         use_log_x: bool = bool(
             getattr(self, "analysis_log_x_btn", None)
             and self.analysis_log_x_btn.isChecked()
@@ -9366,9 +9482,7 @@ class ManualFitGUI(QMainWindow):
             return
 
         axis_count: int = (
-            len(series_specs)
-            if mode == "separate" and len(series_specs) > 1
-            else 1
+            len(series_specs) if mode == "separate" and len(series_specs) > 1 else 1
         )
         self._set_analysis_canvas_height(axis_count)
         self._clear_analysis_figure()
@@ -9378,6 +9492,7 @@ class ManualFitGUI(QMainWindow):
         else:
             axes: List[Axes] = [self.analysis_fig.add_subplot(111)]
         self._set_hover_axes(axes)
+        axis_legend_entries: List[List[Tuple[Any, str]]] = [[] for _ in axes]
 
         plotted_any = False
         x_min_plot: None | float = None
@@ -9419,15 +9534,23 @@ class ManualFitGUI(QMainWindow):
             if r2_values is not None and np.size(r2_values) == np.size(mask):
                 r2_plot = r2_values[mask]
                 r2_sorted = r2_plot[order]
-                point_alphas = np.clip(r2_sorted, 0.5, 1.0)
-                point_alphas: np.ndarray[Tuple[int, ...], np.dtype[Any]] = np.where(
-                    np.isfinite(point_alphas), point_alphas, 0.5
-                )
+                point_alphas = np.full_like(r2_sorted, 0.5, dtype=float)
+                mask_finite = np.isfinite(r2_sorted)
+                # For 0.98 < R2 < 0.999, set linear alpha
+                mask_linear = (r2_sorted > 0.98) & (r2_sorted < 0.999) & mask_finite
+                point_alphas[mask_linear] = 0.5 + 0.5 * (
+                    r2_sorted[mask_linear] - 0.98
+                ) / (0.999 - 0.98)
+                # For R2 >= 0.999, set to 1.0
+                mask_full = (r2_sorted >= 0.999) & mask_finite
+                point_alphas[mask_full] = 1.0
+                # For not finite, stays at 0.5
             else:
                 point_alphas: np.ndarray[Tuple[int], np.dtype[Any]] = np.full(
                     np.size(x_sorted), 0.5, dtype=float
                 )
-            target_ax: Any | Axes = axes[idx] if len(axes) > 1 else axes[0]
+            axis_idx: int = idx if len(axes) > 1 else 0
+            target_ax: Any | Axes = axes[axis_idx]
             param_plot_label: str = str(
                 spec.get("plot_label") or spec.get("hover_label") or spec.get("key")
             )
@@ -9435,30 +9558,64 @@ class ManualFitGUI(QMainWindow):
                 spec.get("hover_label") or spec.get("plot_label") or spec.get("key")
             )
 
+            rgba: Tuple[float, float, float, float] = mcolors.to_rgba(color)
+            point_colors: List[Tuple[float, float, float, float]] = [
+                (rgba[0], rgba[1], rgba[2], float(alpha)) for alpha in point_alphas
+            ]
             if show_points:
-                scatter_label: str = (
-                    param_plot_label if not show_series_line else "_nolegend_"
-                )
-                rgba: Tuple[float, float, float, float] = mcolors.to_rgba(color)
-                point_colors: List[Tuple[float, float, float, float]] = [
-                    (rgba[0], rgba[1], rgba[2], float(alpha)) for alpha in point_alphas
-                ]
-                scatter: PathCollection | Any = target_ax.scatter(
-                    x_sorted,
-                    y_sorted,
-                    s=26,
-                    color=point_colors,
-                    label=scatter_label,
-                )
-                scatter.set_picker(5)
-                self._analysis_scatter_files[scatter] = file_refs_sorted
-                self._register_hover_artist(
-                    artist=scatter,
-                    title=param_hover_label,
-                    x_label=analysis_x_hover_label,
-                    y_label=param_hover_label,
-                    file_refs=file_refs_sorted,
-                )
+                if use_archive_markers:
+                    scatter_groups = self._analysis_group_scatter_points_by_source(
+                        x_sorted,
+                        y_sorted,
+                        point_colors,
+                        file_refs_sorted,
+                        source_marker_styles,
+                    )
+                    for group_idx, scatter_group in enumerate(scatter_groups):
+                        scatter_label: str = (
+                            param_plot_label
+                            if (not show_series_line and group_idx == 0)
+                            else "_nolegend_"
+                        )
+                        scatter: PathCollection | Any = target_ax.scatter(
+                            scatter_group["x"],
+                            scatter_group["y"],
+                            s=30,
+                            marker=str(scatter_group.get("marker") or "o"),
+                            color=list(scatter_group.get("colors") or []),
+                            linewidths=1.0,
+                            label=scatter_label,
+                        )
+                        scatter.set_picker(5)
+                        scatter_file_refs = list(scatter_group.get("file_refs") or [])
+                        self._analysis_scatter_files[scatter] = scatter_file_refs
+                        self._register_hover_artist(
+                            artist=scatter,
+                            title=param_hover_label,
+                            x_label=analysis_x_hover_label,
+                            y_label=param_hover_label,
+                            file_refs=scatter_file_refs,
+                        )
+                else:
+                    scatter_label = (
+                        param_plot_label if not show_series_line else "_nolegend_"
+                    )
+                    scatter: PathCollection | Any = target_ax.scatter(
+                        x_sorted,
+                        y_sorted,
+                        s=26,
+                        color=point_colors,
+                        label=scatter_label,
+                    )
+                    scatter.set_picker(5)
+                    self._analysis_scatter_files[scatter] = file_refs_sorted
+                    self._register_hover_artist(
+                        artist=scatter,
+                        title=param_hover_label,
+                        x_label=analysis_x_hover_label,
+                        y_label=param_hover_label,
+                        file_refs=file_refs_sorted,
+                    )
             if show_series_line:
                 (series_line,) = target_ax.plot(
                     x_sorted,
@@ -9473,6 +9630,28 @@ class ManualFitGUI(QMainWindow):
                     title=f"{param_hover_label} series",
                     x_label=analysis_x_hover_label,
                     y_label=param_hover_label,
+                )
+                axis_legend_entries[axis_idx].append(
+                    (
+                        Line2D([], [], linewidth=1.4, alpha=0.85, color=color),
+                        param_plot_label,
+                    )
+                )
+            elif show_points:
+                axis_legend_entries[axis_idx].append(
+                    (
+                        Line2D(
+                            [],
+                            [],
+                            linestyle="None",
+                            marker="o",
+                            markersize=5.5,
+                            markerfacecolor=color,
+                            markeredgecolor=color,
+                            alpha=0.85,
+                        ),
+                        param_plot_label,
+                    )
                 )
 
             if show_fit_lines:
@@ -9503,8 +9682,6 @@ class ManualFitGUI(QMainWindow):
             if len(axes) > 1:
                 target_ax.set_ylabel(param_plot_label)
                 target_ax.grid(True, alpha=0.25)
-                if show_legend:
-                    target_ax.legend(loc="best", fontsize=8)
 
         if not plotted_any:
             if use_log_x:
@@ -9545,9 +9722,16 @@ class ManualFitGUI(QMainWindow):
                 axes[0].set_ylabel(single_label)
             else:
                 axes[0].set_ylabel("Parameter Value")
-            if show_legend:
-                axes[0].legend(loc="best", fontsize=8)
             axes[0].grid(True, alpha=0.3)
+
+        if show_legend:
+            for axis_idx, axis in enumerate(axes):
+                legend_entries = axis_legend_entries[axis_idx]
+                if not legend_entries:
+                    continue
+                handles = [entry[0] for entry in legend_entries]
+                labels = [entry[1] for entry in legend_entries]
+                axis.legend(handles, labels, loc="best", fontsize=8)
 
         if x_field in self.analysis_param_columns:
             x_axis_label: str = self._display_name_for_param_key_mathtext(x_field)
@@ -10168,8 +10352,7 @@ class ManualFitGUI(QMainWindow):
             row["plot_render_size"] = None
             row["plot_has_fit"] = has_nonempty_values(fit_get(row, "params"))
             has_imported_fit: bool = bool(
-                row.get("plot_has_fit")
-                or bool(fit_get(row, "channel_results"))
+                row.get("plot_has_fit") or bool(fit_get(row, "channel_results"))
             )
             if has_imported_fit:
                 row["_equation_stale"] = False
@@ -10276,7 +10459,9 @@ class ManualFitGUI(QMainWindow):
                     for spec in self.param_specs:
                         merged_specs.append(spec_by_key.get(spec.key, spec))
                     self.param_specs = merged_specs
-                    valid_param_keys: set[str] = {str(spec.key) for spec in self.param_specs}
+                    valid_param_keys: set[str] = {
+                        str(spec.key) for spec in self.param_specs
+                    }
                     self._periodic_param_keys = {
                         str(key)
                         for key, state in value_by_key.items()
@@ -10445,7 +10630,9 @@ class ManualFitGUI(QMainWindow):
                 for k in getattr(self, "_periodic_param_keys", set())
                 if str(k) in valid_param_keys
             }
-            for key, cb in getattr(self, "_model_param_periodic_checkboxes", {}).items():
+            for key, cb in getattr(
+                self, "_model_param_periodic_checkboxes", {}
+            ).items():
                 cb.blockSignals(True)
                 cb.setChecked(str(key) in self._periodic_param_keys)
                 cb.blockSignals(False)
@@ -10464,7 +10651,6 @@ class ManualFitGUI(QMainWindow):
             else:
                 self._procedure_panel.procedure_steps = []
                 self._procedure_panel.procedure_name = "Procedure"
-                self._procedure_panel.clear_run_history()
 
             self._restore_splitter_sizes(
                 getattr(self, "main_splitter", None),
@@ -10613,8 +10799,7 @@ class ManualFitGUI(QMainWindow):
         self._fit_details_autoload_attempted = True
         loaded: bool = bool(self._autoload_fit_details_from_source())
         fit_debug(
-            "fit-details autoload attempt: "
-            f"reason={reason or '-'} loaded={loaded}"
+            f"fit-details autoload attempt: reason={reason or '-'} loaded={loaded}"
         )
         return loaded
 
@@ -10982,7 +11167,9 @@ class ManualFitGUI(QMainWindow):
             self._data_preload_worker = None
             self._data_preload_thread = None
 
-    def _start_background_data_preload(self, *, prioritize_file: str | None = None) -> None:
+    def _start_background_data_preload(
+        self, *, prioritize_file: str | None = None
+    ) -> None:
         files: List[str] = [str(ref).strip() for ref in list(self.data_files or [])]
         files = [ref for ref in files if ref]
         if not files:
@@ -11097,9 +11284,9 @@ class ManualFitGUI(QMainWindow):
         self._idle_archive_scan_stream = None
         self._idle_archive_scan_current_archive = None
         self._idle_archive_scan_current_found = 0
-        self._idle_archive_scan_session = int(
-            getattr(self, "_idle_archive_scan_session", 0)
-        ) + 1
+        self._idle_archive_scan_session = (
+            int(getattr(self, "_idle_archive_scan_session", 0)) + 1
+        )
 
     def _queue_idle_archive_scan(self, archive_paths) -> None:
         deduped: List[str] = []
@@ -11113,9 +11300,9 @@ class ManualFitGUI(QMainWindow):
         if not deduped:
             return
 
-        self._idle_archive_scan_session = int(
-            getattr(self, "_idle_archive_scan_session", 0)
-        ) + 1
+        self._idle_archive_scan_session = (
+            int(getattr(self, "_idle_archive_scan_session", 0)) + 1
+        )
         self._idle_archive_scan_queue = deduped
         self._idle_archive_scan_total = len(deduped)
         self._idle_archive_scan_done = 0
@@ -11138,9 +11325,7 @@ class ManualFitGUI(QMainWindow):
         ]
         if not refs:
             return 0
-        existing: set[str] = {
-            str(item).strip() for item in list(self.data_files or [])
-        }
+        existing: set[str] = {str(item).strip() for item in list(self.data_files or [])}
         new_refs: List[str] = [ref for ref in refs if ref not in existing]
         if not new_refs:
             return 0
@@ -11183,7 +11368,9 @@ class ManualFitGUI(QMainWindow):
                                 f"Archive scan complete: added {added} file(s)."
                             )
                     elif not self.data_files:
-                        self.stats_text.setText("No CSV files found in selected source.")
+                        self.stats_text.setText(
+                            "No CSV files found in selected source."
+                        )
                 self._idle_archive_scan_total = 0
                 self._idle_archive_scan_done = 0
                 self._idle_archive_scan_added = 0
@@ -11232,7 +11419,9 @@ class ManualFitGUI(QMainWindow):
                 return
             self._idle_archive_scan_stream = stream
 
-        archive_path = str(getattr(self, "_idle_archive_scan_current_archive", "") or "")
+        archive_path = str(
+            getattr(self, "_idle_archive_scan_current_archive", "") or ""
+        )
         archive_name: str = Path(archive_path).name if archive_path else "archive"
 
         members_batch: List[str] = []
@@ -11453,7 +11642,9 @@ class ManualFitGUI(QMainWindow):
             empty_message=empty_message,
             confirm_clear_batch=not bool(source_path.is_dir()),
         )
-        if archive_paths and not bool(getattr(self, "_last_source_load_cancelled", False)):
+        if archive_paths and not bool(
+            getattr(self, "_last_source_load_cancelled", False)
+        ):
             self._queue_idle_archive_scan(archive_paths)
 
     def _clear_main_plot(self, message="No data loaded.") -> None:
@@ -11539,7 +11730,9 @@ class ManualFitGUI(QMainWindow):
                 cached_frame = self._data_preload_cache.get(str(file_path))
                 if cached_frame is not None:
                     self.current_data = cached_frame
-                    fit_debug(f"data-preload cache hit: file={stem_for_file_ref(file_path)}")
+                    fit_debug(
+                        f"data-preload cache hit: file={stem_for_file_ref(file_path)}"
+                    )
                 else:
                     _on_file_load_progress("Preparing...", 0.0)
                     self.current_data = read_measurement_csv(
@@ -11577,7 +11770,9 @@ class ManualFitGUI(QMainWindow):
                 # If this file already has a stored fitted row, preserve those
                 # values on load instead of immediately reseeding from bound fields.
                 if has_valid_fit_to_load:
-                    self._mapped_param_seed_file_key = self._fit_task_file_key(file_path)
+                    self._mapped_param_seed_file_key = self._fit_task_file_key(
+                        file_path
+                    )
                 else:
                     self._mapped_param_seed_file_key = None
                 # Refresh capture mapping controls after restoring any batch row
@@ -11766,8 +11961,7 @@ class ManualFitGUI(QMainWindow):
         multi: Any | None = getattr(self, "_multi_channel_model", None)
         if (
             (not row_is_stale)
-            and
-            isinstance(channel_results, dict)
+            and isinstance(channel_results, dict)
             and multi is not None
             and multi.is_multi_channel
         ):
@@ -11800,7 +11994,9 @@ class ManualFitGUI(QMainWindow):
                             f"expected={int(expected_n)}"
                         )
                         continue
-                    if self._fit_state.set_channel_ratios(ch_key, np.clip(ch_b, 0.0, 1.0)):
+                    if self._fit_state.set_channel_ratios(
+                        ch_key, np.clip(ch_b, 0.0, 1.0)
+                    ):
                         boundary_changed = True
                     boundary_source_targets.append(ch_key)
                     applied_boundary_targets.add(ch_key)
@@ -12085,16 +12281,6 @@ class ManualFitGUI(QMainWindow):
             f"{action_label} started for {stem_for_file_ref(current_file)} (full trace)."
         )
         if run_mode == "procedure":
-            panel: Any | None = getattr(self, "_procedure_panel", None)
-            if panel is not None and procedure is not None:
-                try:
-                    panel.record_external_procedure_start(
-                        procedure_name=str(getattr(procedure, "name", "Procedure")),
-                        file_label=stem_for_file_ref(current_file),
-                        step_count=len(getattr(procedure, "steps", ()) or ()),
-                    )
-                except Exception:
-                    pass
             if procedure is not None:
                 total_steps = len(getattr(procedure, "steps", ()) or ())
                 if total_steps > 0:
@@ -12365,7 +12551,9 @@ class ManualFitGUI(QMainWindow):
         if unique_handles:
             axis.legend(unique_handles, unique_labels, loc=loc)
 
-    def _boundary_marker_entries(self, x_values: Sequence[float]) -> List[Dict[str, Any]]:
+    def _boundary_marker_entries(
+        self, x_values: Sequence[float]
+    ) -> List[Dict[str, Any]]:
         """Return boundary marker line entries for plotting."""
         x_arr = np.asarray(x_values, dtype=float).reshape(-1)
         x_finite = x_arr[np.isfinite(x_arr)]
@@ -12393,7 +12581,9 @@ class ManualFitGUI(QMainWindow):
                     x_finite,
                     n_boundaries,
                 )
-                for bidx, bval in enumerate(np.asarray(x_boundaries, dtype=float).reshape(-1)):
+                for bidx, bval in enumerate(
+                    np.asarray(x_boundaries, dtype=float).reshape(-1)
+                ):
                     if not np.isfinite(bval):
                         continue
                     entries.append(
@@ -12409,9 +12599,9 @@ class ManualFitGUI(QMainWindow):
             )
             n_boundaries = int(self._fit_state.channel_count(target))
             if n_boundaries > 0:
-                ratios = np.asarray(self._fit_state.channel_ratios(target), dtype=float).reshape(
-                    -1
-                )
+                ratios = np.asarray(
+                    self._fit_state.channel_ratios(target), dtype=float
+                ).reshape(-1)
                 if ratios.size != n_boundaries:
                     ratios = default_boundary_ratios(n_boundaries)
                 x_boundaries = boundary_ratios_to_x_values(
@@ -12419,7 +12609,9 @@ class ManualFitGUI(QMainWindow):
                     x_finite,
                     n_boundaries,
                 )
-                for bidx, bval in enumerate(np.asarray(x_boundaries, dtype=float).reshape(-1)):
+                for bidx, bval in enumerate(
+                    np.asarray(x_boundaries, dtype=float).reshape(-1)
+                ):
                     if not np.isfinite(bval):
                         continue
                     entries.append(
@@ -12955,7 +13147,9 @@ class ManualFitGUI(QMainWindow):
                 self.ax.set_ylabel(" / ".join(ch_labels))
             else:
                 self.ax.set_ylabel(
-                    self._channel_axis_label(primary_target) if primary_target else "Signal"
+                    self._channel_axis_label(primary_target)
+                    if primary_target
+                    else "Signal"
                 )
             x_vals: np.ndarray[Tuple[int, ...], np.dtype[Any]] = np.asarray(
                 context["x_display"], dtype=float
@@ -13402,7 +13596,9 @@ class ManualFitGUI(QMainWindow):
             # If procedure sibling-seeding is enabled and this is a non-batch
             # run, ensure we have a sibling context even when the caller did not
             # pre-populate one.
-            if str(kind) != "batch" and bool(getattr(proc, "seed_from_siblings", False)):
+            if str(kind) != "batch" and bool(
+                getattr(proc, "seed_from_siblings", False)
+            ):
                 if len(existing_rows_by_file) <= 1:
                     existing_rows_by_file = {
                         str(row.get("file")): canonicalize_fit_row(row)
@@ -13560,17 +13756,6 @@ class ManualFitGUI(QMainWindow):
                 ),
                 _r2_old=existing_r2,
             )
-            if run_mode == "procedure":
-                panel: Any | None = getattr(self, "_procedure_panel", None)
-                if panel is not None:
-                    file_name: str = stem_for_file_ref(file_path)
-                    panel.record_external_procedure_start(
-                        procedure_name=str(
-                            getattr(proc, "name", "") or "Procedure"
-                        ),
-                        file_label=file_name,
-                        step_count=len(getattr(proc, "steps", ()) or ()),
-                    )
 
         # Submit to the single worker thread.
         if priority:
@@ -13906,8 +14091,6 @@ class ManualFitGUI(QMainWindow):
 
         task_mode: str = self._normalize_fit_run_mode(task.get("execution_mode"))
         manual_label: str = "Procedure fit" if task_mode == "procedure" else "Auto-fit"
-        procedure_panel: Any | None = getattr(self, "_procedure_panel", None)
-
         if task.get("kind") == "manual":
             file_path = str(task.get("file_path"))
             file_name: str = stem_for_file_ref(file_path)
@@ -13948,35 +14131,6 @@ class ManualFitGUI(QMainWindow):
                 self.stats_text.append(
                     f"✗ {manual_label} failed [{file_name}]: {error_text}"
                 )
-            if task_mode == "procedure" and procedure_panel is not None:
-                if row is None:
-                    procedure_panel.record_external_procedure_failure(
-                        "Procedure run produced no result.",
-                        file_label=file_name,
-                    )
-                else:
-                    proc_result = row.get("_procedure_result")
-                    if isinstance(proc_result, Mapping):
-                        procedure_panel.record_external_procedure_result(
-                            proc_result,
-                            file_label=file_name,
-                        )
-                    else:
-                        row_error = self._batch_row_error_text(row)
-                        if row_error:
-                            procedure_panel.record_external_procedure_failure(
-                                row_error,
-                                file_label=file_name,
-                            )
-                        else:
-                            procedure_panel.record_external_procedure_result(
-                                {
-                                    "step_results": [],
-                                    "r2": finite_float_or_none(fit_get(row, "r2")),
-                                    "stopped_at_step": None,
-                                },
-                                file_label=file_name,
-                            )
         elif task.get("kind") == "batch" and row is not None:
             status_text = "Done"
             if bool(row.get("_fit_no_change")):
@@ -14006,31 +14160,6 @@ class ManualFitGUI(QMainWindow):
                     else:
                         self.stats_text.append(
                             f"ℹ Seed used [{file_name}]: closest extracted fields from {source_name}."
-                        )
-            if task_mode == "procedure" and procedure_panel is not None:
-                file_path = str(task.get("file_path"))
-                file_name: str = stem_for_file_ref(file_path)
-                proc_result = row.get("_procedure_result")
-                if isinstance(proc_result, Mapping):
-                    procedure_panel.record_external_procedure_result(
-                        proc_result,
-                        file_label=file_name,
-                    )
-                else:
-                    row_error = self._batch_row_error_text(row)
-                    if row_error:
-                        procedure_panel.record_external_procedure_failure(
-                            row_error,
-                            file_label=file_name,
-                        )
-                    else:
-                        procedure_panel.record_external_procedure_result(
-                            {
-                                "step_results": [],
-                                "r2": finite_float_or_none(fit_get(row, "r2")),
-                                "stopped_at_step": None,
-                            },
-                            file_label=file_name,
                         )
 
         if row is not None and has_nonempty_values(fit_get(row, "params")):
@@ -14074,15 +14203,6 @@ class ManualFitGUI(QMainWindow):
                 _fit_status="Failed",
                 _fit_task_id=None,
             )
-            task_mode: str = self._normalize_fit_run_mode(task.get("execution_mode"))
-            if task_mode == "procedure":
-                panel: Any | None = getattr(self, "_procedure_panel", None)
-                if panel is not None:
-                    file_name: str = stem_for_file_ref(file_path)
-                    panel.record_external_procedure_failure(
-                        error_text,
-                        file_label=file_name,
-                    )
         if task.get("kind") == "manual":
             task_mode: str = self._normalize_fit_run_mode(task.get("execution_mode"))
             manual_label: str = (
@@ -14092,13 +14212,6 @@ class ManualFitGUI(QMainWindow):
             self.stats_text.append(
                 f"✗ {manual_label} failed [{file_name}]: {error_text}"
             )
-            if task_mode == "procedure":
-                panel: Any | None = getattr(self, "_procedure_panel", None)
-                if panel is not None:
-                    panel.record_external_procedure_failure(
-                        error_text,
-                        file_label=file_name,
-                    )
         self._finish_fit_task(int(task_id))
 
     def _on_fit_task_cancelled(self, task_id) -> None:
@@ -14111,12 +14224,6 @@ class ManualFitGUI(QMainWindow):
                 _fit_status="Cancelled",
                 _fit_task_id=None,
             )
-            task_mode: str = self._normalize_fit_run_mode(task.get("execution_mode"))
-            if task_mode == "procedure":
-                panel: Any | None = getattr(self, "_procedure_panel", None)
-                if panel is not None:
-                    file_name: str = stem_for_file_ref(task.get("file_path"))
-                    panel.record_external_procedure_cancelled(file_label=file_name)
         if task.get("kind") == "manual":
             task_mode: str = self._normalize_fit_run_mode(task.get("execution_mode"))
             manual_label: str = (
@@ -14124,10 +14231,6 @@ class ManualFitGUI(QMainWindow):
             )
             file_name: str = stem_for_file_ref(task.get("file_path"))
             self.stats_text.append(f"{manual_label} cancelled: {file_name}")
-            if task_mode == "procedure":
-                panel: Any | None = getattr(self, "_procedure_panel", None)
-                if panel is not None:
-                    panel.record_external_procedure_cancelled(file_label=file_name)
         self._finish_fit_task(int(task_id))
 
     def _finish_fit_task(self, task_id) -> None:
